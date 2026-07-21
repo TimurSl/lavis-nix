@@ -90,7 +90,7 @@ fn required_api_id(value: Option<OsString>) -> Result<u32, ConfigError> {
     let value = value.to_str().ok_or(ConfigError::InvalidApiId)?;
     let api_id = value.parse().map_err(|_| ConfigError::InvalidApiId)?;
 
-    if api_id == 0 {
+    if api_id == 0 || i32::try_from(api_id).is_err() {
         return Err(ConfigError::InvalidApiId);
     }
 
@@ -154,6 +154,11 @@ mod tests {
         ));
         assert!(matches!(
             Config::load_with(&invalid, paths()),
+            Err(ConfigError::InvalidApiId)
+        ));
+        let out_of_range = environment(&[(API_ID_ENV, "2147483648"), (API_HASH_ENV, "hash")]);
+        assert!(matches!(
+            Config::load_with(&out_of_range, paths()),
             Err(ConfigError::InvalidApiId)
         ));
     }

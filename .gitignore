@@ -4,6 +4,12 @@
 .env
 *.session
 *.session-journal
+*.session-shm
+*.session-wal
+/session
+/session-journal
+/session-shm
+/session-wal
 /state/
 *.sqlite
 *.sqlite3
