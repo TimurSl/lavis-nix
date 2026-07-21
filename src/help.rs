@@ -1,26 +1,15 @@
-use crate::commands::{COMMANDS, CommandKind, HelpRequest, definition};
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Response {
-    pub text: String,
-    pub entities: Vec<grammers_client::tl::enums::MessageEntity>,
-}
-
-impl Response {
-    pub fn plain(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            entities: Vec::new(),
-        }
-    }
-}
+pub use crate::response::Response;
+use crate::{
+    aliases::AliasStore,
+    commands::{COMMANDS, CommandKind, HelpRequest, definition},
+};
 
 pub struct RenderedHelp {
     pub response: Response,
     pub entity_fallback: bool,
 }
 
-pub fn render(request: &HelpRequest, prefix: &str) -> RenderedHelp {
+pub fn render(request: &HelpRequest, prefix: &str, aliases: &AliasStore) -> RenderedHelp {
     match request {
         HelpRequest::Overview => render_quote(
             "🛠 Lavis commands".to_owned(),
@@ -36,17 +25,35 @@ pub fn render(request: &HelpRequest, prefix: &str) -> RenderedHelp {
                 .join("\n"),
         ),
         HelpRequest::Topic(kind) => render_topic(*kind, prefix),
-        HelpRequest::Unknown(topic) => RenderedHelp {
-            response: Response::plain(format!(
-                "❓ Unknown command: {topic}\nUse {prefix}help to list available commands."
-            )),
-            entity_fallback: false,
-        },
+        HelpRequest::Unknown(topic) => render_alias_or_unknown(topic, prefix, aliases),
         HelpRequest::Invalid => RenderedHelp {
             response: Response::plain(format!("⚠️ Usage: {prefix}help [command]")),
             entity_fallback: false,
         },
     }
+}
+
+fn render_alias_or_unknown(topic: &str, prefix: &str, aliases: &AliasStore) -> RenderedHelp {
+    let Some(alias) = aliases.lookup(topic) else {
+        return RenderedHelp {
+            response: Response::plain(format!(
+                "❓ Unknown command: {topic}\nUse {prefix}help to list available commands."
+            )),
+            entity_fallback: false,
+        };
+    };
+    let preset = if alias.args.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", shell_words::join(&alias.args))
+    };
+    render_quote(
+        format!("🔗 {prefix}{topic}"),
+        format!(
+            "Alias for {prefix}{}{preset}\n\nUsage: {prefix}{topic} [arguments]",
+            alias.target
+        ),
+    )
 }
 
 fn render_topic(kind: CommandKind, prefix: &str) -> RenderedHelp {
@@ -61,45 +68,61 @@ fn render_topic(kind: CommandKind, prefix: &str) -> RenderedHelp {
 }
 
 fn render_quote(heading: String, body: String) -> RenderedHelp {
-    let text = format!("{heading}\n\n{body}");
-    let offset = heading.encode_utf16().count().checked_add(2);
-    let length = body.encode_utf16().count();
-    let entity = offset
-        .and_then(|offset| i32::try_from(offset).ok().zip(i32::try_from(length).ok()))
-        .map(|(offset, length)| {
-            grammers_client::tl::types::MessageEntityBlockquote {
-                offset,
-                length,
-                collapsed: true,
-            }
-            .into()
-        });
-
-    match entity {
-        Some(entity) => RenderedHelp {
-            response: Response {
-                text,
-                entities: vec![entity],
-            },
-            entity_fallback: false,
-        },
-        None => RenderedHelp {
-            response: Response::plain(text),
-            entity_fallback: true,
-        },
+    let rendered = Response::collapsed(heading, body);
+    RenderedHelp {
+        response: rendered.response,
+        entity_fallback: rendered.entity_fallback,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Response, render};
-    use crate::commands::{CommandKind, HelpRequest, definition};
+    use crate::{
+        aliases::{Alias, AliasStore},
+        commands::{CommandKind, HelpRequest, definition},
+    };
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
-    #[test]
-    fn overview_uses_registry_order_and_configured_prefix_once_per_command() {
-        let response = render(&HelpRequest::Overview, "!").response;
+    async fn aliases() -> AliasStore {
+        AliasStore::load(PathBuf::from("/nonexistent/lavis-help-aliases.json"))
+            .await
+            .unwrap()
+    }
 
-        assert_eq!(response.text.matches('!').count(), 3);
+    async fn aliases_with_mini() -> (AliasStore, PathBuf) {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("lavis-help-alias-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let mut aliases = AliasStore::load(directory.join("aliases.json"))
+            .await
+            .unwrap();
+        aliases
+            .add(
+                "mini",
+                Alias {
+                    target: "fastfetch".to_owned(),
+                    args: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        (aliases, directory)
+    }
+
+    #[tokio::test]
+    async fn overview_uses_registry_order_and_configured_prefix_once_per_command() {
+        let response = render(&HelpRequest::Overview, "!", &aliases().await).response;
+
+        assert_eq!(response.text.matches('!').count(), 5);
         assert!(response.text.contains("Measure Telegram latency"));
         assert!(response.text.contains("Show runtime statistics"));
         assert!(response.text.contains("Show command help"));
@@ -111,14 +134,14 @@ mod tests {
         assert_eq!(response.entities.len(), 1);
     }
 
-    #[test]
-    fn command_details_keep_titles_outside_a_single_entity() {
+    #[tokio::test]
+    async fn command_details_keep_titles_outside_a_single_entity() {
         for (kind, title) in [
             (CommandKind::Ping, "🏓 ,ping\n\n"),
             (CommandKind::Stats, "📊 ,stats\n\n"),
             (CommandKind::Help, "🛠 ,help [command]\n\n"),
         ] {
-            let response = render(&HelpRequest::Topic(kind), ",").response;
+            let response = render(&HelpRequest::Topic(kind), ",", &aliases().await).response;
             let definition = definition(kind);
 
             assert!(response.text.starts_with(title));
@@ -130,10 +153,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn renders_unknown_and_invalid_help_plainly() {
-        let unknown = render(&HelpRequest::Unknown("foo".to_owned()), ",").response;
-        let invalid = render(&HelpRequest::Invalid, "!").response;
+    #[tokio::test]
+    async fn renders_unknown_and_invalid_help_plainly() {
+        let unknown = render(
+            &HelpRequest::Unknown("foo".to_owned()),
+            ",",
+            &aliases().await,
+        )
+        .response;
+        let invalid = render(&HelpRequest::Invalid, "!", &aliases().await).response;
 
         assert_eq!(
             unknown,
@@ -142,9 +170,24 @@ mod tests {
         assert_eq!(invalid, Response::plain("⚠️ Usage: !help [command]"));
     }
 
-    #[test]
-    fn blockquote_uses_utf16_body_bounds() {
-        let response = render(&HelpRequest::Topic(CommandKind::Help), "🦀").response;
+    #[tokio::test]
+    async fn alias_help_uses_the_configured_alias_target() {
+        let (aliases, directory) = aliases_with_mini().await;
+        let response = render(&HelpRequest::Unknown("mini".to_owned()), "!", &aliases).response;
+
+        assert!(response.text.starts_with("🔗 !mini\n\n"));
+        assert!(response.text.contains("Alias for !fastfetch"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn blockquote_uses_utf16_body_bounds() {
+        let response = render(
+            &HelpRequest::Topic(CommandKind::Help),
+            "🦀",
+            &aliases().await,
+        )
+        .response;
         let text_units: Vec<u16> = response.text.encode_utf16().collect();
         let grammers_client::tl::enums::MessageEntity::Blockquote(entity) = &response.entities[0]
         else {

@@ -3,21 +3,36 @@ use std::time::{Duration, Instant};
 use grammers_client::{Client, tl};
 
 use crate::{
-    commands::Action,
-    help::{Response, render},
+    aliases::{Alias, AliasStore, DeleteResult},
+    command::Command,
+    commands::{Action, AliasRequest, dispatch},
+    fastfetch::{self, FastfetchInputError, FastfetchResult},
+    help::render,
+    response::Response,
 };
 
 pub struct RuntimeState {
     started_at: Instant,
     recognized_commands: u64,
+    aliases: AliasStore,
 }
 
 impl RuntimeState {
-    pub fn new(started_at: Instant) -> Self {
+    pub fn new(started_at: Instant, aliases: AliasStore) -> Self {
         Self {
             started_at,
             recognized_commands: 0,
+            aliases,
         }
+    }
+
+    pub fn resolve_alias(&self, name: &str, args: &str) -> Option<Action> {
+        let invocation_args = shell_words::split(args).ok()?;
+        let invocation = self.aliases.invocation(name, &invocation_args).ok()??;
+        dispatch(&Command {
+            name: invocation.target,
+            args: shell_words::join(invocation.args),
+        })
     }
 
     pub async fn execute(
@@ -54,7 +69,7 @@ impl RuntimeState {
                 ))
             }
             Action::Help(request) => {
-                let rendered = render(request, prefix);
+                let rendered = render(request, prefix, &self.aliases);
                 if rendered.entity_fallback {
                     tracing::warn!(
                         event = "help_entity_fallback",
@@ -63,7 +78,107 @@ impl RuntimeState {
                 }
                 rendered.response
             }
+            Action::Fastfetch(arguments) => fastfetch_response(fastfetch::run(arguments).await),
+            Action::Alias(request) => self.execute_alias(request, prefix).await,
         }
+    }
+
+    async fn execute_alias(&mut self, request: &AliasRequest, prefix: &str) -> Response {
+        match request {
+            AliasRequest::List => {
+                let aliases = self.aliases.aliases();
+                if aliases.is_empty() {
+                    return Response::plain("🔗 No aliases configured");
+                }
+                Response::plain(format!(
+                    "🔗 Aliases\n\n{}",
+                    aliases
+                        .iter()
+                        .map(|(name, alias)| {
+                            let args = if alias.args.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" {}", shell_words::join(&alias.args))
+                            };
+                            format!("{prefix}{name} → {prefix}{}{args}", alias.target)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ))
+            }
+            AliasRequest::Add { name, target, args } => match self
+                .aliases
+                .add(
+                    name,
+                    Alias {
+                        target: target.clone(),
+                        args: args.clone(),
+                    },
+                )
+                .await
+            {
+                Ok(_) => Response::plain(format!("🔗 Added alias: {prefix}{name}")),
+                Err(error) => Response::plain(format!("⚠️ Could not add alias: {error}")),
+            },
+            AliasRequest::Delete { name } => match self.aliases.delete(name).await {
+                Ok(DeleteResult::Deleted) => {
+                    Response::plain(format!("🔗 Deleted alias: {prefix}{name}"))
+                }
+                Ok(DeleteResult::NotFound) => {
+                    Response::plain(format!("❓ Alias not found: {name}"))
+                }
+                Err(error) => Response::plain(format!("⚠️ Could not delete alias: {error}")),
+            },
+            AliasRequest::Show { name } => {
+                let normalized_name = name.to_ascii_lowercase();
+                let Some(alias) = self.aliases.lookup(name) else {
+                    return Response::plain(format!(
+                        "⚠️ Alias {prefix}{normalized_name} does not exist"
+                    ));
+                };
+                let args = if alias.args.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", shell_words::join(&alias.args))
+                };
+                Response::collapsed(
+                    format!("🔗 {prefix}{normalized_name}"),
+                    format!("Alias for:\n{prefix}{}{args}", alias.target),
+                )
+                .response
+            }
+            AliasRequest::Invalid => Response::plain(format!(
+                "⚠️ Usage: {prefix}alias [list|add <name> <command> [arguments...]|show <name>|del <name>]"
+            )),
+        }
+    }
+}
+
+fn fastfetch_response(result: FastfetchResult) -> Response {
+    match result {
+        FastfetchResult::Success(response) => response,
+        FastfetchResult::Empty => Response::plain("⚠️ Fastfetch produced no output"),
+        FastfetchResult::TimedOut => Response::plain("⚠️ Fastfetch timed out"),
+        FastfetchResult::Unavailable => Response::plain("⚠️ Fastfetch is unavailable"),
+        FastfetchResult::NonZero { code, .. } => {
+            Response::plain(format!("⚠️ Fastfetch failed (exit code {code})"))
+        }
+        FastfetchResult::UnexpectedStatus => Response::plain("⚠️ Fastfetch ended unexpectedly"),
+        FastfetchResult::InvalidArguments(error) => Response::plain(format!(
+            "⚠️ Invalid fastfetch options: {}",
+            fastfetch_input_message(error)
+        )),
+    }
+}
+
+fn fastfetch_input_message(error: FastfetchInputError) -> &'static str {
+    match error {
+        FastfetchInputError::Tokenization => "invalid quoting",
+        FastfetchInputError::UnsupportedOption => "unsupported option",
+        FastfetchInputError::MissingValue => "option value is missing",
+        FastfetchInputError::InvalidLogo => "only --logo none is allowed",
+        FastfetchInputError::InvalidStructure => "invalid --structure value",
+        FastfetchInputError::InvalidSeparator => "invalid --separator value",
     }
 }
 
@@ -214,10 +329,103 @@ fn format_stats(
 #[cfg(test)]
 mod tests {
     use super::{
-        ProcStats, format_duration, format_latency, format_stats, parse_memory_kib,
-        parse_system_uptime,
+        ProcStats, fastfetch_response, format_duration, format_latency, format_stats,
+        parse_memory_kib, parse_system_uptime,
     };
-    use std::time::Duration;
+    use crate::response::Response;
+    use crate::{
+        aliases::{Alias, AliasStore},
+        commands::AliasRequest,
+        fastfetch::FastfetchResult,
+    };
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    };
+
+    async fn runtime_with_alias() -> (super::RuntimeState, PathBuf) {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("lavis-runtime-show-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("aliases.json");
+        let mut aliases = AliasStore::load(path).await.unwrap();
+        aliases
+            .add(
+                "Mini",
+                Alias {
+                    target: "fastfetch".to_owned(),
+                    args: vec!["--separator".to_owned(), " → ".to_owned()],
+                },
+            )
+            .await
+            .unwrap();
+        (super::RuntimeState::new(Instant::now(), aliases), directory)
+    }
+
+    #[tokio::test]
+    async fn shows_existing_alias_with_utf16_safe_collapsed_body() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        let response = runtime
+            .execute_alias(
+                &AliasRequest::Show {
+                    name: "MINI".to_owned(),
+                },
+                "🦀",
+            )
+            .await;
+        let units = response.text.encode_utf16().collect::<Vec<_>>();
+        let grammers_client::tl::enums::MessageEntity::Blockquote(entity) = &response.entities[0]
+        else {
+            panic!("expected a blockquote entity");
+        };
+
+        assert_eq!(
+            response.text,
+            "🔗 🦀mini\n\nAlias for:\n🦀fastfetch --separator ' → '"
+        );
+        assert_eq!(response.entities.len(), 1);
+        assert!(entity.collapsed);
+        let offset = usize::try_from(entity.offset).unwrap();
+        let length = usize::try_from(entity.length).unwrap();
+        assert_eq!(
+            String::from_utf16(&units[..offset]).unwrap(),
+            "🔗 🦀mini\n\n"
+        );
+        assert_eq!(
+            String::from_utf16(&units[offset..offset + length]).unwrap(),
+            "Alias for:\n🦀fastfetch --separator ' → '"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reports_missing_alias_and_invalid_show_usage() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+
+        assert_eq!(
+            runtime
+                .execute_alias(
+                    &AliasRequest::Show {
+                        name: "MISSING".to_owned()
+                    },
+                    "!"
+                )
+                .await,
+            Response::plain("⚠️ Alias !missing does not exist")
+        );
+        assert_eq!(
+            runtime.execute_alias(&AliasRequest::Invalid, "!").await,
+            Response::plain(
+                "⚠️ Usage: !alias [list|add <name> <command> [arguments...]|show <name>|del <name>]"
+            )
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn formats_durations_compactly() {
@@ -236,6 +444,18 @@ mod tests {
         assert_eq!(format_latency(Duration::ZERO), "<1 ms");
         assert_eq!(format_latency(Duration::from_micros(999)), "<1 ms");
         assert_eq!(format_latency(Duration::from_millis(12)), "12 ms");
+    }
+
+    #[test]
+    fn reports_fastfetch_exit_codes_without_stderr() {
+        assert_eq!(
+            fastfetch_response(FastfetchResult::NonZero {
+                code: 1,
+                stderr: "sensitive diagnostic".to_owned(),
+            })
+            .text,
+            "⚠️ Fastfetch failed (exit code 1)"
+        );
     }
 
     #[test]

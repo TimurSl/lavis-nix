@@ -1,4 +1,5 @@
 /target/
+.slim/deepwork/
 /result
 /result-*
 .env

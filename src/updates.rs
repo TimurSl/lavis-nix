@@ -58,7 +58,7 @@ async fn process_update(
         "Received Telegram message update"
     );
 
-    let Some(action) = route(authored_by_self, message.text(), prefix) else {
+    let Some(action) = route(authored_by_self, message.text(), prefix, runtime) else {
         return;
     };
     tracing::debug!(
@@ -102,11 +102,14 @@ fn is_self_authored(sender_id: Option<PeerId>, outgoing: bool, self_user_id: Pee
     }
 }
 
-fn route(authored_by_self: bool, text: &str, prefix: &str) -> Option<Action> {
-    authored_by_self
-        .then(|| parse(text, prefix))
-        .flatten()
-        .and_then(|command| dispatch(&command))
+fn route(
+    authored_by_self: bool,
+    text: &str,
+    prefix: &str,
+    runtime: &RuntimeState,
+) -> Option<Action> {
+    let command = authored_by_self.then(|| parse(text, prefix)).flatten()?;
+    dispatch(&command).or_else(|| runtime.resolve_alias(&command.name, &command.args))
 }
 
 #[cfg(test)]
@@ -115,30 +118,48 @@ mod tests {
 
     use super::{is_self_authored, route};
     use crate::commands::Action;
+    use crate::{aliases::AliasStore, runtime::RuntimeState};
+    use std::{path::PathBuf, time::Instant};
 
-    #[test]
-    fn routes_outgoing_false_messages_authored_by_self() {
+    async fn runtime() -> RuntimeState {
+        RuntimeState::new(
+            Instant::now(),
+            AliasStore::load(PathBuf::from("/nonexistent/lavis-updates-aliases.json"))
+                .await
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn routes_outgoing_false_messages_authored_by_self() {
         let outgoing = false;
         let authored_by_self = true;
 
         assert!(!outgoing);
-        assert_eq!(route(authored_by_self, ",ping", ","), Some(Action::Ping));
+        assert_eq!(
+            route(authored_by_self, ",ping", ",", &runtime().await),
+            Some(Action::Ping)
+        );
     }
 
-    #[test]
-    fn rejects_outgoing_true_messages_not_authored_by_self() {
+    #[tokio::test]
+    async fn rejects_outgoing_true_messages_not_authored_by_self() {
         let outgoing = true;
         let authored_by_self = false;
 
         assert!(outgoing);
-        assert_eq!(route(authored_by_self, ",ping", ","), None);
+        assert_eq!(
+            route(authored_by_self, ",ping", ",", &runtime().await),
+            None
+        );
     }
 
-    #[test]
-    fn ignores_self_authored_normal_unknown_and_dot_prefixed_text() {
-        assert_eq!(route(true, "ordinary outgoing text", ","), None);
-        assert_eq!(route(true, ",unknown", ","), None);
-        assert_eq!(route(true, ".ping", ","), None);
+    #[tokio::test]
+    async fn ignores_self_authored_normal_unknown_and_dot_prefixed_text() {
+        let runtime = runtime().await;
+        assert_eq!(route(true, "ordinary outgoing text", ",", &runtime), None);
+        assert_eq!(route(true, ",unknown", ",", &runtime), None);
+        assert_eq!(route(true, ".ping", ",", &runtime), None);
     }
 
     #[test]

@@ -18,6 +18,11 @@
             && builtins.baseNameOf path != "target";
         };
         cargoLock.lockFile = ./Cargo.lock;
+        nativeBuildInputs = [ pkgs.makeWrapper ];
+        postFixup = ''
+          wrapProgram $out/bin/lavis \
+            --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.fastfetch ]}
+        '';
       };
     in
     {
@@ -27,7 +32,7 @@
         program = "${package}/bin/lavis";
       };
       devShells.${system}.default = pkgs.mkShell {
-        packages = with pkgs; [ cargo clippy rustc rustfmt ];
+        packages = with pkgs; [ cargo clippy rustc rustfmt fastfetch ];
       };
       checks.${system}.default = package;
     };

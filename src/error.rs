@@ -14,8 +14,52 @@ pub enum ConfigError {
     EmptyPrefix,
     #[error("session path must not be empty")]
     EmptySessionPath,
+    #[error("session path has no parent directory for application state")]
+    MissingSessionDirectory,
     #[error("neither XDG_STATE_HOME nor HOME is available for the session path")]
     MissingStateDirectory,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum AliasError {
+    #[error("alias name is invalid")]
+    InvalidName,
+    #[error("alias name conflicts with a built-in command")]
+    ReservedName,
+    #[error("alias already exists")]
+    AlreadyExists,
+    #[error("alias target is not a canonical command")]
+    UnknownTarget,
+    #[error("alias target is not aliasable")]
+    TargetNotAliasable,
+    #[error("alias limit exceeded")]
+    AliasLimit,
+    #[error("alias argument limit exceeded")]
+    ArgumentLimit,
+    #[error("alias argument is too long")]
+    ArgumentTooLong,
+    #[error("alias arguments are too large")]
+    ArgumentsTooLarge,
+    #[error("alias file is too large")]
+    FileTooLarge,
+    #[error("alias file is malformed")]
+    MalformedFile,
+    #[error("alias file version is unsupported")]
+    UnsupportedVersion,
+    #[error("failed to read alias storage")]
+    Read,
+    #[error("alias state directory is unavailable")]
+    CreateDirectory,
+    #[error("failed to create alias temporary file")]
+    CreateTemporary,
+    #[error("failed to write alias temporary file")]
+    WriteTemporary,
+    #[error("failed to synchronize alias temporary file")]
+    SyncTemporary,
+    #[error("failed to replace alias file")]
+    Replace,
+    #[error("failed to run alias storage task")]
+    StorageTask,
 }
 
 #[derive(Debug, Error)]

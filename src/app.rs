@@ -1,13 +1,16 @@
 use anyhow::Context;
 use std::time::Instant;
 
+pub mod aliases;
 pub mod auth;
 pub mod client;
 pub mod command;
 pub mod commands;
 pub mod config;
 pub mod error;
+pub mod fastfetch;
 pub mod help;
+pub mod response;
 pub mod runtime;
 pub mod updates;
 
@@ -40,8 +43,11 @@ pub async fn run() -> anyhow::Result<()> {
             .map_err(anyhow::Error::from_boxed)
             .context("failed to create the Telegram update stream")?;
 
+        let aliases = aliases::AliasStore::load(config.aliases_path.clone())
+            .await
+            .context("failed to load persistent aliases")?;
         tracing::info!(event = "application_started", "lavis is running");
-        let mut runtime = runtime::RuntimeState::new(started_at);
+        let mut runtime = runtime::RuntimeState::new(started_at, aliases);
         updates::run(
             &mut stream,
             &config.prefix,
