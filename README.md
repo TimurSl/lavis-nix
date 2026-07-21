@@ -1,6 +1,6 @@
 # lavis
 
-Minimal Rust foundation for a personal Telegram userbot. Telegram integration is not part of this stage.
+Minimal Rust foundation for a personal Telegram userbot. This stage authorizes one user account and persists its Telegram session locally; it does not process updates or commands.
 
 ## Development
 
@@ -13,13 +13,13 @@ nix run
 nix flake check
 ```
 
-`nix run` starts the process and waits for Ctrl-C; it does not need credentials at this stage.
-
-When Telegram authentication is implemented, provide credentials through the environment:
+Before running, provide the Telegram application credentials through the environment:
 
 ```bash
 export LAVIS_API_ID='your-api-id'
 export LAVIS_API_HASH='your-api-hash'
 ```
 
-The default command prefix is `.`. Session state defaults to `$XDG_STATE_HOME/lavis/session`, or `$HOME/.local/state/lavis/session`.
+`nix run` prompts for a phone number and, when required, a login code and two-factor password. Login codes and passwords are entered without terminal echo. There are no automatic retries; rerun the program after an invalid credential or other authorization failure.
+
+The default command prefix is `.`. Session state defaults to `$XDG_STATE_HOME/lavis/session`, or `$HOME/.local/state/lavis/session`. The session database and any SQLite sidecar files are sensitive authentication material: keep them outside Git and do not share or copy them.

@@ -8,6 +8,10 @@ path = "src/app.rs"
 
 [dependencies]
 anyhow = "1.0"
+grammers-client = "0.10.0"
+grammers-mtsender = "0.10.0"
+grammers-session = "0.10.0"
+rpassword = "7.4"
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = "0.1"
