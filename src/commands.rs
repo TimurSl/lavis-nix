@@ -1,13 +1,24 @@
 use crate::command::Command;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    EditMessage(&'static str),
+    Ping,
+    Stats,
+}
+
+impl Action {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Ping => "ping",
+            Self::Stats => "stats",
+        }
+    }
 }
 
 pub fn dispatch(command: &Command) -> Option<Action> {
     match command.name.as_str() {
-        "ping" => Some(Action::EditMessage("🏓 Pong!")),
+        "ping" => Some(Action::Ping),
+        "stats" => Some(Action::Stats),
         _ => None,
     }
 }
@@ -18,13 +29,23 @@ mod tests {
     use crate::command::Command;
 
     #[test]
-    fn dispatches_ping_to_an_edit() {
+    fn dispatches_ping() {
         let command = Command {
             name: "ping".to_owned(),
             args: String::new(),
         };
 
-        assert_eq!(dispatch(&command), Some(Action::EditMessage("🏓 Pong!")));
+        assert_eq!(dispatch(&command), Some(Action::Ping));
+    }
+
+    #[test]
+    fn dispatches_stats() {
+        let command = Command {
+            name: "stats".to_owned(),
+            args: String::new(),
+        };
+
+        assert_eq!(dispatch(&command), Some(Action::Stats));
     }
 
     #[test]

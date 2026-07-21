@@ -1,17 +1,19 @@
 use anyhow::Context;
 use grammers_client::{client::UpdateStream, update::Update};
-use grammers_mtsender::InvocationError;
 use grammers_session::types::PeerId;
 
 use crate::{
     command::parse,
     commands::{Action, dispatch},
+    runtime::{RuntimeState, invocation_error_category},
 };
 
 pub async fn run(
     stream: &mut UpdateStream,
     prefix: &str,
     self_user_id: PeerId,
+    client: &grammers_client::Client,
+    runtime: &mut RuntimeState,
 ) -> anyhow::Result<()> {
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -29,13 +31,19 @@ pub async fn run(
             }
             update = stream.next() => {
                 let update = update.context("Telegram update stream ended or failed")?;
-                process_update(update, prefix, self_user_id).await;
+                process_update(update, prefix, self_user_id, client, runtime).await;
             }
         }
     }
 }
 
-async fn process_update(update: Update, prefix: &str, self_user_id: PeerId) {
+async fn process_update(
+    update: Update,
+    prefix: &str,
+    self_user_id: PeerId,
+    client: &grammers_client::Client,
+    runtime: &mut RuntimeState,
+) {
     let Update::NewMessage(message) = update else {
         return;
     };
@@ -50,22 +58,22 @@ async fn process_update(update: Update, prefix: &str, self_user_id: PeerId) {
         "Received Telegram message update"
     );
 
-    let Some(Action::EditMessage(response)) = route(authored_by_self, message.text(), prefix)
-    else {
+    let Some(action) = route(authored_by_self, message.text(), prefix) else {
         return;
     };
     tracing::debug!(
         event = "outgoing_command_matched",
-        command = "ping",
+        command = action.name(),
         message_id,
         "Matched outgoing command"
     );
 
+    let response = runtime.execute(client, action, message_id).await;
     match message.edit(response).await {
         Ok(()) => {
             tracing::debug!(
                 event = "command_edit_succeeded",
-                command = "ping",
+                command = action.name(),
                 message_id,
                 "Edited outgoing command message"
             );
@@ -73,26 +81,13 @@ async fn process_update(update: Update, prefix: &str, self_user_id: PeerId) {
         Err(error) => {
             tracing::warn!(
                 event = "command_edit_failed",
-                command = "ping",
+                command = action.name(),
                 message_id,
-                error_category = edit_error_category(&error),
+                error_category = invocation_error_category(&error),
                 error = %error,
                 "Failed to edit outgoing command message"
             );
         }
-    }
-}
-
-fn edit_error_category(error: &InvocationError) -> &'static str {
-    match error {
-        InvocationError::Session(_) => "session",
-        InvocationError::Rpc(_) => "rpc",
-        InvocationError::Io(_) => "io",
-        InvocationError::Deserialize(_) => "deserialize",
-        InvocationError::Transport(_) => "transport",
-        InvocationError::Dropped => "dropped",
-        InvocationError::InvalidDc => "invalid_dc",
-        InvocationError::Authentication(_) => "authentication",
     }
 }
 
@@ -124,10 +119,7 @@ mod tests {
         let authored_by_self = true;
 
         assert!(!outgoing);
-        assert_eq!(
-            route(authored_by_self, ",ping", ","),
-            Some(Action::EditMessage("🏓 Pong!"))
-        );
+        assert_eq!(route(authored_by_self, ",ping", ","), Some(Action::Ping));
     }
 
     #[test]

@@ -40,6 +40,17 @@ mod tests {
     }
 
     #[test]
+    fn parses_stats_with_the_comma_prefix() {
+        assert_eq!(
+            parse(",stats", ","),
+            Some(Command {
+                name: "stats".to_owned(),
+                args: String::new(),
+            })
+        );
+    }
+
+    #[test]
     fn parses_command_arguments() {
         assert_eq!(
             parse(",edit hello world", ","),
@@ -57,6 +68,7 @@ mod tests {
         assert_eq!(parse(",", ","), None);
         assert_eq!(parse(",   ", ","), None);
         assert_eq!(parse(".ping", ","), None);
+        assert_eq!(parse(".stats", ","), None);
     }
 
     #[test]
