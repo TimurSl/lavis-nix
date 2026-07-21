@@ -1,0 +1,11 @@
+/target/
+/result
+/result-*
+.env
+*.session
+*.session-journal
+/state/
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
