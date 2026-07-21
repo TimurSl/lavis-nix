@@ -190,6 +190,12 @@ fn validate_aliases(aliases: &BTreeMap<String, Alias>) -> Result<(), AliasError>
 }
 
 fn validate_alias(name: &str, alias: &Alias) -> Result<(), AliasError> {
+    if name == "prefix" {
+        return Err(AliasError::PrefixReserved);
+    }
+    if name == "modules" {
+        return Err(AliasError::ModulesReserved);
+    }
     if canonical_command(name).is_some() {
         return Err(AliasError::ReservedName);
     }
@@ -345,6 +351,14 @@ mod tests {
             Err(AliasError::ReservedName)
         );
         assert_eq!(
+            validate_alias("prefix", &alias()),
+            Err(AliasError::PrefixReserved)
+        );
+        assert_eq!(
+            validate_alias("modules", &alias()),
+            Err(AliasError::ModulesReserved)
+        );
+        assert_eq!(
             validate_alias(
                 "fast",
                 &Alias {
@@ -432,6 +446,29 @@ mod tests {
             AliasStore::load(path.clone()).await,
             Err(AliasError::FileTooLarge)
         ));
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_reserved_alias_fixtures_are_rejected_without_rewriting_them() {
+        let path = test_path("legacy-reserved");
+        for (bytes, expected) in [
+            (
+                br#"{"version":1,"aliases":{"prefix":{"target":"ping","args":[]}}}"#.as_slice(),
+                AliasError::PrefixReserved,
+            ),
+            (
+                br#"{"version":1,"aliases":{"modules":{"target":"ping","args":[]}}}"#.as_slice(),
+                AliasError::ModulesReserved,
+            ),
+        ] {
+            fs::write(&path, bytes).unwrap();
+            assert!(matches!(
+                AliasStore::load(path.clone()).await,
+                Err(error) if error == expected
+            ));
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

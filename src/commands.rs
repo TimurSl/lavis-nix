@@ -1,12 +1,15 @@
 use crate::command::Command;
+use crate::modules::ModuleId;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CommandKind {
     Ping,
     Stats,
     Help,
     Fastfetch,
     Alias,
+    Prefix,
+    Modules,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,9 +21,10 @@ pub struct CommandDefinition {
     pub description: &'static str,
     pub icon: &'static str,
     pub aliasable: bool,
+    pub module: ModuleId,
 }
 
-pub struct CommandRegistry([CommandDefinition; 5]);
+pub struct CommandRegistry([CommandDefinition; 7]);
 
 impl CommandRegistry {
     pub fn iter(&self) -> impl Iterator<Item = &CommandDefinition> {
@@ -34,6 +38,26 @@ impl CommandRegistry {
 
 pub const COMMANDS: CommandRegistry = CommandRegistry([
     CommandDefinition {
+        kind: CommandKind::Help,
+        name: "help",
+        usage: "help [command]",
+        summary: "Show command help",
+        description: "Shows the command overview or detailed help for a command, alias, or module.",
+        icon: "🛠",
+        aliasable: true,
+        module: ModuleId::Core,
+    },
+    CommandDefinition {
+        kind: CommandKind::Modules,
+        name: "modules",
+        usage: "modules",
+        summary: "List internal modules",
+        description: "Lists the statically registered Lavis modules and their commands.",
+        icon: "🧩",
+        aliasable: true,
+        module: ModuleId::Core,
+    },
+    CommandDefinition {
         kind: CommandKind::Ping,
         name: "ping",
         usage: "ping",
@@ -41,6 +65,17 @@ pub const COMMANDS: CommandRegistry = CommandRegistry([
         description: "Measures a real Telegram MTProto RPC round-trip over the existing authenticated connection.",
         icon: "🏓",
         aliasable: true,
+        module: ModuleId::Core,
+    },
+    CommandDefinition {
+        kind: CommandKind::Prefix,
+        name: "prefix",
+        usage: "prefix [new-prefix|reset]",
+        summary: "Show or change the command prefix",
+        description: "Shows the active prefix or persists a new prefix.",
+        icon: "⚙️",
+        aliasable: false,
+        module: ModuleId::Core,
     },
     CommandDefinition {
         kind: CommandKind::Stats,
@@ -50,15 +85,7 @@ pub const COMMANDS: CommandRegistry = CommandRegistry([
         description: "Shows fresh Telegram RPC latency, Lavis process uptime, host uptime, resident memory, command count, and package version.",
         icon: "📊",
         aliasable: true,
-    },
-    CommandDefinition {
-        kind: CommandKind::Help,
-        name: "help",
-        usage: "help [command]",
-        summary: "Show command help",
-        description: "Shows the command overview or detailed help for a single command.",
-        icon: "🛠",
-        aliasable: true,
+        module: ModuleId::Core,
     },
     CommandDefinition {
         kind: CommandKind::Fastfetch,
@@ -68,6 +95,7 @@ pub const COMMANDS: CommandRegistry = CommandRegistry([
         description: "Runs fastfetch with a restricted set of display options.",
         icon: "🖥",
         aliasable: true,
+        module: ModuleId::System,
     },
     CommandDefinition {
         kind: CommandKind::Alias,
@@ -77,14 +105,14 @@ pub const COMMANDS: CommandRegistry = CommandRegistry([
         description: "Manages persistent aliases for canonical commands.",
         icon: "🔗",
         aliasable: false,
+        module: ModuleId::Aliases,
     },
 ]);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HelpRequest {
     Overview,
-    Topic(CommandKind),
-    Unknown(String),
+    Topic(String),
     Invalid,
 }
 
@@ -95,6 +123,8 @@ pub enum Action {
     Help(HelpRequest),
     Fastfetch(String),
     Alias(AliasRequest),
+    Prefix(PrefixRequest),
+    Modules(ModulesRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +144,14 @@ pub enum AliasRequest {
     Invalid,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrefixRequest {
+    Show,
+    Set(String),
+    Reset,
+    Invalid,
+}
+
 impl Action {
     pub const fn name(&self) -> &'static str {
         match self {
@@ -122,6 +160,8 @@ impl Action {
             Self::Help(_) => "help",
             Self::Fastfetch(_) => "fastfetch",
             Self::Alias(_) => "alias",
+            Self::Prefix(_) => "prefix",
+            Self::Modules(_) => "modules",
         }
     }
 }
@@ -134,16 +174,42 @@ pub fn dispatch(command: &Command) -> Option<Action> {
         CommandKind::Help => Some(Action::Help(parse_help_request(&command.args))),
         CommandKind::Fastfetch => Some(Action::Fastfetch(command.args.clone())),
         CommandKind::Alias => Some(Action::Alias(parse_alias_request(&command.args))),
+        CommandKind::Prefix => Some(Action::Prefix(parse_prefix_request(&command.args))),
+        CommandKind::Modules => Some(Action::Modules(parse_modules_request(&command.args))),
     }
 }
 
 pub fn definition(kind: CommandKind) -> &'static CommandDefinition {
-    match kind {
-        CommandKind::Ping => &COMMANDS.0[0],
-        CommandKind::Stats => &COMMANDS.0[1],
-        CommandKind::Help => &COMMANDS.0[2],
-        CommandKind::Fastfetch => &COMMANDS.0[3],
-        CommandKind::Alias => &COMMANDS.0[4],
+    COMMANDS
+        .canonical_iter()
+        .find(|command| command.kind == kind)
+        .unwrap_or_else(|| unreachable!("all CommandKind values are registered"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModulesRequest {
+    Overview,
+    Invalid,
+}
+
+fn parse_modules_request(args: &str) -> ModulesRequest {
+    if args.trim().is_empty() {
+        ModulesRequest::Overview
+    } else {
+        ModulesRequest::Invalid
+    }
+}
+
+fn parse_prefix_request(args: &str) -> PrefixRequest {
+    let value = args.trim();
+    if value.is_empty() {
+        PrefixRequest::Show
+    } else if value == "reset" {
+        PrefixRequest::Reset
+    } else if value.chars().any(char::is_whitespace) {
+        PrefixRequest::Invalid
+    } else {
+        PrefixRequest::Set(value.to_owned())
     }
 }
 
@@ -183,17 +249,17 @@ fn parse_help_request(args: &str) -> HelpRequest {
         return HelpRequest::Invalid;
     }
     let normalized = topic.to_ascii_lowercase();
-    COMMANDS
-        .iter()
-        .find(|definition| definition.name == normalized)
-        .map(|definition| HelpRequest::Topic(definition.kind))
-        .unwrap_or_else(|| HelpRequest::Unknown(topic.to_owned()))
+    HelpRequest::Topic(normalized)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, AliasRequest, COMMANDS, CommandKind, HelpRequest, dispatch};
+    use super::{Action, AliasRequest, COMMANDS, HelpRequest, ModulesRequest, dispatch};
     use crate::command::Command;
+    use crate::modules::{
+        MODULES, ModuleId, commands_for_module, module_by_name, module_definition,
+    };
+    use std::collections::HashSet;
 
     #[test]
     fn dispatches_ping() {
@@ -236,11 +302,18 @@ mod tests {
         );
         assert_eq!(
             dispatch(&topic),
-            Some(Action::Help(HelpRequest::Topic(CommandKind::Ping)))
+            Some(Action::Help(HelpRequest::Topic("ping".to_owned())))
         );
         assert_eq!(
             dispatch(&alias_topic),
-            Some(Action::Help(HelpRequest::Topic(CommandKind::Alias)))
+            Some(Action::Help(HelpRequest::Topic("alias".to_owned())))
+        );
+        assert_eq!(
+            dispatch(&Command {
+                name: "help".to_owned(),
+                args: "prefix".to_owned(),
+            }),
+            Some(Action::Help(HelpRequest::Topic("prefix".to_owned())))
         );
     }
 
@@ -257,24 +330,74 @@ mod tests {
 
         assert_eq!(
             dispatch(&unknown),
-            Some(Action::Help(HelpRequest::Unknown("missing".to_owned())))
+            Some(Action::Help(HelpRequest::Topic("missing".to_owned())))
         );
         assert_eq!(dispatch(&invalid), Some(Action::Help(HelpRequest::Invalid)));
     }
 
     #[test]
-    fn registry_is_unique_ordered_and_complete() {
+    fn registry_invariants_and_ownership_are_complete() {
         let names = COMMANDS
             .canonical_iter()
             .map(|definition| definition.name)
             .collect::<Vec<_>>();
-        assert_eq!(names, ["ping", "stats", "help", "fastfetch", "alias"]);
+        assert_eq!(
+            names,
+            [
+                "help",
+                "modules",
+                "ping",
+                "prefix",
+                "stats",
+                "fastfetch",
+                "alias"
+            ]
+        );
+        let module_names = MODULES.iter().map(|module| module.name).collect::<Vec<_>>();
+        assert_eq!(module_names, ["core", "system", "aliases"]);
+        assert_eq!(
+            module_names.iter().copied().collect::<HashSet<_>>().len(),
+            MODULES.len()
+        );
+        assert_eq!(
+            MODULES
+                .iter()
+                .map(|module| module.id)
+                .collect::<HashSet<_>>()
+                .len(),
+            MODULES.len()
+        );
+        assert_eq!(
+            names.iter().copied().collect::<HashSet<_>>().len(),
+            names.len()
+        );
+        assert_eq!(
+            COMMANDS
+                .canonical_iter()
+                .map(|definition| definition.kind)
+                .collect::<HashSet<_>>()
+                .len(),
+            names.len()
+        );
+        assert!(MODULES.iter().all(|module| !module.description.is_empty()));
+        assert!(
+            MODULES
+                .iter()
+                .all(|module| commands_for_module(module.id).next().is_some())
+        );
+        assert!(names.iter().all(|name| module_by_name(name).is_none()));
+        assert_eq!(
+            module_by_name("CORE").map(|module| module.id),
+            Some(ModuleId::Core)
+        );
+        assert_eq!(module_definition(ModuleId::Aliases).name, "aliases");
         for definition in COMMANDS.canonical_iter() {
             assert!(!definition.usage.is_empty());
             assert!(!definition.summary.is_empty());
             assert!(!definition.description.is_empty());
             assert!(!definition.icon.is_empty());
-            if definition.name == "alias" {
+            assert!(MODULES.iter().any(|module| module.id == definition.module));
+            if matches!(definition.name, "alias" | "prefix") {
                 assert!(!definition.aliasable);
                 continue;
             }
@@ -284,6 +407,65 @@ mod tests {
             };
             assert!(dispatch(&command).is_some());
         }
+        assert_eq!(
+            commands_for_module(ModuleId::Core)
+                .map(|command| command.name)
+                .collect::<Vec<_>>(),
+            ["help", "modules", "ping", "prefix", "stats"]
+        );
+        assert_eq!(
+            commands_for_module(ModuleId::System)
+                .map(|command| command.name)
+                .collect::<Vec<_>>(),
+            ["fastfetch"]
+        );
+        assert_eq!(
+            commands_for_module(ModuleId::Aliases)
+                .map(|command| command.name)
+                .collect::<Vec<_>>(),
+            ["alias"]
+        );
+    }
+
+    #[test]
+    fn dispatches_modules_and_rejects_arguments() {
+        let modules = |args: &str| {
+            dispatch(&Command {
+                name: "modules".to_owned(),
+                args: args.to_owned(),
+            })
+        };
+        assert_eq!(
+            modules("  \t"),
+            Some(Action::Modules(ModulesRequest::Overview))
+        );
+        assert_eq!(
+            modules("core"),
+            Some(Action::Modules(ModulesRequest::Invalid))
+        );
+    }
+
+    #[test]
+    fn parses_prefix_without_shell_word_semantics() {
+        let prefix = |args: &str| {
+            dispatch(&Command {
+                name: "prefix".to_owned(),
+                args: args.to_owned(),
+            })
+        };
+        assert_eq!(prefix(""), Some(Action::Prefix(super::PrefixRequest::Show)));
+        assert_eq!(
+            prefix("reset"),
+            Some(Action::Prefix(super::PrefixRequest::Reset))
+        );
+        assert_eq!(
+            prefix("."),
+            Some(Action::Prefix(super::PrefixRequest::Set(".".to_owned())))
+        );
+        assert_eq!(
+            prefix("' .'"),
+            Some(Action::Prefix(super::PrefixRequest::Invalid))
+        );
     }
 
     #[test]

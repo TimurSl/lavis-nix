@@ -1,7 +1,8 @@
 pub use crate::response::Response;
 use crate::{
     aliases::AliasStore,
-    commands::{COMMANDS, CommandKind, HelpRequest, definition},
+    commands::{HelpRequest, canonical_command},
+    modules::{commands_for_module, module_by_name},
 };
 
 pub struct RenderedHelp {
@@ -11,21 +12,8 @@ pub struct RenderedHelp {
 
 pub fn render(request: &HelpRequest, prefix: &str, aliases: &AliasStore) -> RenderedHelp {
     match request {
-        HelpRequest::Overview => render_quote(
-            "🛠 Lavis commands".to_owned(),
-            COMMANDS
-                .iter()
-                .map(|definition| {
-                    format!(
-                        "{} {prefix}{} — {}",
-                        definition.icon, definition.usage, definition.summary
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
-        HelpRequest::Topic(kind) => render_topic(*kind, prefix),
-        HelpRequest::Unknown(topic) => render_alias_or_unknown(topic, prefix, aliases),
+        HelpRequest::Overview => render_overview(prefix),
+        HelpRequest::Topic(topic) => render_topic(topic, prefix, aliases),
         HelpRequest::Invalid => RenderedHelp {
             response: Response::plain(format!("⚠️ Usage: {prefix}help [command]")),
             entity_fallback: false,
@@ -33,31 +21,81 @@ pub fn render(request: &HelpRequest, prefix: &str, aliases: &AliasStore) -> Rend
     }
 }
 
-fn render_alias_or_unknown(topic: &str, prefix: &str, aliases: &AliasStore) -> RenderedHelp {
-    let Some(alias) = aliases.lookup(topic) else {
-        return RenderedHelp {
-            response: Response::plain(format!(
-                "❓ Unknown command: {topic}\nUse {prefix}help to list available commands."
-            )),
-            entity_fallback: false,
-        };
-    };
+fn render_overview(prefix: &str) -> RenderedHelp {
+    render_quote(
+        "🛠 Lavis commands".to_owned(),
+        crate::modules::MODULES
+            .iter()
+            .map(|module| {
+                let commands = commands_for_module(module.id)
+                    .map(|definition| {
+                        format!("{prefix}{} — {}", definition.usage, definition.summary)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!(
+                    "{} {} ({})\n{}",
+                    module.icon,
+                    module.name,
+                    commands_for_module(module.id).count(),
+                    commands
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    )
+}
+
+fn render_alias(topic: &str, prefix: &str, aliases: &AliasStore) -> Option<RenderedHelp> {
+    let alias = aliases.lookup(topic)?;
     let preset = if alias.args.is_empty() {
         String::new()
     } else {
         format!(" {}", shell_words::join(&alias.args))
     };
-    render_quote(
+    Some(render_quote(
         format!("🔗 {prefix}{topic}"),
         format!(
             "Alias for {prefix}{}{preset}\n\nUsage: {prefix}{topic} [arguments]",
             alias.target
         ),
-    )
+    ))
 }
 
-fn render_topic(kind: CommandKind, prefix: &str) -> RenderedHelp {
-    let definition = definition(kind);
+fn render_topic(topic: &str, prefix: &str, aliases: &AliasStore) -> RenderedHelp {
+    // Topic precedence is deliberate: canonical commands cannot be shadowed by aliases,
+    // while an existing alias named after a module remains useful.
+    if let Some(definition) = canonical_command(&topic.to_ascii_lowercase()) {
+        return render_command(definition, prefix);
+    }
+    if let Some(rendered) = render_alias(topic, prefix, aliases) {
+        return rendered;
+    }
+    if let Some(module) = module_by_name(topic) {
+        return render_quote(
+            format!("{} {} module", module.icon, module.name),
+            format!(
+                "{}\n\n{}",
+                module.description,
+                commands_for_module(module.id)
+                    .map(|definition| format!(
+                        "{prefix}{} — {}",
+                        definition.usage, definition.summary
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        );
+    }
+    RenderedHelp {
+        response: Response::plain(format!(
+            "❓ Unknown command: {topic}\nUse {prefix}help to list available commands."
+        )),
+        entity_fallback: false,
+    }
+}
+
+fn render_command(definition: &crate::commands::CommandDefinition, prefix: &str) -> RenderedHelp {
     render_quote(
         format!("{} {prefix}{}", definition.icon, definition.usage),
         format!(
@@ -122,15 +160,21 @@ mod tests {
     async fn overview_uses_registry_order_and_configured_prefix_once_per_command() {
         let response = render(&HelpRequest::Overview, "!", &aliases().await).response;
 
-        assert_eq!(response.text.matches('!').count(), 5);
-        assert!(response.text.contains("Measure Telegram latency"));
-        assert!(response.text.contains("Show runtime statistics"));
-        assert!(response.text.contains("Show command help"));
-        assert!(response.text.find("🏓 !ping").unwrap() < response.text.find("📊 !stats").unwrap());
-        assert!(
-            response.text.find("📊 !stats").unwrap()
-                < response.text.find("🛠 !help [command]").unwrap()
+        assert_eq!(
+            response.text,
+            "🛠 Lavis commands\n\n🧩 core (5)\n!help [command] — Show command help\n!modules — List internal modules\n!ping — Measure Telegram latency\n!prefix [new-prefix|reset] — Show or change the command prefix\n!stats — Show runtime statistics\n\n🖥 system (1)\n!fastfetch [options] — Show system information\n\n🔗 aliases (1)\n!alias [list|add <name> <command> [arguments...]|show <name>|del <name>] — Manage command aliases"
         );
+        for command in [
+            "help",
+            "modules",
+            "ping",
+            "prefix",
+            "stats",
+            "fastfetch",
+            "alias",
+        ] {
+            assert_eq!(response.text.matches(&format!("!{command}")).count(), 1);
+        }
         assert_eq!(response.entities.len(), 1);
     }
 
@@ -141,7 +185,12 @@ mod tests {
             (CommandKind::Stats, "📊 ,stats\n\n"),
             (CommandKind::Help, "🛠 ,help [command]\n\n"),
         ] {
-            let response = render(&HelpRequest::Topic(kind), ",", &aliases().await).response;
+            let response = render(
+                &HelpRequest::Topic(definition(kind).name.to_owned()),
+                ",",
+                &aliases().await,
+            )
+            .response;
             let definition = definition(kind);
 
             assert!(response.text.starts_with(title));
@@ -155,12 +204,7 @@ mod tests {
 
     #[tokio::test]
     async fn renders_unknown_and_invalid_help_plainly() {
-        let unknown = render(
-            &HelpRequest::Unknown("foo".to_owned()),
-            ",",
-            &aliases().await,
-        )
-        .response;
+        let unknown = render(&HelpRequest::Topic("foo".to_owned()), ",", &aliases().await).response;
         let invalid = render(&HelpRequest::Invalid, "!", &aliases().await).response;
 
         assert_eq!(
@@ -173,7 +217,7 @@ mod tests {
     #[tokio::test]
     async fn alias_help_uses_the_configured_alias_target() {
         let (aliases, directory) = aliases_with_mini().await;
-        let response = render(&HelpRequest::Unknown("mini".to_owned()), "!", &aliases).response;
+        let response = render(&HelpRequest::Topic("mini".to_owned()), "!", &aliases).response;
 
         assert!(response.text.starts_with("🔗 !mini\n\n"));
         assert!(response.text.contains("Alias for !fastfetch"));
@@ -181,9 +225,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn module_topics_are_case_insensitive_and_aliases_take_precedence() {
+        let (mut store, directory) = aliases_with_mini().await;
+        store
+            .add(
+                "core",
+                Alias {
+                    target: "ping".to_owned(),
+                    args: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let alias = render(&HelpRequest::Topic("CORE".to_owned()), "!", &store).response;
+        assert!(alias.text.starts_with("🔗 !CORE"));
+        let modules = aliases().await;
+        let system = render(&HelpRequest::Topic("SyStEm".to_owned()), "!", &modules).response;
+        assert_eq!(
+            system.text,
+            "🖥 system module\n\nSystem information commands.\n\n!fastfetch [options] — Show system information"
+        );
+        assert_eq!(system.entities.len(), 1);
+        let grammers_client::tl::enums::MessageEntity::Blockquote(entity) = &system.entities[0]
+        else {
+            panic!("expected a blockquote entity");
+        };
+        let units: Vec<u16> = system.text.encode_utf16().collect();
+        let offset = usize::try_from(entity.offset).unwrap();
+        let length = usize::try_from(entity.length).unwrap();
+        assert_eq!(
+            String::from_utf16(&units[offset..offset + length]).unwrap(),
+            "System information commands.\n\n!fastfetch [options] — Show system information"
+        );
+        assert_eq!(
+            length,
+            "System information commands.\n\n!fastfetch [options] — Show system information"
+                .encode_utf16()
+                .count()
+        );
+        assert!(entity.collapsed);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
     async fn blockquote_uses_utf16_body_bounds() {
         let response = render(
-            &HelpRequest::Topic(CommandKind::Help),
+            &HelpRequest::Topic("help".to_owned()),
             "🦀",
             &aliases().await,
         )
@@ -203,7 +290,7 @@ mod tests {
         );
         assert_eq!(
             String::from_utf16(&text_units[offset..offset + length]).unwrap(),
-            "Shows the command overview or detailed help for a single command.\n\nUsage: 🦀help [command]"
+            "Shows the command overview or detailed help for a command, alias, or module.\n\nUsage: 🦀help [command]"
         );
     }
 

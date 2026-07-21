@@ -1,29 +1,86 @@
-use std::time::{Duration, Instant};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 use grammers_client::{Client, tl};
+use grammers_session::types::PeerId;
 
 use crate::{
     aliases::{Alias, AliasStore, DeleteResult},
     command::Command,
-    commands::{Action, AliasRequest, dispatch},
+    commands::{Action, AliasRequest, ModulesRequest, PrefixRequest, dispatch},
     fastfetch::{self, FastfetchInputError, FastfetchResult},
     help::render,
+    modules::{MODULES, commands_for_module},
     response::Response,
+    settings::{DEFAULT_PREFIX, SettingsStore},
 };
 
 pub struct RuntimeState {
     started_at: Instant,
     recognized_commands: u64,
     aliases: AliasStore,
+    settings: SettingsStore,
+    expected_self_edits: VecDeque<ExpectedSelfEdit>,
+}
+
+const MAX_EXPECTED_SELF_EDITS: usize = 128;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ExpectedSelfEdit {
+    peer_id: PeerId,
+    message_id: i32,
+    text: String,
 }
 
 impl RuntimeState {
-    pub fn new(started_at: Instant, aliases: AliasStore) -> Self {
+    pub fn new(started_at: Instant, aliases: AliasStore, settings: SettingsStore) -> Self {
         Self {
             started_at,
             recognized_commands: 0,
             aliases,
+            settings,
+            expected_self_edits: VecDeque::new(),
         }
+    }
+
+    pub fn prefix(&self) -> &str {
+        self.settings.prefix()
+    }
+
+    pub fn register_expected_self_edit(&mut self, peer_id: PeerId, message_id: i32, text: String) {
+        self.expected_self_edits
+            .retain(|expected| expected.peer_id != peer_id || expected.message_id != message_id);
+        if self.expected_self_edits.len() == MAX_EXPECTED_SELF_EDITS {
+            self.expected_self_edits.pop_front();
+        }
+        self.expected_self_edits.push_back(ExpectedSelfEdit {
+            peer_id,
+            message_id,
+            text,
+        });
+    }
+
+    pub fn consume_expected_self_edit(
+        &mut self,
+        peer_id: PeerId,
+        message_id: i32,
+        text: &str,
+    ) -> bool {
+        let Some(index) = self.expected_self_edits.iter().position(|expected| {
+            expected.peer_id == peer_id
+                && expected.message_id == message_id
+                && expected.text == text
+        }) else {
+            return false;
+        };
+        self.expected_self_edits.remove(index);
+        true
+    }
+
+    pub fn remove_expected_self_edit(&mut self, peer_id: PeerId, message_id: i32, text: &str) {
+        self.consume_expected_self_edit(peer_id, message_id, text);
     }
 
     pub fn resolve_alias(&self, name: &str, args: &str) -> Option<Action> {
@@ -35,14 +92,9 @@ impl RuntimeState {
         })
     }
 
-    pub async fn execute(
-        &mut self,
-        client: &Client,
-        action: &Action,
-        message_id: i32,
-        prefix: &str,
-    ) -> Response {
+    pub async fn execute(&mut self, client: &Client, action: &Action, message_id: i32) -> Response {
         self.recognized_commands = self.recognized_commands.saturating_add(1);
+        let prefix = self.prefix().to_owned();
         match action {
             Action::Ping => match telegram_ping(client, message_id).await {
                 Ok(latency) => Response::plain(format!("🏓 Pong: {}", format_latency(latency))),
@@ -69,7 +121,7 @@ impl RuntimeState {
                 ))
             }
             Action::Help(request) => {
-                let rendered = render(request, prefix, &self.aliases);
+                let rendered = render(request, &prefix, &self.aliases);
                 if rendered.entity_fallback {
                     tracing::warn!(
                         event = "help_entity_fallback",
@@ -79,7 +131,69 @@ impl RuntimeState {
                 rendered.response
             }
             Action::Fastfetch(arguments) => fastfetch_response(fastfetch::run(arguments).await),
-            Action::Alias(request) => self.execute_alias(request, prefix).await,
+            Action::Alias(request) => self.execute_alias(request, &prefix).await,
+            Action::Prefix(request) => self.execute_prefix(request).await,
+            Action::Modules(request) => self.execute_modules(request, &prefix),
+        }
+    }
+
+    fn execute_modules(&self, request: &ModulesRequest, prefix: &str) -> Response {
+        match request {
+            ModulesRequest::Overview => {
+                let command_count = crate::commands::COMMANDS.canonical_iter().count();
+                tracing::info!(
+                    event = "modules_overview",
+                    module_count = MODULES.len(),
+                    command_count,
+                    "Rendered module overview"
+                );
+                let rendered = Response::collapsed(
+                    "🧩 Lavis modules".to_owned(),
+                    MODULES
+                        .iter()
+                        .map(|module| {
+                            let commands = commands_for_module(module.id)
+                                .map(|command| format!("{prefix}{}", command.name))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            format!(
+                                "{} {} ({}): {commands}",
+                                module.icon,
+                                module.name,
+                                commands_for_module(module.id).count()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+                if rendered.entity_fallback {
+                    tracing::warn!(
+                        event = "modules_entity_fallback",
+                        "Module formatting was unavailable"
+                    );
+                }
+                rendered.response
+            }
+            ModulesRequest::Invalid => Response::plain(format!("⚠️ Usage: {prefix}modules")),
+        }
+    }
+
+    pub(crate) async fn execute_prefix(&mut self, request: &PrefixRequest) -> Response {
+        match request {
+            PrefixRequest::Show => Response::plain(format!("⚙️ Active prefix: {}", self.prefix())),
+            PrefixRequest::Set(prefix) => match self.settings.set_prefix(prefix.clone()).await {
+                Ok(()) => Response::plain(format!("⚙️ Command prefix set to: {}", self.prefix())),
+                Err(error) => Response::plain(format!("⚠️ Could not change prefix: {error}")),
+            },
+            PrefixRequest::Reset => match self.settings.set_prefix(DEFAULT_PREFIX.to_owned()).await
+            {
+                Ok(()) => Response::plain(format!("⚙️ Command prefix reset to: {}", self.prefix())),
+                Err(error) => Response::plain(format!("⚠️ Could not reset prefix: {error}")),
+            },
+            PrefixRequest::Invalid => Response::plain(format!(
+                "⚠️ Usage: {}prefix [new-prefix|reset]",
+                self.prefix()
+            )),
         }
     }
 
@@ -364,7 +478,13 @@ mod tests {
             )
             .await
             .unwrap();
-        (super::RuntimeState::new(Instant::now(), aliases), directory)
+        let settings = crate::settings::SettingsStore::load(directory.join("settings.json"))
+            .await
+            .unwrap();
+        (
+            super::RuntimeState::new(Instant::now(), aliases, settings),
+            directory,
+        )
     }
 
     #[tokio::test]
@@ -424,6 +544,111 @@ mod tests {
                 "⚠️ Usage: !alias [list|add <name> <command> [arguments...]|show <name>|del <name>]"
             )
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn modules_overview_uses_current_prefix_and_invalid_usage() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        runtime
+            .execute_prefix(&crate::commands::PrefixRequest::Set("🦀".to_owned()))
+            .await;
+        let overview =
+            runtime.execute_modules(&crate::commands::ModulesRequest::Overview, runtime.prefix());
+        assert_eq!(
+            overview.text,
+            "🧩 Lavis modules\n\n🧩 core (5): 🦀help, 🦀modules, 🦀ping, 🦀prefix, 🦀stats\n🖥 system (1): 🦀fastfetch\n🔗 aliases (1): 🦀alias"
+        );
+        assert_eq!(overview.entities.len(), 1);
+        assert_eq!(
+            runtime.execute_modules(&crate::commands::ModulesRequest::Invalid, runtime.prefix()),
+            Response::plain("⚠️ Usage: 🦀modules")
+        );
+        let entity = &overview.entities[0];
+        let grammers_client::tl::enums::MessageEntity::Blockquote(entity) = entity else {
+            panic!("expected blockquote")
+        };
+        let units = overview.text.encode_utf16().collect::<Vec<_>>();
+        let offset = usize::try_from(entity.offset).unwrap();
+        let length = usize::try_from(entity.length).unwrap();
+        assert_eq!(
+            String::from_utf16(&units[..offset]).unwrap(),
+            "🧩 Lavis modules\n\n"
+        );
+        assert_eq!(
+            String::from_utf16(&units[offset..offset + length]).unwrap(),
+            "🧩 core (5): 🦀help, 🦀modules, 🦀ping, 🦀prefix, 🦀stats\n🖥 system (1): 🦀fastfetch\n🔗 aliases (1): 🦀alias"
+        );
+        assert_eq!(
+            length,
+            "🧩 core (5): 🦀help, 🦀modules, 🦀ping, 🦀prefix, 🦀stats\n🖥 system (1): 🦀fastfetch\n🔗 aliases (1): 🦀alias"
+                .encode_utf16()
+                .count()
+        );
+        assert!(entity.collapsed);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn bounds_replaces_and_cleans_up_expected_self_edits() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        let peer = grammers_session::types::PeerId::user(1).unwrap();
+        for message_id in 0..=super::MAX_EXPECTED_SELF_EDITS as i32 {
+            runtime.register_expected_self_edit(peer, message_id, format!("response {message_id}"));
+        }
+        assert!(!runtime.consume_expected_self_edit(peer, 0, "response 0"));
+        assert!(runtime.consume_expected_self_edit(
+            peer,
+            super::MAX_EXPECTED_SELF_EDITS as i32,
+            &format!("response {}", super::MAX_EXPECTED_SELF_EDITS)
+        ));
+
+        runtime.register_expected_self_edit(peer, 42, "old response".to_owned());
+        runtime.register_expected_self_edit(peer, 42, "new response".to_owned());
+        assert!(!runtime.consume_expected_self_edit(peer, 42, "old response"));
+        assert!(runtime.consume_expected_self_edit(peer, 42, "new response"));
+
+        runtime.register_expected_self_edit(peer, 43, "failed response".to_owned());
+        runtime.remove_expected_self_edit(peer, 43, "failed response");
+        assert!(!runtime.consume_expected_self_edit(peer, 43, "failed response"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prefix_changes_persist_reset_and_fail_without_changing_runtime_state() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        assert_eq!(runtime.prefix(), ",");
+        assert_eq!(
+            runtime
+                .execute_prefix(&crate::commands::PrefixRequest::Set(".".to_owned()))
+                .await
+                .text,
+            "⚙️ Command prefix set to: ."
+        );
+        assert_eq!(runtime.prefix(), ".");
+        assert_eq!(
+            crate::settings::SettingsStore::load(directory.join("settings.json"))
+                .await
+                .unwrap()
+                .prefix(),
+            "."
+        );
+        assert_eq!(
+            runtime
+                .execute_prefix(&crate::commands::PrefixRequest::Reset)
+                .await
+                .text,
+            "⚙️ Command prefix reset to: ,"
+        );
+        assert_eq!(runtime.prefix(), ",");
+        assert!(
+            runtime
+                .execute_prefix(&crate::commands::PrefixRequest::Set("bad".to_owned()))
+                .await
+                .text
+                .contains("Could not change")
+        );
+        assert_eq!(runtime.prefix(), ",");
         fs::remove_dir_all(directory).unwrap();
     }
 
