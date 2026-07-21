@@ -21,11 +21,41 @@ pub enum ConfigError {
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
+pub enum SettingsError {
+    #[error("settings prefix must be 1–4 visible non-alphabetic characters")]
+    InvalidPrefix,
+    #[error("settings file is too large")]
+    FileTooLarge,
+    #[error("settings file is malformed")]
+    MalformedFile,
+    #[error("settings file version is unsupported")]
+    UnsupportedVersion,
+    #[error("failed to read settings storage")]
+    Read,
+    #[error("settings state directory is unavailable")]
+    CreateDirectory,
+    #[error("failed to create settings temporary file")]
+    CreateTemporary,
+    #[error("failed to write settings temporary file")]
+    WriteTemporary,
+    #[error("failed to synchronize settings temporary file")]
+    SyncTemporary,
+    #[error("failed to replace settings file")]
+    Replace,
+    #[error("failed to run settings storage task")]
+    StorageTask,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum AliasError {
     #[error("alias name is invalid")]
     InvalidName,
     #[error("alias name conflicts with a built-in command")]
     ReservedName,
+    #[error("alias name 'prefix' is reserved; remove or rename the legacy alias")]
+    PrefixReserved,
+    #[error("alias name 'modules' is reserved; remove or rename the legacy alias")]
+    ModulesReserved,
     #[error("alias already exists")]
     AlreadyExists,
     #[error("alias target is not a canonical command")]

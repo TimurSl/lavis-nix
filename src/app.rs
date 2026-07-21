@@ -10,8 +10,10 @@ pub mod config;
 pub mod error;
 pub mod fastfetch;
 pub mod help;
+pub mod modules;
 pub mod response;
 pub mod runtime;
+pub mod settings;
 pub mod updates;
 
 pub async fn run() -> anyhow::Result<()> {
@@ -22,6 +24,9 @@ pub async fn run() -> anyhow::Result<()> {
         .context("failed to open the Telegram session")?;
 
     let run_result = async {
+        let settings = settings::SettingsStore::load(config.settings_path.clone())
+            .await
+            .context("failed to load persistent settings")?;
         let self_user_id = auth::authorize(client.client(), &config)
             .await
             .context("Telegram authorization failed")?;
@@ -47,15 +52,8 @@ pub async fn run() -> anyhow::Result<()> {
             .await
             .context("failed to load persistent aliases")?;
         tracing::info!(event = "application_started", "lavis is running");
-        let mut runtime = runtime::RuntimeState::new(started_at, aliases);
-        updates::run(
-            &mut stream,
-            &config.prefix,
-            self_user_id,
-            client.client(),
-            &mut runtime,
-        )
-        .await?;
+        let mut runtime = runtime::RuntimeState::new(started_at, aliases, settings);
+        updates::run(&mut stream, self_user_id, client.client(), &mut runtime).await?;
         drop(stream);
         Ok(())
     }

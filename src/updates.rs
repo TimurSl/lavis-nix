@@ -10,7 +10,6 @@ use crate::{
 
 pub async fn run(
     stream: &mut UpdateStream,
-    prefix: &str,
     self_user_id: PeerId,
     client: &grammers_client::Client,
     runtime: &mut RuntimeState,
@@ -31,7 +30,7 @@ pub async fn run(
             }
             update = stream.next() => {
                 let update = update.context("Telegram update stream ended or failed")?;
-                process_update(update, prefix, self_user_id, client, runtime).await;
+                process_update(update, self_user_id, client, runtime).await;
             }
         }
     }
@@ -39,15 +38,25 @@ pub async fn run(
 
 async fn process_update(
     update: Update,
-    prefix: &str,
     self_user_id: PeerId,
     client: &grammers_client::Client,
     runtime: &mut RuntimeState,
 ) {
-    let Update::NewMessage(message) = update else {
-        return;
+    let (message, edited) = match update {
+        Update::NewMessage(message) => (message, false),
+        Update::MessageEdited(message) => (message, true),
+        _ => return,
     };
     let message_id = message.id();
+    let peer_id = message.peer_id();
+    if edited && runtime.consume_expected_self_edit(peer_id, message_id, message.text()) {
+        tracing::debug!(
+            event = "command_self_edit_suppressed",
+            message_id,
+            "Suppressed the expected command response edit"
+        );
+        return;
+    }
     let outgoing = message.outgoing();
     let authored_by_self = is_self_authored(message.sender_id(), outgoing, self_user_id);
     tracing::debug!(
@@ -58,7 +67,7 @@ async fn process_update(
         "Received Telegram message update"
     );
 
-    let Some(action) = route(authored_by_self, message.text(), prefix, runtime) else {
+    let Some(action) = route(authored_by_self, message.text(), runtime) else {
         return;
     };
     tracing::debug!(
@@ -68,10 +77,12 @@ async fn process_update(
         "Matched authenticated command"
     );
 
-    let response = runtime.execute(client, &action, message_id, prefix).await;
+    let response = runtime.execute(client, &action, message_id).await;
+    let rendered_text = response.text;
     let input = grammers_client::message::InputMessage::new()
-        .text(response.text)
+        .text(rendered_text.clone())
         .fmt_entities(response.entities);
+    runtime.register_expected_self_edit(peer_id, message_id, rendered_text.clone());
     match message.edit(input).await {
         Ok(()) => {
             tracing::debug!(
@@ -82,6 +93,7 @@ async fn process_update(
             );
         }
         Err(error) => {
+            runtime.remove_expected_self_edit(peer_id, message_id, &rendered_text);
             tracing::warn!(
                 event = "command_edit_failed",
                 command = action.name(),
@@ -102,13 +114,10 @@ fn is_self_authored(sender_id: Option<PeerId>, outgoing: bool, self_user_id: Pee
     }
 }
 
-fn route(
-    authored_by_self: bool,
-    text: &str,
-    prefix: &str,
-    runtime: &RuntimeState,
-) -> Option<Action> {
-    let command = authored_by_self.then(|| parse(text, prefix)).flatten()?;
+fn route(authored_by_self: bool, text: &str, runtime: &RuntimeState) -> Option<Action> {
+    let command = authored_by_self
+        .then(|| parse(text, runtime.prefix()))
+        .flatten()?;
     dispatch(&command).or_else(|| runtime.resolve_alias(&command.name, &command.args))
 }
 
@@ -117,14 +126,21 @@ mod tests {
     use grammers_session::types::PeerId;
 
     use super::{is_self_authored, route};
-    use crate::commands::Action;
-    use crate::{aliases::AliasStore, runtime::RuntimeState};
+    use crate::commands::{Action, PrefixRequest};
+    use crate::{
+        aliases::{Alias, AliasStore},
+        runtime::RuntimeState,
+        settings::SettingsStore,
+    };
     use std::{path::PathBuf, time::Instant};
 
     async fn runtime() -> RuntimeState {
         RuntimeState::new(
             Instant::now(),
             AliasStore::load(PathBuf::from("/nonexistent/lavis-updates-aliases.json"))
+                .await
+                .unwrap(),
+            SettingsStore::load(PathBuf::from("/nonexistent/lavis-updates-settings.json"))
                 .await
                 .unwrap(),
         )
@@ -137,7 +153,7 @@ mod tests {
 
         assert!(!outgoing);
         assert_eq!(
-            route(authored_by_self, ",ping", ",", &runtime().await),
+            route(authored_by_self, ",ping", &runtime().await),
             Some(Action::Ping)
         );
     }
@@ -148,18 +164,105 @@ mod tests {
         let authored_by_self = false;
 
         assert!(outgoing);
-        assert_eq!(
-            route(authored_by_self, ",ping", ",", &runtime().await),
-            None
-        );
+        assert_eq!(route(authored_by_self, ",ping", &runtime().await), None);
     }
 
     #[tokio::test]
     async fn ignores_self_authored_normal_unknown_and_dot_prefixed_text() {
         let runtime = runtime().await;
-        assert_eq!(route(true, "ordinary outgoing text", ",", &runtime), None);
-        assert_eq!(route(true, ",unknown", ",", &runtime), None);
-        assert_eq!(route(true, ".ping", ",", &runtime), None);
+        assert_eq!(route(true, "ordinary outgoing text", &runtime), None);
+        assert_eq!(route(true, ",unknown", &runtime), None);
+        assert_eq!(route(true, ".ping", &runtime), None);
+    }
+
+    #[tokio::test]
+    async fn routes_edited_style_text_with_the_active_prefix() {
+        let directory = std::env::temp_dir().join(format!(
+            "lavis-updates-prefix-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let aliases = AliasStore::load(directory.join("aliases.json"))
+            .await
+            .unwrap();
+        let mut settings = SettingsStore::load(directory.join("settings.json"))
+            .await
+            .unwrap();
+        settings.set_prefix(".".to_owned()).await.unwrap();
+        let runtime = RuntimeState::new(Instant::now(), aliases, settings);
+        assert_eq!(
+            route(true, ".help", &runtime),
+            Some(Action::Help(crate::commands::HelpRequest::Overview))
+        );
+        assert_eq!(route(true, ",help", &runtime), None);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn routes_modules_aliases_and_a_new_prefix_in_the_same_runtime() {
+        let directory = std::env::temp_dir().join(format!(
+            "lavis-updates-routing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut aliases = AliasStore::load(directory.join("aliases.json"))
+            .await
+            .unwrap();
+        aliases
+            .add(
+                "mods",
+                Alias {
+                    target: "modules".to_owned(),
+                    args: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let settings = SettingsStore::load(directory.join("settings.json"))
+            .await
+            .unwrap();
+        let mut runtime = RuntimeState::new(Instant::now(), aliases, settings);
+
+        assert_eq!(
+            route(true, ",modules", &runtime),
+            Some(Action::Modules(crate::commands::ModulesRequest::Overview))
+        );
+        assert_eq!(
+            route(true, ",mods", &runtime),
+            Some(Action::Modules(crate::commands::ModulesRequest::Overview))
+        );
+        runtime
+            .execute_prefix(&PrefixRequest::Set(".".to_owned()))
+            .await;
+        assert_eq!(
+            route(true, ".modules", &runtime),
+            Some(Action::Modules(crate::commands::ModulesRequest::Overview))
+        );
+        assert_eq!(route(true, ",modules", &runtime), None);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_suppresses_the_exact_expected_edit_in_its_peer() {
+        let mut runtime = runtime().await;
+        let first_peer = PeerId::user(1).unwrap();
+        let second_peer = PeerId::user(2).unwrap();
+        runtime.register_expected_self_edit(first_peer, 7, "🏓 Pong: 1 ms".to_owned());
+
+        assert!(!runtime.consume_expected_self_edit(first_peer, 7, ",ping"));
+        assert_eq!(route(true, ",ping", &runtime), Some(Action::Ping));
+        assert!(!runtime.consume_expected_self_edit(second_peer, 7, "🏓 Pong: 1 ms"));
+        assert_eq!(route(true, ",ping", &runtime), Some(Action::Ping));
+        assert!(runtime.consume_expected_self_edit(first_peer, 7, "🏓 Pong: 1 ms"));
+        assert!(!runtime.consume_expected_self_edit(first_peer, 7, "🏓 Pong: 1 ms"));
     }
 
     #[test]

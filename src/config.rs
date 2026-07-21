@@ -8,10 +8,11 @@ pub const API_HASH_ENV: &str = "LAVIS_API_HASH";
 pub struct Config {
     pub api_id: u32,
     api_hash: String,
-    pub prefix: String,
+    pub default_prefix: String,
     pub session_path: PathBuf,
     pub state_dir: PathBuf,
     pub aliases_path: PathBuf,
+    pub settings_path: PathBuf,
 }
 
 impl fmt::Debug for Config {
@@ -20,7 +21,7 @@ impl fmt::Debug for Config {
             .debug_struct("Config")
             .field("api_id", &self.api_id)
             .field("api_hash", &"[REDACTED]")
-            .field("prefix", &self.prefix)
+            .field("default_prefix", &self.default_prefix)
             .field("session_path", &self.session_path)
             .finish()
     }
@@ -28,14 +29,12 @@ impl fmt::Debug for Config {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigPaths {
-    pub prefix: String,
     pub session_path: PathBuf,
 }
 
 impl ConfigPaths {
-    pub fn new(prefix: impl Into<String>, session_path: impl Into<PathBuf>) -> Self {
+    pub fn new(session_path: impl Into<PathBuf>) -> Self {
         Self {
-            prefix: prefix.into(),
             session_path: session_path.into(),
         }
     }
@@ -49,7 +48,7 @@ impl ConfigPaths {
             .or_else(|| environment("HOME").map(|home| PathBuf::from(home).join(".local/state")))
             .ok_or(ConfigError::MissingStateDirectory)?;
 
-        Ok(Self::new(",", state_directory.join("lavis/session")))
+        Ok(Self::new(state_directory.join("lavis/session")))
     }
 }
 
@@ -67,9 +66,6 @@ impl Config {
         let api_id = required_api_id(environment(API_ID_ENV))?;
         let api_hash = required_api_hash(environment(API_HASH_ENV))?;
 
-        if paths.prefix.is_empty() {
-            return Err(ConfigError::EmptyPrefix);
-        }
         if paths.session_path.as_os_str().is_empty() {
             return Err(ConfigError::EmptySessionPath);
         }
@@ -84,9 +80,10 @@ impl Config {
         Ok(Self {
             api_id,
             api_hash,
-            prefix: paths.prefix,
+            default_prefix: crate::settings::DEFAULT_PREFIX.to_owned(),
             session_path: paths.session_path,
             aliases_path: state_dir.join("aliases.json"),
+            settings_path: state_dir.join("settings.json"),
             state_dir,
         })
     }
@@ -139,18 +136,19 @@ mod tests {
     #[test]
     fn loads_configuration_from_injected_environment_and_paths() {
         let environment = environment(&[(API_ID_ENV, "12345"), (API_HASH_ENV, "test-api-hash")]);
-        let paths = ConfigPaths::new("!", "/tmp/lavis-test.session");
+        let paths = ConfigPaths::new("/tmp/lavis-test.session");
 
         let config = Config::load_with(&environment, paths).unwrap();
 
         assert_eq!(config.api_id, 12345);
-        assert_eq!(config.prefix, "!");
+        assert_eq!(config.default_prefix, ",");
         assert_eq!(
             config.session_path,
             PathBuf::from("/tmp/lavis-test.session")
         );
         assert_eq!(config.state_dir, PathBuf::from("/tmp"));
         assert_eq!(config.aliases_path, PathBuf::from("/tmp/aliases.json"));
+        assert_eq!(config.settings_path, PathBuf::from("/tmp/settings.json"));
         assert_eq!(config.api_hash, "test-api-hash");
         assert!(!format!("{config:?}").contains("test-api-hash"));
     }
@@ -159,7 +157,7 @@ mod tests {
     fn distinguishes_missing_and_invalid_api_id() {
         let missing = environment(&[(API_HASH_ENV, "hash")]);
         let invalid = environment(&[(API_ID_ENV, "not-a-number"), (API_HASH_ENV, "hash")]);
-        let paths = || ConfigPaths::new(".", "/tmp/session");
+        let paths = || ConfigPaths::new("/tmp/session");
 
         assert!(matches!(
             Config::load_with(&missing, paths()),
@@ -180,7 +178,7 @@ mod tests {
     fn rejects_missing_or_empty_api_hash_without_exposing_it() {
         let missing = environment(&[(API_ID_ENV, "1")]);
         let empty = environment(&[(API_ID_ENV, "1"), (API_HASH_ENV, "")]);
-        let paths = || ConfigPaths::new(".", "/tmp/session");
+        let paths = || ConfigPaths::new("/tmp/session");
 
         assert!(matches!(
             Config::load_with(&missing, paths()),
@@ -201,7 +199,6 @@ mod tests {
             ConfigPaths::default_with(&xdg).unwrap().session_path,
             PathBuf::from("/tmp/state/lavis/session")
         );
-        assert_eq!(ConfigPaths::default_with(&xdg).unwrap().prefix, ",");
         let config = Config::load_with(
             &environment(&[(API_ID_ENV, "1"), (API_HASH_ENV, "hash")]),
             ConfigPaths::default_with(&xdg).unwrap(),
@@ -211,6 +208,10 @@ mod tests {
         assert_eq!(
             config.aliases_path,
             PathBuf::from("/tmp/state/lavis/aliases.json")
+        );
+        assert_eq!(
+            config.settings_path,
+            PathBuf::from("/tmp/state/lavis/settings.json")
         );
         assert_eq!(
             ConfigPaths::default_with(&home).unwrap().session_path,
