@@ -2,7 +2,10 @@ use std::time::{Duration, Instant};
 
 use grammers_client::{Client, tl};
 
-use crate::commands::Action;
+use crate::{
+    commands::Action,
+    help::{Response, render},
+};
 
 pub struct RuntimeState {
     started_at: Instant,
@@ -17,14 +20,20 @@ impl RuntimeState {
         }
     }
 
-    pub async fn execute(&mut self, client: &Client, action: Action, message_id: i32) -> String {
+    pub async fn execute(
+        &mut self,
+        client: &Client,
+        action: &Action,
+        message_id: i32,
+        prefix: &str,
+    ) -> Response {
         self.recognized_commands = self.recognized_commands.saturating_add(1);
         match action {
             Action::Ping => match telegram_ping(client, message_id).await {
-                Ok(latency) => format!("🏓 Pong: {}", format_latency(latency)),
+                Ok(latency) => Response::plain(format!("🏓 Pong: {}", format_latency(latency))),
                 Err(error) => {
                     log_ping_failure(action, message_id, &error);
-                    "⚠️ Telegram ping failed".to_owned()
+                    Response::plain("⚠️ Telegram ping failed")
                 }
             },
             Action::Stats => {
@@ -37,12 +46,22 @@ impl RuntimeState {
                 };
                 let proc_stats = read_proc_stats().await;
                 log_unavailable_proc_stats(&proc_stats);
-                format_stats(
+                Response::plain(format_stats(
                     &telegram,
                     self.started_at.elapsed(),
                     &proc_stats,
                     self.recognized_commands,
-                )
+                ))
+            }
+            Action::Help(request) => {
+                let rendered = render(request, prefix);
+                if rendered.entity_fallback {
+                    tracing::warn!(
+                        event = "help_entity_fallback",
+                        "Help formatting was unavailable"
+                    );
+                }
+                rendered.response
             }
         }
     }
@@ -61,7 +80,7 @@ async fn telegram_ping(
     Ok(started_at.elapsed())
 }
 
-fn log_ping_failure(action: Action, message_id: i32, error: &grammers_mtsender::InvocationError) {
+fn log_ping_failure(action: &Action, message_id: i32, error: &grammers_mtsender::InvocationError) {
     tracing::warn!(
         event = "telegram_ping_failed",
         command = action.name(),

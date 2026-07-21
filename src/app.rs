@@ -7,6 +7,7 @@ pub mod command;
 pub mod commands;
 pub mod config;
 pub mod error;
+pub mod help;
 pub mod runtime;
 pub mod updates;
 

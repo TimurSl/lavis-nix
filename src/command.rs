@@ -51,6 +51,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_help_with_the_comma_prefix_and_rejects_dots() {
+        assert_eq!(
+            parse(",help stats", ","),
+            Some(Command {
+                name: "help".to_owned(),
+                args: "stats".to_owned(),
+            })
+        );
+        assert_eq!(parse(".help", ","), None);
+    }
+
+    #[test]
     fn parses_command_arguments() {
         assert_eq!(
             parse(",edit hello world", ","),

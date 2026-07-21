@@ -62,14 +62,17 @@ async fn process_update(
         return;
     };
     tracing::debug!(
-        event = "outgoing_command_matched",
+        event = "command_matched",
         command = action.name(),
         message_id,
-        "Matched outgoing command"
+        "Matched authenticated command"
     );
 
-    let response = runtime.execute(client, action, message_id).await;
-    match message.edit(response).await {
+    let response = runtime.execute(client, &action, message_id, prefix).await;
+    let input = grammers_client::message::InputMessage::new()
+        .text(response.text)
+        .fmt_entities(response.entities);
+    match message.edit(input).await {
         Ok(()) => {
             tracing::debug!(
                 event = "command_edit_succeeded",
