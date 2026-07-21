@@ -1,4 +1,5 @@
 use anyhow::Context;
+use std::time::Instant;
 
 pub mod auth;
 pub mod client;
@@ -6,9 +7,11 @@ pub mod command;
 pub mod commands;
 pub mod config;
 pub mod error;
+pub mod runtime;
 pub mod updates;
 
 pub async fn run() -> anyhow::Result<()> {
+    let started_at = Instant::now();
     let config = config::Config::load().context("failed to load configuration")?;
     let mut client = client::TelegramClient::connect(&config)
         .await
@@ -37,7 +40,15 @@ pub async fn run() -> anyhow::Result<()> {
             .context("failed to create the Telegram update stream")?;
 
         tracing::info!(event = "application_started", "lavis is running");
-        updates::run(&mut stream, &config.prefix, self_user_id).await?;
+        let mut runtime = runtime::RuntimeState::new(started_at);
+        updates::run(
+            &mut stream,
+            &config.prefix,
+            self_user_id,
+            client.client(),
+            &mut runtime,
+        )
+        .await?;
         drop(stream);
         Ok(())
     }
