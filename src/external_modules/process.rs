@@ -165,9 +165,7 @@ impl ModuleProcess {
         self.in_flight_request = Some(req_id.clone());
         self.send(&msg).await?;
 
-        let result = match timeout(EXECUTE_TIMEOUT, self.collect_reply(&req_id))
-            .await
-        {
+        let result = match timeout(EXECUTE_TIMEOUT, self.collect_reply(&req_id)).await {
             Ok(inner) => inner,
             Err(_) => {
                 self.status = ProcessStatus::Crashed;
