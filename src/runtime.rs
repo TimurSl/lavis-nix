@@ -12,7 +12,7 @@ use crate::{
     command::Command,
     commands::{Action, AliasRequest, ExternalInvocation, ModulesRequest, PrefixRequest, dispatch},
     error::ExternalError,
-    external_modules::manager::ExternalManagerHandle,
+    external_modules::manager::{ExternalManagerHandle, ExternalRuntimeSnapshot},
     fastfetch::{self, FastfetchInputError, FastfetchProfileError, FastfetchResult},
     help::{render_modules_overview_with_external, render_with_external},
     response::Response,
@@ -26,11 +26,7 @@ pub struct RuntimeState {
     settings: SettingsStore,
     fastfetch_profile_path: PathBuf,
     external_manager: Option<ExternalManagerHandle>,
-    /// Pre-computed sync-routing set: {"module-id.command-name", ...}
-    active_external_commands: std::collections::HashSet<String>,
-    /// Snapshots for sync Help/modules rendering
-    external_command_refs: Vec<crate::external_modules::manager::ExternalCommandRef>,
-    external_descriptors: Vec<crate::external_modules::manifest::ExternalModuleDescriptor>,
+    external_snapshot: ExternalRuntimeSnapshot,
     expected_self_edits: VecDeque<ExpectedSelfEdit>,
 }
 
@@ -57,24 +53,13 @@ impl RuntimeState {
             settings,
             fastfetch_profile_path,
             external_manager: None,
-            active_external_commands: std::collections::HashSet::new(),
-            external_command_refs: Vec::new(),
-            external_descriptors: Vec::new(),
+            external_snapshot: ExternalRuntimeSnapshot::new(),
             expected_self_edits: VecDeque::new(),
         }
     }
 
     pub async fn set_external_manager(&mut self, handle: ExternalManagerHandle) {
-        {
-            let mgr = handle.lock().await;
-            self.active_external_commands = mgr
-                .command_refs()
-                .into_iter()
-                .map(|r| format!("{}.{}", r.module_id, r.command_name))
-                .collect();
-            self.external_command_refs = mgr.command_refs();
-            self.external_descriptors = mgr.descriptors().to_vec();
-        }
+        self.external_snapshot = handle.snapshot().await;
         self.external_manager = Some(handle);
     }
 
@@ -82,18 +67,24 @@ impl RuntimeState {
         self.external_manager.as_ref()
     }
 
+    pub async fn refresh_snapshot(&mut self) {
+        if let Some(handle) = &self.external_manager {
+            self.external_snapshot = handle.snapshot().await;
+        }
+    }
+
     pub fn external_command_refs(&self) -> &[crate::external_modules::manager::ExternalCommandRef] {
-        &self.external_command_refs
+        &self.external_snapshot.command_refs
     }
 
     pub fn has_active_external_command(&self, name: &str) -> bool {
-        self.active_external_commands.contains(name)
+        self.external_snapshot.active_commands.contains(name)
     }
 
     pub fn external_descriptors(
         &self,
     ) -> &[crate::external_modules::manifest::ExternalModuleDescriptor] {
-        &self.external_descriptors
+        &self.external_snapshot.descriptors
     }
 
     pub fn prefix(&self) -> &str {
@@ -175,19 +166,29 @@ impl RuntimeState {
     }
 
     async fn execute_external(&mut self, invocation: &ExternalInvocation) -> Response {
-        let Some(handle) = self.external_manager.as_ref() else {
-            return Response::plain("⚠️ Внешние модули не доступны.".to_owned());
+        let handle = match self.external_manager.clone() {
+            Some(h) => h,
+            None => return Response::plain("⚠️ Внешние модули не доступны.".to_owned()),
         };
         let mut mgr = handle.lock().await;
-        match mgr
+        let result = mgr
             .execute(
                 &invocation.module_id,
                 &invocation.command_name,
                 &invocation.arguments,
             )
-            .await
-        {
-            Ok(text) => Response::plain(text),
+            .await;
+        let response = match &result {
+            Ok(text) => {
+                let provenance = self
+                    .external_snapshot
+                    .descriptors
+                    .iter()
+                    .find(|d| d.id == invocation.module_id)
+                    .map(|d| format!("\n\n📦 {} ({})", d.display_name, d.id))
+                    .unwrap_or_default();
+                Response::plain(format!("{text}{provenance}"))
+            }
             Err(ExternalError::Unavailable) => Response::plain(format!(
                 "⚠️ Модуль «{}» недоступен или завершился с ошибкой.",
                 invocation.module_id
@@ -225,7 +226,12 @@ impl RuntimeState {
                     invocation.module_id, error
                 ))
             }
+        };
+        drop(mgr);
+        if result.is_err() {
+            self.refresh_snapshot().await;
         }
+        response
     }
 
     pub async fn execute(&mut self, client: &Client, action: &Action, message_id: i32) -> Response {

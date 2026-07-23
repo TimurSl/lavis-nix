@@ -247,15 +247,50 @@ impl ExternalManager {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ExternalRuntimeSnapshot {
+    pub command_refs: Vec<ExternalCommandRef>,
+    pub descriptors: Vec<ExternalModuleDescriptor>,
+    pub active_commands: std::collections::HashSet<String>,
+}
+
+impl ExternalRuntimeSnapshot {
+    pub fn new() -> Self {
+        Self {
+            command_refs: Vec::new(),
+            descriptors: Vec::new(),
+            active_commands: std::collections::HashSet::new(),
+        }
+    }
+
+    pub fn from_manager(manager: &ExternalManager) -> Self {
+        let command_refs = manager.command_refs();
+        let descriptors = manager.descriptors().to_vec();
+        let active_commands = command_refs
+            .iter()
+            .map(|r| format!("{}.{}", r.module_id, r.command_name))
+            .collect();
+        Self {
+            command_refs,
+            descriptors,
+            active_commands,
+        }
+    }
+
+    pub fn refresh_from(&mut self, manager: &ExternalManager) {
+        *self = Self::from_manager(manager);
+    }
+}
+
 #[derive(Clone)]
 pub struct ExternalManagerHandle {
     inner: Arc<Mutex<ExternalManager>>,
 }
 
 impl ExternalManagerHandle {
-    pub fn new(module_root: PathBuf) -> Self {
+    pub fn new(manager: ExternalManager) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(ExternalManager::new(module_root))),
+            inner: Arc::new(Mutex::new(manager)),
         }
     }
 
@@ -263,9 +298,8 @@ impl ExternalManagerHandle {
         self.inner.lock().await
     }
 
-    pub fn new_for_tests(manager: ExternalManager) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(manager)),
-        }
+    pub async fn snapshot(&self) -> ExternalRuntimeSnapshot {
+        let mgr = self.inner.lock().await;
+        ExternalRuntimeSnapshot::from_manager(&mgr)
     }
 }

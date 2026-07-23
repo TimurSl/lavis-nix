@@ -1,0 +1,18 @@
+{
+    "schema_version": 2,
+    "id": "echo",
+    "name": "Echo",
+    "version": "1.0.0",
+    "author": "Lavis Contributors",
+    "entrypoint": "bin/echo-module",
+    "capabilities": [],
+    "commands": [
+        {
+            "name": "echo",
+            "summary_ru": "Повторяет аргументы",
+            "description_ru": "Возвращает переданные аргументы как есть. Полезен для отладки внешних модулей.",
+            "usage": "echo [текст...]",
+            "examples": ["привет мир", "Hello from Lavis!", "42"]
+        }
+    ]
+}

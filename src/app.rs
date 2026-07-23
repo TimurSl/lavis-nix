@@ -192,12 +192,13 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
             Vec::new()
         });
 
-    let mut external_manager = external_modules::manager::ExternalManager::new(module_root);
-    external_manager.set_descriptors(descriptors);
-    external_manager
-        .startup_enabled(external_state.enabled_ids())
-        .await;
-    let handle = external_modules::manager::ExternalManagerHandle::new_for_tests(external_manager);
+    let external_manager = external_modules::manager::ExternalManager::new(module_root);
+    let handle = external_modules::manager::ExternalManagerHandle::new(external_manager);
+    {
+        let mut mgr = handle.lock().await;
+        mgr.set_descriptors(descriptors);
+        mgr.startup_enabled(external_state.enabled_ids()).await;
+    }
     tracing::info!(event = "application_started", "lavis is running");
 
     let mut runtime = runtime::RuntimeState::new(

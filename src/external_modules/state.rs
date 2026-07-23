@@ -28,13 +28,19 @@ pub struct ExternalStateStore {
 impl ExternalStateStore {
     pub fn new_disabled() -> Self {
         Self {
-            path: PathBuf::from("/tmp/lavis-external-disabled"),
+            path: PathBuf::from("/dev/null"),
             enabled: BTreeSet::new(),
             temporary_counter: 0,
         }
     }
 
     pub async fn load(path: PathBuf) -> Result<Self, ExternalError> {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|_| ExternalError::StateRead)?;
+        }
+
         let enabled = tokio::task::spawn_blocking({
             let path = path.clone();
             move || load_state(&path)
@@ -59,6 +65,9 @@ impl ExternalStateStore {
 
     pub async fn enable(&mut self, id: &str) -> Result<(), ExternalError> {
         crate::external_modules::manifest::validate_module_id(id)?;
+        if self.enabled.contains(id) {
+            return Ok(());
+        }
         let mut candidate = self.enabled.clone();
         if candidate.len() >= MAX_ENABLED_MODULES {
             return Err(ExternalError::ModuleLimit);

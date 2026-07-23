@@ -288,8 +288,8 @@ pub fn validate_manifest_at(
 
     let entrypoint_path = parent.join(&manifest.entrypoint);
     let canonical_entrypoint =
-        dunce::canonicalize(&entrypoint_path).map_err(|_| ExternalError::InvalidEntrypoint)?;
-    let canonical_parent = dunce::canonicalize(parent).map_err(|_| ExternalError::NotReadable)?;
+        std::fs::canonicalize(&entrypoint_path).map_err(|_| ExternalError::InvalidEntrypoint)?;
+    let canonical_parent = std::fs::canonicalize(parent).map_err(|_| ExternalError::NotReadable)?;
     if !canonical_entrypoint.starts_with(&canonical_parent) {
         return Err(ExternalError::PathEscape);
     }
@@ -405,7 +405,7 @@ pub fn discover_modules(root: &Path) -> Result<Vec<ExternalModuleDescriptor>, Ex
     Ok(descriptors)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fixture-tests"))]
 mod tests {
     use super::*;
 

@@ -44,6 +44,7 @@ pub enum ModuleMessage {
         request_id: String,
     },
     Log {
+        request_id: String,
         level: String,
         message: String,
     },
@@ -96,6 +97,17 @@ impl CoreMessage {
     }
 }
 
+fn validate_request_id(value: &serde_json::Value) -> Result<String, ExternalError> {
+    let id = get_string(value, "request_id")?;
+    if id.is_empty() || id.len() > 64 {
+        return Err(ExternalError::ProtocolDecode);
+    }
+    if !id.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ExternalError::ProtocolDecode);
+    }
+    Ok(id)
+}
+
 pub fn parse_module_line(line: &str) -> Result<Option<ModuleMessage>, ExternalError> {
     if line.len() > MAX_LINE_BYTES {
         return Err(ExternalError::LineTooLarge);
@@ -118,7 +130,7 @@ pub fn parse_module_line(line: &str) -> Result<Option<ModuleMessage>, ExternalEr
 
     match msg_type {
         "initialized" => {
-            let request_id = get_string(&value, "request_id")?;
+            let request_id = validate_request_id(&value)?;
             let module_id = get_string(&value, "module_id")?;
             Ok(Some(ModuleMessage::Initialized {
                 request_id,
@@ -126,7 +138,7 @@ pub fn parse_module_line(line: &str) -> Result<Option<ModuleMessage>, ExternalEr
             }))
         }
         "result" => {
-            let request_id = get_string(&value, "request_id")?;
+            let request_id = validate_request_id(&value)?;
             let text = get_string(&value, "text")?;
             if text.len() > MAX_RESULT_BYTES {
                 return Err(ExternalError::ResultTooLarge);
@@ -134,7 +146,7 @@ pub fn parse_module_line(line: &str) -> Result<Option<ModuleMessage>, ExternalEr
             Ok(Some(ModuleMessage::Result { request_id, text }))
         }
         "error" => {
-            let request_id = get_string(&value, "request_id")?;
+            let request_id = validate_request_id(&value)?;
             let code = get_string(&value, "code")?;
             let message = get_string(&value, "message")?;
             if code.chars().count() > MAX_ERROR_MESSAGE_CHARS
@@ -149,10 +161,11 @@ pub fn parse_module_line(line: &str) -> Result<Option<ModuleMessage>, ExternalEr
             }))
         }
         "health" => {
-            let request_id = get_string(&value, "request_id")?;
+            let request_id = validate_request_id(&value)?;
             Ok(Some(ModuleMessage::Health { request_id }))
         }
         "log" => {
+            let request_id = validate_request_id(&value)?;
             let level = get_string(&value, "level")?;
             let message = get_string(&value, "message")?;
             if level.chars().count() > MAX_LOG_MESSAGE_CHARS
@@ -160,7 +173,11 @@ pub fn parse_module_line(line: &str) -> Result<Option<ModuleMessage>, ExternalEr
             {
                 return Err(ExternalError::ResultTooLarge);
             }
-            Ok(Some(ModuleMessage::Log { level, message }))
+            Ok(Some(ModuleMessage::Log {
+                request_id,
+                level,
+                message,
+            }))
         }
         _ => Err(ExternalError::ProtocolDecode),
     }
@@ -289,11 +306,12 @@ mod tests {
 
     #[test]
     fn parse_log() {
-        let line = r#"{"protocol_version":2,"type":"log","level":"info","message":"hello"}"#;
+        let line = r#"{"protocol_version":2,"type":"log","request_id":"1","level":"info","message":"hello"}"#;
         let msg = parse_module_line(line).unwrap().unwrap();
         assert_eq!(
             msg,
             ModuleMessage::Log {
+                request_id: "1".to_owned(),
                 level: "info".to_owned(),
                 message: "hello".to_owned()
             }
@@ -371,6 +389,24 @@ mod tests {
     #[test]
     fn reject_missing_request_id() {
         let line = r#"{"protocol_version":2,"type":"result","text":"hello"}"#;
+        assert!(matches!(
+            parse_module_line(line),
+            Err(ExternalError::ProtocolDecode)
+        ));
+    }
+
+    #[test]
+    fn reject_non_numeric_request_id() {
+        let line = r#"{"protocol_version":2,"type":"result","request_id":"abc","text":"hello"}"#;
+        assert!(matches!(
+            parse_module_line(line),
+            Err(ExternalError::ProtocolDecode)
+        ));
+    }
+
+    #[test]
+    fn reject_empty_request_id() {
+        let line = r#"{"protocol_version":2,"type":"health","request_id":""}"#;
         assert!(matches!(
             parse_module_line(line),
             Err(ExternalError::ProtocolDecode)

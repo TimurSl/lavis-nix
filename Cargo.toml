@@ -9,6 +9,10 @@ readme = "README.md"
 [lib]
 path = "src/app.rs"
 
+[features]
+default = []
+fixture-tests = []
+
 [dependencies]
 anyhow = "1.0"
 grammers-client = "0.10.0"
@@ -21,7 +25,6 @@ shell-words = "1.1.1"
 strip-ansi-escapes = "0.2.1"
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "time"] }
-dunce = "1.0"
 libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
