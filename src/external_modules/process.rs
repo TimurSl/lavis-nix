@@ -165,34 +165,37 @@ impl ModuleProcess {
         self.in_flight_request = Some(req_id.clone());
         self.send(&msg).await?;
 
-        let result = timeout(EXECUTE_TIMEOUT, self.collect_reply(&req_id))
+        let result = match timeout(EXECUTE_TIMEOUT, self.collect_reply(&req_id))
             .await
-            .map_err(|_| {
+        {
+            Ok(inner) => inner,
+            Err(_) => {
                 self.status = ProcessStatus::Crashed;
-                ExternalError::ExecutionTimeout
-            });
+                self.in_flight_request = None;
+                return Err(ExternalError::ExecutionTimeout);
+            }
+        };
 
         self.in_flight_request = None;
 
         match result {
-            Ok(ModuleMessage::Result { request_id, text }) => {
+            ModuleMessage::Result { request_id, text } => {
                 if request_id != req_id {
                     return Err(ExternalError::WrongRequestId);
                 }
                 Ok(truncate_result(&text))
             }
-            Ok(ModuleMessage::Error {
+            ModuleMessage::Error {
                 request_id,
                 code: _,
                 message: _,
-            }) => {
+            } => {
                 if request_id != req_id {
                     return Err(ExternalError::WrongRequestId);
                 }
                 Err(ExternalError::ModuleError)
             }
-            Ok(_) => Err(ExternalError::ProtocolDecode),
-            Err(e) => Err(e),
+            _ => Err(ExternalError::ProtocolDecode),
         }
     }
 
@@ -220,9 +223,9 @@ impl ModuleProcess {
             match line {
                 Some(ModuleMessage::Log { .. }) => continue,
                 Some(
-                    ModuleMessage::Result { request_id, .. }
-                    | ModuleMessage::Error { request_id, .. }
-                    | ModuleMessage::Health { request_id },
+                    ModuleMessage::Result { ref request_id, .. }
+                    | ModuleMessage::Error { ref request_id, .. }
+                    | ModuleMessage::Health { ref request_id },
                 ) => {
                     if request_id == expected_id {
                         return Ok(line.unwrap());
@@ -254,13 +257,14 @@ impl ModuleProcess {
             .map_err(|_| ExternalError::ExecutionTimeout)?;
 
         match response {
-            ModuleMessage::Health { request_id } => {
+            Ok(ModuleMessage::Health { request_id }) => {
                 if request_id != req_id {
                     return Err(ExternalError::WrongRequestId);
                 }
                 Ok(())
             }
-            _ => Err(ExternalError::ProtocolDecode),
+            Ok(_) => Err(ExternalError::ProtocolDecode),
+            Err(e) => Err(e),
         }
     }
 
