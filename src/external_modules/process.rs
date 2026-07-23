@@ -769,10 +769,7 @@ fn main() {
         let (desc, dir) = create_fixture_module(source, "timeout");
         let mut proc = ModuleProcess::start(desc, &dir).await.unwrap();
         let result = proc.execute("repeat", "test").await;
-        assert!(matches!(
-            result,
-            Err(ExternalError::ExecutionTimeout)
-        ));
+        assert!(matches!(result, Err(ExternalError::ExecutionTimeout)));
         assert_eq!(proc.status(), ProcessStatus::Failed);
         proc.terminate().await;
         fs::remove_dir_all(&dir).unwrap();
