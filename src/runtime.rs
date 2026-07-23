@@ -267,8 +267,8 @@ impl RuntimeState {
                     request,
                     &prefix,
                     &self.aliases,
-                    &self.external_command_refs,
-                    &self.external_descriptors,
+                    self.external_command_refs(),
+                    self.external_descriptors(),
                 );
                 if rendered.entity_fallback {
                     tracing::warn!(
@@ -301,8 +301,8 @@ impl RuntimeState {
                 );
                 let rendered = render_modules_overview_with_external(
                     prefix,
-                    &self.external_descriptors,
-                    &self.external_command_refs,
+                    self.external_descriptors(),
+                    self.external_command_refs(),
                 );
                 if rendered.entity_fallback {
                     tracing::warn!(

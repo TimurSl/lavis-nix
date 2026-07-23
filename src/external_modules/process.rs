@@ -82,7 +82,6 @@ impl ModuleProcess {
 
         #[cfg(unix)]
         {
-            use std::os::unix::process::CommandExt;
             unsafe {
                 command.pre_exec(|| {
                     let ret = libc::setsid();
@@ -166,7 +165,7 @@ impl ModuleProcess {
         self.send(&msg).await?;
 
         let result = match timeout(EXECUTE_TIMEOUT, self.collect_reply(&req_id)).await {
-            Ok(inner) => inner,
+            Ok(inner) => inner?,
             Err(_) => {
                 self.status = ProcessStatus::Crashed;
                 self.in_flight_request = None;
