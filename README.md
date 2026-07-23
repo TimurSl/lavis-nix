@@ -59,6 +59,30 @@ Lavis — личный Telegram userbot на Rust, использующий MTPr
 
 Module API v1 **не** добавляет динамический загрузчик внешних модулей, установщик, терминал, `sudo` или запуск произвольных процессов. Метаданные внешнего происхождения нужны только для безопасного отображения происхождения; они не являются загрузчиком или песочницей.
 
+## Внешние модули (alpha)
+
+Module API v2 и runtime внешних модулей позволяют расширять Lavis командами
+на любом языке. Каждый модуль запускается как отдельный процесс и общается
+с Lavis через JSON-строки (stdin/stdout).
+
+```bash
+# Управление модулями
+,modules list
+,modules validate my-module
+,modules enable my-module
+,modules disable my-module
+
+# Использование модуля
+,my-module.command-name аргументы
+```
+
+Документация: [Module API v2](docs/module-api-v2.md) и
+[External Modules](docs/external-modules.md). Пример:
+[examples/external-module-echo/](examples/external-module-echo/).
+
+**Предупреждение:** внешние модули запускаются без песочницы. Включайте
+только код, которому доверяете.
+
 ## Требования
 
 - Linux; текущие outputs Nix flake предназначены только для `x86_64-linux`;

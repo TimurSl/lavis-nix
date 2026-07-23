@@ -4,7 +4,7 @@ use std::{
     ffi::OsString,
     fs,
     io::{self, IsTerminal, Write},
-    path::Path,
+    path::{Path, PathBuf},
     time::Instant,
 };
 
@@ -16,6 +16,7 @@ pub mod commands;
 pub mod config;
 pub mod credentials;
 pub mod error;
+pub mod external_modules;
 pub mod fastfetch;
 pub mod help;
 pub mod modules;
@@ -33,16 +34,24 @@ pub async fn run() -> anyhow::Result<()> {
         CliCommand::Credentials => credentials_status().await,
         CliCommand::CredentialsReset => credentials_reset().await,
         CliCommand::Logout => logout().await,
+        CliCommand::ModulesValidate { path } => modules_validate(path).await,
+        CliCommand::ModulesEnable { id } => modules_enable(id).await,
+        CliCommand::ModulesDisable { id } => modules_disable(id).await,
+        CliCommand::ModulesStatus => modules_status().await,
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CliCommand {
     Run,
     Auth,
     Credentials,
     CredentialsReset,
     Logout,
+    ModulesValidate { path: PathBuf },
+    ModulesEnable { id: String },
+    ModulesDisable { id: String },
+    ModulesStatus,
 }
 
 const NONINTERACTIVE_MISSING_CREDENTIALS: &str =
@@ -60,7 +69,27 @@ fn parse_cli(arguments: impl IntoIterator<Item = OsString>) -> anyhow::Result<Cl
             Ok(CliCommand::CredentialsReset)
         }
         [argument] if argument == "logout" => Ok(CliCommand::Logout),
-        _ => anyhow::bail!("usage: lavis [run|auth|credentials [reset]|logout]"),
+        [modules, subcommand] if modules == "modules" && subcommand == "status" => {
+            Ok(CliCommand::ModulesStatus)
+        }
+        [modules, subcommand, id] if modules == "modules" && subcommand == "enable" => {
+            Ok(CliCommand::ModulesEnable {
+                id: id.to_string_lossy().into_owned(),
+            })
+        }
+        [modules, subcommand, id] if modules == "modules" && subcommand == "disable" => {
+            Ok(CliCommand::ModulesDisable {
+                id: id.to_string_lossy().into_owned(),
+            })
+        }
+        [modules, subcommand, path] if modules == "modules" && subcommand == "validate" => {
+            Ok(CliCommand::ModulesValidate {
+                path: PathBuf::from(path),
+            })
+        }
+        _ => anyhow::bail!(
+            "usage: lavis [run|auth|credentials [reset]|logout|modules [validate <path>|enable <id>|disable <id>|status]]"
+        ),
     }
 }
 
@@ -77,73 +106,118 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
         .await
         .context("failed to open the Telegram session")?;
 
-    let run_result = async {
-        let settings = settings::SettingsStore::load(config.settings_path.clone())
-            .await
-            .context("failed to load persistent settings")?;
-        let prefix = settings.prefix().to_owned();
+    // Load settings early (needed for prefix in quick_start)
+    let settings = settings::SettingsStore::load(config.settings_path.clone())
+        .await
+        .context("failed to load persistent settings")?;
+    let prefix = settings.prefix().to_owned();
 
-        let outcome = auth::authorize(client.client(), &config)
-            .await
-            .context("Telegram authorization failed")
-            .map_err(|error| authorization_failure(error, newly_saved))?;
+    let outcome = auth::authorize(client.client(), &config)
+        .await
+        .context("Telegram authorization failed")
+        .map_err(|error| authorization_failure(error, newly_saved))?;
 
-        if should_show_quick_start(&outcome) {
-            let quick_start = render_quick_start(&prefix);
-            if let Err(error) = client
-                .client()
-                .send_message(
-                    &grammers_client::tl::types::InputPeerSelf {},
-                    grammers_client::message::InputMessage::new().text(quick_start.clone()),
-                )
-                .await
-            {
-                tracing::warn!(
-                    event = "quick_start_send_failed",
-                    error = %error,
-                    "Failed to send post-auth quick start message"
-                );
-                let fallback = render_quick_start_fallback(&quick_start);
-                let _ = writeln!(io::stdout().lock(), "{fallback}");
-            }
-        }
-
-        if auth_only {
-            return Ok(());
-        }
-        let self_user_id = outcome.self_user_id();
-        initialize_dialog_cache(client.client()).await?;
-        let receiver = client
-            .take_updates()
-            .context("failed to start the Telegram update stream")?;
-        let mut stream = client
+    if should_show_quick_start(&outcome) {
+        let quick_start = render_quick_start(&prefix);
+        if let Err(error) = client
             .client()
-            .stream_updates(
-                receiver,
-                grammers_client::client::UpdatesConfiguration {
-                    catch_up: false,
-                    ..Default::default()
-                },
+            .send_message(
+                &grammers_client::tl::types::InputPeerSelf {},
+                grammers_client::message::InputMessage::new().text(quick_start.clone()),
             )
             .await
-            .map_err(anyhow::Error::from_boxed)
-            .context("failed to create the Telegram update stream")?;
-
-        let aliases = aliases::AliasStore::load(config.aliases_path.clone())
-            .await
-            .context("failed to load persistent aliases")?;
-        tracing::info!(event = "application_started", "lavis is running");
-        let mut runtime = runtime::RuntimeState::new(
-            started_at,
-            aliases,
-            settings,
-            config.fastfetch_profile_path.clone(),
-        );
-        updates::run(&mut stream, self_user_id, client.client(), &mut runtime).await?;
-        drop(stream);
-        Ok(())
+        {
+            tracing::warn!(
+                event = "quick_start_send_failed",
+                error = %error,
+                "Failed to send post-auth quick start message"
+            );
+            let fallback = render_quick_start_fallback(&quick_start);
+            let _ = writeln!(io::stdout().lock(), "{fallback}");
+        }
     }
-    .await;
+
+    if auth_only {
+        let _ = client.shutdown().await;
+        return Ok(());
+    }
+
+    let self_user_id = outcome.self_user_id();
+    initialize_dialog_cache(client.client()).await?;
+    let receiver = client
+        .take_updates()
+        .context("failed to start the Telegram update stream")?;
+    let mut stream = client
+        .client()
+        .stream_updates(
+            receiver,
+            grammers_client::client::UpdatesConfiguration {
+                catch_up: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(anyhow::Error::from_boxed)
+        .context("failed to create the Telegram update stream")?;
+
+    let aliases = aliases::AliasStore::load(config.aliases_path.clone())
+        .await
+        .context("failed to load persistent aliases")?;
+
+    // Set up external modules
+    let external_state_path = config::ConfigPaths::external_modules_state_path_with(&environment)
+        .context("failed to determine external modules state path")?;
+    let external_state = external_modules::state::ExternalStateStore::load(external_state_path)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                event = "external_state_load_failed",
+                error = %error,
+                "External modules state unavailable, continuing without them"
+            );
+            external_modules::state::ExternalStateStore::new_disabled()
+        });
+
+    let module_root = config::ConfigPaths::data_dir_with(&environment)
+        .context("failed to determine data directory")?
+        .join(external_modules::MODULE_DIR_NAME);
+
+    let descriptors =
+        external_modules::manifest::discover_modules(&module_root).unwrap_or_else(|error| {
+            tracing::warn!(
+                event = "external_discovery_failed",
+                error = %error,
+                "External module discovery failed, continuing without modules"
+            );
+            Vec::new()
+        });
+
+    let mut external_manager = external_modules::manager::ExternalManager::new(module_root);
+    external_manager.set_descriptors(descriptors);
+    external_manager
+        .startup_enabled(external_state.enabled_ids())
+        .await;
+    let handle = external_modules::manager::ExternalManagerHandle::new_for_tests(external_manager);
+    tracing::info!(event = "application_started", "lavis is running");
+
+    let mut runtime = runtime::RuntimeState::new(
+        started_at,
+        aliases,
+        settings,
+        config.fastfetch_profile_path.clone(),
+    );
+    runtime.set_external_manager(handle.clone()).await;
+
+    let run_result =
+        async { updates::run(&mut stream, self_user_id, client.client(), &mut runtime).await }
+            .await;
+
+    drop(stream);
+
+    // Shut down external modules
+    let mut mgr = handle.lock().await;
+    mgr.shutdown_all().await;
+    drop(mgr);
 
     let shutdown_result = client.shutdown().await;
     match (run_result, shutdown_result) {
@@ -334,6 +408,119 @@ fn render_quick_start_fallback(quick_start: &str) -> String {
         "Не удалось отправить подсказку в Telegram.\n\n\
         {quick_start}"
     )
+}
+
+async fn modules_validate(path: PathBuf) -> anyhow::Result<()> {
+    let path = path.canonicalize().context("path does not exist")?;
+    match external_modules::manifest::validate_manifest_at(&path, None) {
+        Ok(desc) => {
+            println!("✅ Модуль «{}» корректен.", desc.display_name);
+            println!("   ID: {}", desc.id);
+            println!("   Версия: {}", desc.version);
+            println!("   Автор: {}", desc.author);
+            println!("   Команд: {}", desc.commands.len());
+            println!(
+                "   Возможности: {}",
+                desc.capabilities
+                    .iter()
+                    .map(|c| c.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        Err(error) => {
+            println!("❌ Ошибка валидации: {error}");
+        }
+    }
+    Ok(())
+}
+
+async fn modules_enable(id: String) -> anyhow::Result<()> {
+    let environment = |name: &str| std::env::var_os(name);
+    let module_root = config::ConfigPaths::data_dir_with(&environment)
+        .context("failed to determine data directory")?
+        .join(external_modules::MODULE_DIR_NAME);
+    let state_path = config::ConfigPaths::external_modules_state_path_with(&environment)
+        .context("failed to determine state path")?;
+
+    // Validate the manifest exists
+    let manifest_path = module_root.join(&id).join("module.json");
+    let descriptor = external_modules::manifest::validate_manifest_at(&manifest_path, Some(&id))
+        .context("module validation failed")?;
+
+    let mut state = external_modules::state::ExternalStateStore::load(state_path)
+        .await
+        .context("failed to load module state")?;
+    state.enable(&id).await?;
+
+    println!(
+        "✅ Модуль «{}» ({}) включён. Он будет запущен при следующем запуске lavis.",
+        descriptor.display_name, id
+    );
+    Ok(())
+}
+
+async fn modules_disable(id: String) -> anyhow::Result<()> {
+    let environment = |name: &str| std::env::var_os(name);
+    let state_path = config::ConfigPaths::external_modules_state_path_with(&environment)
+        .context("failed to determine state path")?;
+
+    let mut state = external_modules::state::ExternalStateStore::load(state_path)
+        .await
+        .context("failed to load module state")?;
+    let removed = state.disable_idempotent(&id).await?;
+    if removed {
+        println!("✅ Модуль «{id}» отключён.");
+    } else {
+        println!("ℹ️ Модуль «{id}» не был включён.");
+    }
+    Ok(())
+}
+
+async fn modules_status() -> anyhow::Result<()> {
+    let environment = |name: &str| std::env::var_os(name);
+    let module_root = config::ConfigPaths::data_dir_with(&environment)
+        .context("failed to determine data directory")?
+        .join(external_modules::MODULE_DIR_NAME);
+    let state_path = config::ConfigPaths::external_modules_state_path_with(&environment)
+        .context("failed to determine state path")?;
+
+    let state = external_modules::state::ExternalStateStore::load(state_path)
+        .await
+        .context("failed to load module state")?;
+    let descriptors =
+        external_modules::manifest::discover_modules(&module_root).unwrap_or_default();
+    let enabled_ids = state.enabled_ids();
+
+    if descriptors.is_empty() && enabled_ids.is_empty() {
+        println!("Внешние модули не обнаружены.");
+        return Ok(());
+    }
+
+    println!("Внешние модули (альфа):");
+    for desc in &descriptors {
+        let enabled = if enabled_ids.contains(&desc.id) {
+            "включён"
+        } else {
+            "отключён"
+        };
+        let cmd_count = desc.commands.len();
+        println!(
+            "  • {} ({}) — v{}, автор: {} — {enabled}, команд: {cmd_count}",
+            desc.display_name, desc.id, desc.version, desc.author
+        );
+    }
+
+    for id in enabled_ids {
+        if !descriptors.iter().any(|d| d.id == *id) {
+            println!("  • {id} — включён, но манифест не найден");
+        }
+    }
+
+    println!();
+    println!("⚠️ Внешние модули запускаются отдельными процессами с правами вашего пользователя.");
+    println!("   Lavis не помещает их в системную песочницу. Включайте только доверенные модули.");
+    Ok(())
 }
 
 async fn initialize_dialog_cache(client: &grammers_client::Client) -> anyhow::Result<()> {

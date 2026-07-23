@@ -177,3 +177,75 @@ pub enum AuthError {
     #[error("failed to retrieve the authorized Telegram account")]
     GetAuthorizedUser,
 }
+
+#[derive(Debug, Error)]
+pub enum ExternalError {
+    #[error("manifest file is not readable or not found")]
+    NotReadable,
+    #[error("manifest file is too large")]
+    ManifestTooLarge,
+    #[error("manifest JSON is malformed")]
+    MalformedManifest,
+    #[error("unsupported manifest schema version")]
+    UnsupportedSchemaVersion,
+    #[error("invalid module ID")]
+    InvalidModuleId,
+    #[error("module ID does not match the manifest")]
+    IdMismatch,
+    #[error("invalid command name")]
+    InvalidCommandName,
+    #[error("invalid or empty metadata field")]
+    InvalidMetadata,
+    #[error("duplicate command name")]
+    DuplicateCommand,
+    #[error("invalid command count")]
+    InvalidCommandCount,
+    #[error("invalid capability")]
+    InvalidCapability,
+    #[error("unsafe file or directory permissions")]
+    UnsafePermissions,
+    #[error("invalid entrypoint path")]
+    InvalidEntrypoint,
+    #[error("entrypoint path escapes module directory")]
+    PathEscape,
+    #[error("symlink detected")]
+    SymlinkEscape,
+    #[error("module limit exceeded")]
+    ModuleLimit,
+    #[error("module is not enabled")]
+    NotEnabled,
+    #[error("state file read error")]
+    StateRead,
+    #[error("state file write error")]
+    StateWrite,
+    #[error("state file is too large")]
+    StateFileTooLarge,
+    #[error("state file is malformed")]
+    StateMalformed,
+    #[error("state file version is unsupported")]
+    StateUnsupportedVersion,
+    #[error("protocol encode error")]
+    ProtocolEncode,
+    #[error("protocol decode error")]
+    ProtocolDecode,
+    #[error("protocol line is too large")]
+    LineTooLarge,
+    #[error("protocol version mismatch")]
+    ProtocolVersionMismatch,
+    #[error("handshake timeout")]
+    HandshakeTimeout,
+    #[error("wrong request ID")]
+    WrongRequestId,
+    #[error("execution timeout")]
+    ExecutionTimeout,
+    #[error("shutdown timeout")]
+    ShutdownTimeout,
+    #[error("module result is too large")]
+    ResultTooLarge,
+    #[error("module reported an error")]
+    ModuleError,
+    #[error("module is unavailable or crashed")]
+    Unavailable,
+    #[error("invalid argument")]
+    InvalidArgument,
+}

@@ -6,6 +6,7 @@ use crate::{
         CommandDefinition, CommandRisk, HelpRequest, canonical_command, command_by_name, commands,
         module_for_command,
     },
+    external_modules::{manager::ExternalCommandRef, manifest::ExternalModuleDescriptor},
     modules::{
         ModuleCapability, ModuleOrigin, ModuleSpec, commands_for_module, module_by_name, modules,
         validate_external_origin,
@@ -19,32 +20,74 @@ pub struct RenderedHelp {
 }
 
 pub fn render(request: &HelpRequest, prefix: &str, aliases: &AliasStore) -> RenderedHelp {
+    render_with_external(request, prefix, aliases, &[], &[])
+}
+
+pub fn render_with_external(
+    request: &HelpRequest,
+    prefix: &str,
+    aliases: &AliasStore,
+    external_command_refs: &[ExternalCommandRef],
+    external_descriptors: &[ExternalModuleDescriptor],
+) -> RenderedHelp {
     match request {
-        HelpRequest::Overview => render_overview(prefix),
-        HelpRequest::Topic(topic) => render_topic(topic, prefix, aliases),
+        HelpRequest::Overview => {
+            render_overview_with_external(prefix, external_descriptors, external_command_refs)
+        }
+        HelpRequest::Topic(topic) => render_topic(
+            topic,
+            prefix,
+            aliases,
+            external_command_refs,
+            external_descriptors,
+        ),
         HelpRequest::Invalid => plain(format!("⚠️ Использование: {prefix}help [команда]")),
     }
 }
 
 pub fn render_modules_overview(prefix: &str) -> RenderedHelp {
-    let module_names = modules()
-        .iter()
-        .map(|module| format!("{} {}", module.icon, module.name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let command_names = commands()
-        .iter()
-        .map(|command| format!("{prefix}{}", command.name))
-        .collect::<Vec<_>>()
-        .join(", ");
-    documentation(
-        format!("🧩 Модули Lavis: {}", modules().len()),
-        format!(
-            "Модули: {module_names}\nКоманды ({}): {command_names}\n\nИспользуйте {prefix}help <команда или модуль> для подробностей.",
-            commands().len()
-        ),
-        core_provenance(),
-    )
+    render_modules_overview_with_external(prefix, &[], &[])
+}
+
+pub fn render_modules_overview_with_external(
+    prefix: &str,
+    external_descriptors: &[ExternalModuleDescriptor],
+    external_command_refs: &[ExternalCommandRef],
+) -> RenderedHelp {
+    let mut module_parts: Vec<String> = Vec::new();
+    for module in modules() {
+        module_parts.push(format!("{} {}", module.icon, module.name));
+    }
+    for desc in external_descriptors {
+        let has_active = external_command_refs.iter().any(|r| r.module_id == desc.id);
+        if has_active {
+            module_parts.push(format!("📦 {} ({})", desc.display_name, desc.id));
+        }
+    }
+
+    let mut cmd_names: Vec<String> = Vec::new();
+    for command in commands() {
+        cmd_names.push(format!("{prefix}{}", command.name));
+    }
+    for ref_ in external_command_refs {
+        cmd_names.push(format!("{prefix}{}.{}", ref_.module_id, ref_.command_name));
+    }
+
+    let total = modules().len()
+        + external_descriptors
+            .iter()
+            .filter(|d| external_command_refs.iter().any(|r| r.module_id == d.id))
+            .count();
+    let cmd_total = commands().len() + external_command_refs.len();
+
+    let heading = format!("🧩 Модули Lavis: {total}");
+    let primary = format!(
+        "Модули: {}\nКоманды ({cmd_total}): {}\n\nИспользуйте {prefix}help <команда или модуль> для подробностей.",
+        module_parts.join(", "),
+        cmd_names.join(", "),
+    );
+
+    documentation(heading, primary, core_provenance())
 }
 
 fn render_module_card(module: &ModuleSpec, prefix: &str) -> RenderedHelp {
@@ -72,7 +115,11 @@ fn render_module_card(module: &ModuleSpec, prefix: &str) -> RenderedHelp {
     )
 }
 
-fn render_overview(prefix: &str) -> RenderedHelp {
+fn render_overview_with_external(
+    prefix: &str,
+    _external_descriptors: &[ExternalModuleDescriptor],
+    _external_command_refs: &[ExternalCommandRef],
+) -> RenderedHelp {
     let body = modules()
         .iter()
         .map(|module| {
@@ -95,18 +142,138 @@ fn render_overview(prefix: &str) -> RenderedHelp {
     )
 }
 
-fn render_topic(topic: &str, prefix: &str, aliases: &AliasStore) -> RenderedHelp {
+fn render_topic(
+    topic: &str,
+    prefix: &str,
+    aliases: &AliasStore,
+    external_command_refs: &[ExternalCommandRef],
+    external_descriptors: &[ExternalModuleDescriptor],
+) -> RenderedHelp {
+    // 1. Built-in canonical command
     if let Some(command) = canonical_command(topic) {
         return render_command_card(command, prefix);
     }
+    // 2. Active external namespaced command
+    if topic.contains('.')
+        && let Some(rendered) = render_external_namespaced_command(
+            topic,
+            prefix,
+            external_command_refs,
+            external_descriptors,
+        )
+    {
+        return rendered;
+    }
+    // 3. Alias
     if let Some(rendered) = render_alias(topic, prefix, aliases) {
         return rendered;
     }
+    // 4. Built-in module
     if let Some(module) = module_by_name(topic) {
         return render_module_card(module, prefix);
     }
+    // 5. Active external module
+    if let Some(rendered) =
+        render_external_module_card(topic, prefix, external_descriptors, external_command_refs)
+    {
+        return rendered;
+    }
+    // 6. Unknown
     plain(format!(
         "❓ Неизвестная команда или модуль: {topic}\nИспользуйте {prefix}help для списка команд."
+    ))
+}
+
+fn render_external_namespaced_command(
+    dotted: &str,
+    prefix: &str,
+    external_command_refs: &[ExternalCommandRef],
+    external_descriptors: &[ExternalModuleDescriptor],
+) -> Option<RenderedHelp> {
+    let dot = dotted.find('.')?;
+    let module_id = &dotted[..dot];
+    let command_name = &dotted[dot + 1..];
+
+    let desc = external_descriptors.iter().find(|d| d.id == module_id)?;
+    let cmd = desc.commands.iter().find(|c| c.name == command_name)?;
+    let ref_ = external_command_refs
+        .iter()
+        .find(|r| r.module_id == module_id && r.command_name == command_name)?;
+
+    let examples: Vec<String> = cmd
+        .examples
+        .iter()
+        .map(|ex| format!("{prefix}{}.{} {}", module_id, command_name, ex))
+        .collect();
+
+    let primary = format!(
+        "{}\n\nИспользование: {prefix}{}.{} {}\nМодуль: {} v{}\nАвтор: {}\nВозможности: {}\nРиск: внешний код, запускается без песочницы\n\nПримеры:\n{}",
+        ref_.description_ru,
+        module_id,
+        command_name,
+        cmd.usage,
+        desc.display_name,
+        desc.version,
+        desc.author,
+        desc.capabilities
+            .iter()
+            .map(|c| c.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        examples.join("\n"),
+    );
+
+    Some(documentation(
+        format!("🔌 {prefix}{}", dotted),
+        primary,
+        external_provenance(),
+    ))
+}
+
+fn render_external_module_card(
+    id: &str,
+    prefix: &str,
+    external_descriptors: &[ExternalModuleDescriptor],
+    external_command_refs: &[ExternalCommandRef],
+) -> Option<RenderedHelp> {
+    let desc = external_descriptors.iter().find(|d| d.id == id)?;
+
+    let mut cmd_lines: Vec<String> = Vec::new();
+    for cmd in &desc.commands {
+        let active = external_command_refs
+            .iter()
+            .any(|r| r.module_id == desc.id && r.command_name == cmd.name);
+        if active {
+            cmd_lines.push(format!(
+                "{prefix}{}.{} — {}",
+                desc.id, cmd.name, cmd.summary_ru
+            ));
+        }
+    }
+
+    let cap_strs: Vec<&str> = desc.capabilities.iter().map(|c| c.as_str()).collect();
+
+    let has_active = external_command_refs.iter().any(|r| r.module_id == desc.id);
+    let active = if has_active {
+        "активен"
+    } else {
+        "не активен"
+    };
+
+    let primary = format!(
+        "id: {}\nавтор: {} v{}\nстатус: {active}\nкоманд: {}\n\nКоманды:\n{}\n\nВозможности: {}\n\n⚠️ Внешний модуль запускается отдельным процессом, но не помещается в системную песочницу. Включайте только код, которому доверяете.",
+        desc.id,
+        desc.author,
+        desc.version,
+        desc.commands.len(),
+        cmd_lines.join("\n"),
+        cap_strs.join(", "),
+    );
+
+    Some(documentation(
+        format!("📦 Модуль {}", desc.display_name),
+        primary,
+        external_provenance(),
     ))
 }
 
@@ -236,6 +403,11 @@ fn module_provenance(module: &ModuleSpec) -> String {
 
 fn core_provenance() -> String {
     "Это встроенный модуль Lavis. Его нельзя выгрузить или заменить.".to_owned()
+}
+
+fn external_provenance() -> String {
+    "Внешний модуль. Код запускается вне песочницы; доверяйте только проверенным модулям."
+        .to_owned()
 }
 
 fn risk_label(risk: CommandRisk) -> &'static str {

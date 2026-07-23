@@ -154,6 +154,13 @@ pub enum HelpRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalInvocation {
+    pub module_id: String,
+    pub command_name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     Ping,
     Stats,
@@ -162,6 +169,7 @@ pub enum Action {
     Alias(AliasRequest),
     Prefix(PrefixRequest),
     Modules(ModulesRequest),
+    External(ExternalInvocation),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,7 +198,7 @@ pub enum PrefixRequest {
 }
 
 impl Action {
-    pub const fn name(&self) -> &'static str {
+    pub fn name(&self) -> &str {
         match self {
             Self::Ping => "ping",
             Self::Stats => "stats",
@@ -199,6 +207,12 @@ impl Action {
             Self::Alias(_) => "alias",
             Self::Prefix(_) => "prefix",
             Self::Modules(_) => "modules",
+            Self::External(_invocation) => {
+                // Safe bounded string: module_id and command_name are validated ASCII
+                // This is never user-controlled free text
+                // Return a static prefix to avoid allocating
+                "external"
+            }
         }
     }
 }
