@@ -1,7 +1,9 @@
 pub use crate::response::Response;
+use std::path::Path;
+
 use crate::{
     aliases::AliasStore,
-    commands::{HelpRequest, canonical_command},
+    commands::{CommandKind, HelpRequest, canonical_command},
     modules::{commands_for_module, module_by_name},
 };
 
@@ -10,10 +12,15 @@ pub struct RenderedHelp {
     pub entity_fallback: bool,
 }
 
-pub fn render(request: &HelpRequest, prefix: &str, aliases: &AliasStore) -> RenderedHelp {
+pub fn render(
+    request: &HelpRequest,
+    prefix: &str,
+    aliases: &AliasStore,
+    fastfetch_profile_path: &Path,
+) -> RenderedHelp {
     match request {
         HelpRequest::Overview => render_overview(prefix),
-        HelpRequest::Topic(topic) => render_topic(topic, prefix, aliases),
+        HelpRequest::Topic(topic) => render_topic(topic, prefix, aliases, fastfetch_profile_path),
         HelpRequest::Invalid => RenderedHelp {
             response: Response::plain(format!("⚠️ Usage: {prefix}help [command]")),
             entity_fallback: false,
@@ -62,11 +69,16 @@ fn render_alias(topic: &str, prefix: &str, aliases: &AliasStore) -> Option<Rende
     ))
 }
 
-fn render_topic(topic: &str, prefix: &str, aliases: &AliasStore) -> RenderedHelp {
+fn render_topic(
+    topic: &str,
+    prefix: &str,
+    aliases: &AliasStore,
+    fastfetch_profile_path: &Path,
+) -> RenderedHelp {
     // Topic precedence is deliberate: canonical commands cannot be shadowed by aliases,
     // while an existing alias named after a module remains useful.
     if let Some(definition) = canonical_command(&topic.to_ascii_lowercase()) {
-        return render_command(definition, prefix);
+        return render_command(definition, prefix, fastfetch_profile_path);
     }
     if let Some(rendered) = render_alias(topic, prefix, aliases) {
         return rendered;
@@ -95,12 +107,28 @@ fn render_topic(topic: &str, prefix: &str, aliases: &AliasStore) -> RenderedHelp
     }
 }
 
-fn render_command(definition: &crate::commands::CommandDefinition, prefix: &str) -> RenderedHelp {
+fn render_command(
+    definition: &crate::commands::CommandDefinition,
+    prefix: &str,
+    fastfetch_profile_path: &Path,
+) -> RenderedHelp {
+    if definition.kind == CommandKind::Fastfetch {
+        return render_fastfetch_help(prefix, fastfetch_profile_path);
+    }
     render_quote(
         format!("{} {prefix}{}", definition.icon, definition.usage),
         format!(
             "{}\n\nUsage: {prefix}{}",
             definition.description, definition.usage
+        ),
+    )
+}
+
+fn render_fastfetch_help(prefix: &str, profile_path: &Path) -> RenderedHelp {
+    render_quote(
+        format!("🖥 {prefix}fastfetch"),
+        format!(
+            "Безопасный вывод Fastfetch. Примеры: {prefix}fastfetch --logo arch; {prefix}fastfetch --structure OS:Kernel:CPU.\n\nЛоготипы: none, Alpine, Arch, Debian, Fedora, FreeBSD, Linux, MacOS, NixOS, OpenBSD, Ubuntu, Windows (регистр ASCII не важен).\nСтруктура: title, separator, os, kernel, uptime, cpu, memory, gpu, packages, shell, terminal, terminalsize, host, display, wm, de, theme, icons, font, cursor, disk, swap, localip, battery, poweradapter, locale.\n\n{prefix}fastfetch --no-profile не читает профиль. Профиль: {profile_path:?}\nМинимальный JSON: {{ \"version\": 1 }}\nПриоритет: Fastfetch по умолчанию < профиль < параметры команды.\nПсевдоним: {prefix}alias add sys fastfetch --logo arch; затем {prefix}sys.\n\nКаждый процесс запускается только с --config none --pipe; нативные конфиги и пресеты Fastfetch запрещены. Кавычки разбираются как литералы, оболочка не запускается. Вывод может раскрыть сведения о хосте (включая дисплей, сеть, питание и оборудование)."
         ),
     )
 }
@@ -115,16 +143,25 @@ fn render_quote(heading: String, body: String) -> RenderedHelp {
 
 #[cfg(test)]
 mod tests {
-    use super::{Response, render};
+    use super::{RenderedHelp, Response, render as render_with_path};
     use crate::{
         aliases::{Alias, AliasStore},
         commands::{CommandKind, HelpRequest, definition},
     };
     use std::{
         fs,
-        path::PathBuf,
+        path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    fn render(request: &HelpRequest, prefix: &str, aliases: &AliasStore) -> RenderedHelp {
+        render_with_path(
+            request,
+            prefix,
+            aliases,
+            Path::new("/tmp/lavis-help-fastfetch.json"),
+        )
+    }
 
     async fn aliases() -> AliasStore {
         AliasStore::load(PathBuf::from("/nonexistent/lavis-help-aliases.json"))
@@ -162,7 +199,7 @@ mod tests {
 
         assert_eq!(
             response.text,
-            "🛠 Lavis commands\n\n🧩 core (5)\n!help [command] — Show command help\n!modules — List internal modules\n!ping — Measure Telegram latency\n!prefix [new-prefix|reset] — Show or change the command prefix\n!stats — Show runtime statistics\n\n🖥 system (1)\n!fastfetch [options] — Show system information\n\n🔗 aliases (1)\n!alias [list|add <name> <command> [arguments...]|show <name>|del <name>] — Manage command aliases"
+            "🛠 Lavis commands\n\n🧩 core (5)\n!help [command] — Show command help\n!modules — List internal modules\n!ping — Measure Telegram latency\n!prefix [new-prefix|reset] — Show or change the command prefix\n!stats — Show runtime statistics\n\n🖥 system (1)\n!fastfetch [--no-profile] [--logo <...>] [--structure <...>] [--separator <text>] — Показать системную информацию\n\n🔗 aliases (1)\n!alias [list|add <name> <command> [arguments...]|show <name>|del <name>] — Manage command aliases"
         );
         for command in [
             "help",
@@ -200,6 +237,24 @@ mod tests {
             )));
             assert_eq!(response.entities.len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn fastfetch_help_uses_active_prefix_and_escaped_profile_path() {
+        let profile_path = PathBuf::from("/tmp/профиль\nfastfetch.json");
+        let response = render_with_path(
+            &HelpRequest::Topic("fastfetch".to_owned()),
+            "🦀",
+            &aliases().await,
+            &profile_path,
+        )
+        .response;
+
+        assert!(response.text.contains("🦀fastfetch --logo arch"));
+        assert!(response.text.contains("🦀fastfetch --no-profile"));
+        assert!(response.text.contains(&format!("{profile_path:?}")));
+        assert!(!response.text.contains("/tmp/профиль\nfastfetch.json"));
+        assert_eq!(response.entities.len(), 1);
     }
 
     #[tokio::test]
@@ -243,7 +298,7 @@ mod tests {
         let system = render(&HelpRequest::Topic("SyStEm".to_owned()), "!", &modules).response;
         assert_eq!(
             system.text,
-            "🖥 system module\n\nSystem information commands.\n\n!fastfetch [options] — Show system information"
+            "🖥 system module\n\nSystem information commands.\n\n!fastfetch [--no-profile] [--logo <...>] [--structure <...>] [--separator <text>] — Показать системную информацию"
         );
         assert_eq!(system.entities.len(), 1);
         let grammers_client::tl::enums::MessageEntity::Blockquote(entity) = &system.entities[0]
@@ -255,11 +310,11 @@ mod tests {
         let length = usize::try_from(entity.length).unwrap();
         assert_eq!(
             String::from_utf16(&units[offset..offset + length]).unwrap(),
-            "System information commands.\n\n!fastfetch [options] — Show system information"
+            "System information commands.\n\n!fastfetch [--no-profile] [--logo <...>] [--structure <...>] [--separator <text>] — Показать системную информацию"
         );
         assert_eq!(
             length,
-            "System information commands.\n\n!fastfetch [options] — Show system information"
+            "System information commands.\n\n!fastfetch [--no-profile] [--logo <...>] [--structure <...>] [--separator <text>] — Показать системную информацию"
                 .encode_utf16()
                 .count()
         );
