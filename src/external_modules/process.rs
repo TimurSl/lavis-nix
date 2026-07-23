@@ -96,9 +96,7 @@ impl ModuleProcess {
 
         let mut child = command.spawn().map_err(|_| ExternalError::Unavailable)?;
 
-        let pid = child
-            .id()
-            .ok_or(ExternalError::Unavailable)?;
+        let pid = child.id().ok_or(ExternalError::Unavailable)?;
 
         let stdin = child.stdin.take().ok_or(ExternalError::Unavailable)?;
         let stderr = child.stderr.take().ok_or(ExternalError::Unavailable)?;
@@ -198,10 +196,7 @@ impl ModuleProcess {
         }
     }
 
-    async fn collect_reply(
-        &mut self,
-        expected_id: &str,
-    ) -> Result<ModuleMessage, ExternalError> {
+    async fn collect_reply(&mut self, expected_id: &str) -> Result<ModuleMessage, ExternalError> {
         while let Some(msg) = self.live_replies.pop_front() {
             match &msg {
                 ModuleMessage::Log { .. } => continue,
@@ -374,8 +369,7 @@ impl ModuleProcess {
             buf.push(single[0]);
         }
 
-        let trimmed = std::str::from_utf8(&buf)
-            .map_err(|_| ExternalError::ProtocolDecode)?;
+        let trimmed = std::str::from_utf8(&buf).map_err(|_| ExternalError::ProtocolDecode)?;
 
         protocol::parse_module_line(trimmed)
     }
@@ -620,13 +614,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fn compile_fixture(output: &Path, source: &str) {
         use std::process::Command;
         let rustc = Command::new("rustc")
-            .args([
-                "-",
-                "-o",
-                &output.to_string_lossy(),
-                "--edition",
-                "2021",
-            ])
+            .args(["-", "-o", &output.to_string_lossy(), "--edition", "2021"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -639,10 +627,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = rustc.wait_with_output();
     }
 
-    fn create_fixture_module(
-        source: &str,
-        id: &str,
-    ) -> (ExternalModuleDescriptor, PathBuf) {
+    fn create_fixture_module(source: &str, id: &str) -> (ExternalModuleDescriptor, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -736,7 +721,10 @@ fn main() {
 "#;
         let (desc, dir) = create_fixture_module(source, "bad-proto");
         let result = ModuleProcess::start(desc, &dir).await;
-        assert!(matches!(result, Err(ExternalError::ProtocolVersionMismatch)));
+        assert!(matches!(
+            result,
+            Err(ExternalError::ProtocolVersionMismatch)
+        ));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -781,7 +769,10 @@ fn main() {
         let (desc, dir) = create_fixture_module(source, "timeout");
         let mut proc = ModuleProcess::start(desc, &dir).await.unwrap();
         let result = proc.execute("repeat", "test").await;
-        assert!(matches!(result, Err(ExternalError::ExecutionTimeout)));
+        assert!(matches!(
+            result,
+            Err(ExternalError::ExecutionTimeout)
+        ));
         assert_eq!(proc.status(), ProcessStatus::Failed);
         proc.terminate().await;
         fs::remove_dir_all(&dir).unwrap();
