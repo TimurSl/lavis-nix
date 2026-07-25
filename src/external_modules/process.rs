@@ -277,6 +277,7 @@ impl ModuleProcess {
 
         match timeout(SHUTDOWN_TIMEOUT, self.reap_child()).await {
             Ok(()) => {
+                self.join_stderr_drain().await;
                 self.status = ProcessStatus::Terminated;
                 Ok(())
             }
@@ -295,6 +296,7 @@ impl ModuleProcess {
         self.status = ProcessStatus::Terminated;
         self.terminate_process_group().await;
         self.reap_child().await;
+        self.join_stderr_drain().await;
     }
 
     async fn terminate_process_group(&self) {
@@ -317,6 +319,12 @@ impl ModuleProcess {
         #[cfg(not(unix))]
         {
             let _ = self.pid;
+        }
+    }
+
+    async fn join_stderr_drain(&mut self) {
+        if let Some(handle) = self.stderr_drain.take() {
+            let _ = handle.await;
         }
     }
 

@@ -254,13 +254,19 @@ pub struct ExternalRuntimeSnapshot {
     pub active_commands: std::collections::HashSet<String>,
 }
 
-impl ExternalRuntimeSnapshot {
-    pub fn new() -> Self {
+impl Default for ExternalRuntimeSnapshot {
+    fn default() -> Self {
         Self {
             command_refs: Vec::new(),
             descriptors: Vec::new(),
             active_commands: std::collections::HashSet::new(),
         }
+    }
+}
+
+impl ExternalRuntimeSnapshot {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn from_manager(manager: &ExternalManager) -> Self {
