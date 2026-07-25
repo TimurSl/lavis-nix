@@ -20,27 +20,31 @@ communicates with it over stdin/stdout using newline-delimited JSON messages.
 ```
 modules/
 └── my-module/
-    ├── manifest.toml      # Required: module metadata
+    ├── module.json        # Required: module metadata
     └── entrypoint.sh      # Required: executable entrypoint
 ```
 
-## manifest.toml
+## module.json
 
-```toml
-schema_version = 2
-id = "my-module"
-name = "My Module"
-version = "1.0.0"
-author = "Your Name"
-entrypoint = "entrypoint.sh"
-capabilities = []
-
-[[commands]]
-name = "greet"
-summary_ru = "Приветствие"
-description_ru = "Возвращает приветствие с переданным именем."
-usage = "greet [имя]"
-examples = ["Alice", "Мир"]
+```json
+{
+    "schema_version": 2,
+    "id": "my-module",
+    "name": "My Module",
+    "version": "1.0.0",
+    "author": "Your Name",
+    "entrypoint": "entrypoint.sh",
+    "capabilities": [],
+    "commands": [
+        {
+            "name": "greet",
+            "summary_ru": "Приветствие",
+            "description_ru": "Возвращает приветствие с переданным именем.",
+            "usage": "[имя]",
+            "examples": ["Alice", "Мир"]
+        }
+    ]
+}
 ```
 
 ### Fields
@@ -49,12 +53,12 @@ examples = ["Alice", "Мир"]
 |-----------------|----------|------------------------------------------|
 | `schema_version`| yes      | Must be `2`.                             |
 | `id`            | yes      | Unique module identifier (a-z, 0-9, `-`).|
-| `name`          | yes      | Human-readable display name.             |
-| `version`       | yes      | Module version string.                   |
-| `author`        | yes      | Author name or handle.                   |
+| `name`          | yes      | Human-readable display name (1–64 chars).|
+| `version`       | yes      | Module version string (1–32 chars).      |
+| `author`        | yes      | Author name or handle (1–128 chars).     |
 | `entrypoint`    | yes      | Relative path to the executable.         |
 | `capabilities`  | no       | List of capability strings (see below).  |
-| `commands`      | yes      | List of command descriptors (max 32).    |
+| `commands`      | yes      | List of command descriptors (1–32).      |
 
 ### Commands
 
@@ -62,11 +66,11 @@ Each command descriptor has:
 
 | Field           | Required | Description                              |
 |-----------------|----------|------------------------------------------|
-| `name`          | yes      | Command name (a-z, 0-9, `-`, max 64).   |
-| `summary_ru`    | yes      | Short Russian summary (max 120 chars).   |
-| `description_ru`| yes      | Long Russian description (max 2000).     |
-| `usage`         | yes      | Usage string (max 2000).                 |
-| `examples`      | no       | Up to 16 example argument strings.       |
+| `name`          | yes      | Command name (a-z, 0-9, `-`, 1–32 chars).|
+| `summary_ru`    | yes      | Short Russian summary (1–120 chars, single-line). |
+| `description_ru`| yes      | Long Russian description (1–2000 chars). |
+| `usage`         | yes      | Usage string (1–256 chars, single-line, no control/bidi). |
+| `examples`      | no       | Up to 16 example strings (≤256 chars each, single-line). |
 
 ### Capabilities
 

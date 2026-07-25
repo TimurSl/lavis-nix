@@ -14,7 +14,7 @@ language. Each module runs as a separate OS process.
 mkdir -p ~/.local/share/lavis/modules/my-echo
 ```
 
-### 2. Create manifest.toml
+### 2. Create module.json
 
 See `docs/module-api-v2.md` for the full schema.
 
@@ -54,9 +54,9 @@ Register an external module by ID. The module must exist in
 
 Remove a module from the active set. Does not delete its files.
 
-### `modules validate <id>`
+### `modules validate <path>`
 
-Validate a module manifest without enabling it.
+Validate a module manifest at the given path without enabling it.
 
 ### `modules status <id>`
 
@@ -114,7 +114,7 @@ module's environment.
 
 ### Supported capabilities (optional)
 
-Declare capabilities in `manifest.toml` to tell Lavis what your module
+Declare capabilities in `module.json` to tell Lavis what your module
 needs. These are descriptive only — no sandboxing is applied.
 
 ## Troubleshooting
@@ -133,7 +133,7 @@ LAVIS_LOG=debug .lavis
 Run:
 
 ```bash
-.lavis modules validate my-module
+.lavis modules validate ~/.local/share/lavis/modules/my-module
 ```
 
 ### Process crashes

@@ -68,7 +68,7 @@ Module API v2 и runtime внешних модулей позволяют рас
 ```bash
 # Управление модулями
 ,modules list
-,modules validate my-module
+,modules validate ./my-module
 ,modules enable my-module
 ,modules disable my-module
 
