@@ -622,7 +622,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     fn compile_fixture(output: &Path, source: &str) {
         use std::process::Command;
-        let rustc = Command::new("rustc")
+        let mut rustc = Command::new("rustc")
             .args(["-", "-o", &output.to_string_lossy(), "--edition", "2021"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
