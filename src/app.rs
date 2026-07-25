@@ -27,6 +27,36 @@ pub mod updates;
 
 use auth::AuthorizationOutcome;
 
+struct TelegramClientGuard(Option<client::TelegramClient>);
+
+impl TelegramClientGuard {
+    fn new(client: client::TelegramClient) -> Self {
+        Self(Some(client))
+    }
+
+    fn inner(&mut self) -> &mut client::TelegramClient {
+        self.0.as_mut().expect("TelegramClient already taken")
+    }
+
+    async fn shutdown(mut self) -> Result<(), ClientError> {
+        if let Some(client) = self.0.take() {
+            client.shutdown().await
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for TelegramClientGuard {
+    fn drop(&mut self) {
+        if let Some(client) = self.0.take() {
+            tokio::spawn(client.shutdown());
+        }
+    }
+}
+
+use crate::error::ClientError;
+
 pub async fn run() -> anyhow::Result<()> {
     match parse_cli(env::args_os().skip(1))? {
         CliCommand::Run => run_command(false).await,
@@ -102,9 +132,10 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
         .context("failed to determine application paths")?;
     let config = config::Config::from_credentials(resolved.credentials, paths)
         .context("failed to load configuration")?;
-    let mut client = client::TelegramClient::connect(&config)
+    let client = client::TelegramClient::connect(&config)
         .await
         .context("failed to open the Telegram session")?;
+    let mut guard = TelegramClientGuard::new(client);
 
     // Load settings early (needed for prefix in quick_start)
     let settings = settings::SettingsStore::load(config.settings_path.clone())
@@ -112,14 +143,15 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
         .context("failed to load persistent settings")?;
     let prefix = settings.prefix().to_owned();
 
-    let outcome = auth::authorize(client.client(), &config)
+    let outcome = auth::authorize(guard.inner().client(), &config)
         .await
         .context("Telegram authorization failed")
         .map_err(|error| authorization_failure(error, newly_saved))?;
 
     if should_show_quick_start(&outcome) {
         let quick_start = render_quick_start(&prefix);
-        if let Err(error) = client
+        if let Err(error) = guard
+            .inner()
             .client()
             .send_message(
                 &grammers_client::tl::types::InputPeerSelf {},
@@ -138,27 +170,29 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
     }
 
     if auth_only {
-        let _ = client.shutdown().await;
         return Ok(());
     }
 
     let self_user_id = outcome.self_user_id();
-    initialize_dialog_cache(client.client()).await?;
-    let receiver = client
-        .take_updates()
-        .context("failed to start the Telegram update stream")?;
-    let mut stream = client
-        .client()
-        .stream_updates(
-            receiver,
-            grammers_client::client::UpdatesConfiguration {
-                catch_up: false,
-                ..Default::default()
-            },
-        )
-        .await
-        .map_err(anyhow::Error::from_boxed)
-        .context("failed to create the Telegram update stream")?;
+    initialize_dialog_cache(guard.inner().client()).await?;
+    let mut stream = {
+        let client_ref = guard.inner();
+        let receiver = client_ref
+            .take_updates()
+            .context("failed to start the Telegram update stream")?;
+        client_ref
+            .client()
+            .stream_updates(
+                receiver,
+                grammers_client::client::UpdatesConfiguration {
+                    catch_up: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(anyhow::Error::from_boxed)
+            .context("failed to create the Telegram update stream")?
+    };
 
     let aliases = aliases::AliasStore::load(config.aliases_path.clone())
         .await
@@ -209,13 +243,15 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
     );
     runtime.set_external_manager(handle.clone()).await;
 
-    let run_result =
-        async { updates::run(&mut stream, self_user_id, client.client(), &mut runtime).await }
-            .await;
+    let run_result = {
+        let client_ref = guard.inner();
+        async { updates::run(&mut stream, self_user_id, client_ref.client(), &mut runtime).await }
+            .await
+    };
 
     drop(stream);
 
-    let shutdown_result = client.shutdown().await;
+    let shutdown_result = guard.shutdown().await;
 
     // Shut down external modules after Telegram has disconnected
     let mut mgr = handle.lock().await;

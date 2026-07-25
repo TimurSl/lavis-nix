@@ -180,14 +180,20 @@ impl RuntimeState {
             .await;
         let response = match &result {
             Ok(text) => {
-                let provenance = self
+                let found = self
                     .external_snapshot
                     .descriptors
                     .iter()
-                    .find(|d| d.id == invocation.module_id)
-                    .map(|d| format!("\n\n📦 {} ({})", d.display_name, d.id))
-                    .unwrap_or_default();
-                Response::plain(format!("{text}{provenance}"))
+                    .find(|d| d.id == invocation.module_id);
+                match found {
+                    Some(desc) => {
+                        Response::external_result(text, &desc.display_name, &desc.id, &desc.version)
+                    }
+                    None => Response::plain(format!(
+                        "{text}\n\n⚠️ Модуль «{}» не найден в описаниях.",
+                        invocation.module_id
+                    )),
+                }
             }
             Err(ExternalError::Unavailable) => Response::plain(format!(
                 "⚠️ Модуль «{}» недоступен или завершился с ошибкой.",

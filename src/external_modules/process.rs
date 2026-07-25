@@ -64,12 +64,14 @@ impl ModuleProcess {
         }
 
         let mut command = Command::new(&entrypoint);
+        let path = std::env::var_os("PATH").unwrap_or_default();
         command
             .current_dir(&descriptor.module_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env_clear()
+            .env("PATH", path)
             .env("NO_COLOR", "1")
             .env("CLICOLOR", "0")
             .env("CLICOLOR_FORCE", "0")
@@ -111,7 +113,13 @@ impl ModuleProcess {
             in_flight_request: None,
         };
 
-        process.handshake().await?;
+        if let Err(e) = process.handshake().await {
+            process.terminate_process_group().await;
+            process.reap_child().await;
+            process.join_stderr_drain().await;
+            return Err(e);
+        }
+
         Ok(process)
     }
 
@@ -121,27 +129,41 @@ impl ModuleProcess {
             request_id: req_id.clone(),
             module_id: self.descriptor.id.clone(),
         };
-        self.send(&msg).await?;
+        if let Err(e) = self.send(&msg).await {
+            return Err(self.fail_and_terminate(e).await);
+        }
 
-        let response = timeout(INIT_TIMEOUT, self.read_message())
-            .await
-            .map_err(|_| ExternalError::HandshakeTimeout)?;
+        let response = match timeout(INIT_TIMEOUT, self.read_message()).await {
+            Ok(inner) => match inner {
+                Ok(msg) => msg,
+                Err(e) => return Err(self.fail_and_terminate(e).await),
+            },
+            Err(_) => {
+                return Err(self
+                    .fail_and_terminate(ExternalError::HandshakeTimeout)
+                    .await);
+            }
+        };
 
         match response {
-            Ok(ModuleMessage::Initialized {
+            ModuleMessage::Initialized {
                 request_id,
                 module_id,
-            }) => {
+            } => {
                 if request_id != req_id {
-                    return Err(ExternalError::WrongRequestId);
+                    return Err(self.fail_and_terminate(ExternalError::WrongRequestId).await);
                 }
                 if module_id != self.descriptor.id {
-                    return Err(ExternalError::ProtocolVersionMismatch);
+                    return Err(self
+                        .fail_and_terminate(ExternalError::ProtocolVersionMismatch)
+                        .await);
                 }
                 Ok(())
             }
-            Ok(_) => Err(ExternalError::ProtocolDecode),
-            Err(e) => Err(e),
+            ModuleMessage::Error { .. } => {
+                Err(self.fail_and_terminate(ExternalError::ModuleError).await)
+            }
+            _ => Err(self.fail_and_terminate(ExternalError::ProtocolDecode).await),
         }
     }
 
@@ -157,10 +179,15 @@ impl ModuleProcess {
             arguments: arguments.to_owned(),
         };
         self.in_flight_request = Some(req_id.clone());
-        self.send(&msg).await?;
+        if let Err(e) = self.send(&msg).await {
+            return Err(self.fail_and_terminate(e).await);
+        }
 
         let result = match timeout(EXECUTE_TIMEOUT, self.collect_reply(&req_id)).await {
-            Ok(inner) => inner?,
+            Ok(inner) => match inner {
+                Ok(msg) => msg,
+                Err(e) => return Err(self.fail_and_terminate(e).await),
+            },
             Err(_) => {
                 return Err(self
                     .fail_and_terminate(ExternalError::ExecutionTimeout)
@@ -173,7 +200,7 @@ impl ModuleProcess {
         match result {
             ModuleMessage::Result { request_id, text } => {
                 if request_id != req_id {
-                    return Err(ExternalError::WrongRequestId);
+                    return Err(self.fail_and_terminate(ExternalError::WrongRequestId).await);
                 }
                 Ok(truncate_result(&text))
             }
@@ -183,11 +210,11 @@ impl ModuleProcess {
                 message: _,
             } => {
                 if request_id != req_id {
-                    return Err(ExternalError::WrongRequestId);
+                    return Err(self.fail_and_terminate(ExternalError::WrongRequestId).await);
                 }
-                Err(ExternalError::ModuleError)
+                Err(self.fail_and_terminate(ExternalError::ModuleError).await)
             }
-            _ => Err(ExternalError::ProtocolDecode),
+            _ => Err(self.fail_and_terminate(ExternalError::ProtocolDecode).await),
         }
     }
 
@@ -218,10 +245,15 @@ impl ModuleProcess {
         let msg = CoreMessage::Health {
             request_id: req_id.clone(),
         };
-        self.send(&msg).await?;
+        if let Err(e) = self.send(&msg).await {
+            return Err(self.fail_and_terminate(e).await);
+        }
 
         let response = match timeout(HEALTH_TIMEOUT, self.collect_reply(&req_id)).await {
-            Ok(inner) => inner?,
+            Ok(inner) => match inner {
+                Ok(msg) => msg,
+                Err(e) => return Err(self.fail_and_terminate(e).await),
+            },
             Err(_) => {
                 return Err(self
                     .fail_and_terminate(ExternalError::ExecutionTimeout)
@@ -232,11 +264,11 @@ impl ModuleProcess {
         match response {
             ModuleMessage::Health { request_id } => {
                 if request_id != req_id {
-                    return Err(ExternalError::WrongRequestId);
+                    return Err(self.fail_and_terminate(ExternalError::WrongRequestId).await);
                 }
                 Ok(())
             }
-            _ => Err(ExternalError::ProtocolDecode),
+            _ => Err(self.fail_and_terminate(ExternalError::ProtocolDecode).await),
         }
     }
 
@@ -426,6 +458,75 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    const ECHO_MODULE_PY: &str = r#"#!/usr/bin/env python3
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    val = json.loads(line)
+    req_id = val.get("request_id", "?")
+    msg_type = val.get("type", "")
+    if msg_type == "initialize":
+        resp = {"protocol_version": 2, "type": "initialized", "request_id": req_id, "module_id": val.get("module_id", "")}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif msg_type == "execute":
+        args = val.get("arguments", "")
+        resp = {"protocol_version": 2, "type": "result", "request_id": req_id, "text": args}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif msg_type == "health":
+        resp = {"protocol_version": 2, "type": "health", "request_id": req_id}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif msg_type == "shutdown":
+        resp = {"protocol_version": 2, "type": "health", "request_id": req_id}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+        break
+"#;
+
+    const CHILD_SPAWNER_PY: &str = r#"#!/usr/bin/env python3
+import sys, json, subprocess, os
+child = None
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    val = json.loads(line)
+    req_id = val.get("request_id", "?")
+    msg_type = val.get("type", "")
+    if msg_type == "initialize":
+        child = subprocess.Popen(["sh", "-c", "sleep 60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        resp = {"protocol_version": 2, "type": "initialized", "request_id": req_id, "module_id": val.get("module_id", "")}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif msg_type == "execute":
+        args = val.get("arguments", "")
+        resp = {"protocol_version": 2, "type": "result", "request_id": req_id, "text": args}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif msg_type == "health":
+        resp = {"protocol_version": 2, "type": "health", "request_id": req_id}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif msg_type == "shutdown":
+        resp = {"protocol_version": 2, "type": "health", "request_id": req_id}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+        break
+if child:
+    child.kill()
+"#;
+
+    fn make_script(output: &Path, body: &str) {
+        fs::write(output, body).unwrap();
+        let _ = std::process::Command::new("chmod")
+            .args(["+x", &output.to_string_lossy()])
+            .output();
+    }
+
     fn create_echo_module() -> (ExternalModuleDescriptor, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -437,69 +538,7 @@ mod tests {
         fs::set_permissions(dir.join("bin"), fs::Permissions::from_mode(0o700)).unwrap();
 
         let fixture_path = dir.join("bin").join("echo-module");
-        compile_fixture(
-            &fixture_path,
-            r#"
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::{self, BufRead, Write};
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        let val: serde_json::Value = serde_json::from_str(&line)?;
-        let req_id = val["request_id"].as_str().unwrap_or("?").to_owned();
-        match val["type"].as_str().unwrap_or("") {
-            "initialize" => {
-                let resp = serde_json::json!({
-                    "protocol_version": 2,
-                    "type": "initialized",
-                    "request_id": req_id,
-                    "module_id": val["module_id"],
-                });
-                writeln!(stdout, "{}", resp)?;
-                stdout.flush()?;
-            }
-            "execute" => {
-                let args = val["arguments"].as_str().unwrap_or("");
-                let resp = serde_json::json!({
-                    "protocol_version": 2,
-                    "type": "result",
-                    "request_id": req_id,
-                    "text": args,
-                });
-                writeln!(stdout, "{}", resp)?;
-                stdout.flush()?;
-            }
-            "health" => {
-                let resp = serde_json::json!({
-                    "protocol_version": 2,
-                    "type": "health",
-                    "request_id": req_id,
-                });
-                writeln!(stdout, "{}", resp)?;
-                stdout.flush()?;
-            }
-            "shutdown" => {
-                let resp = serde_json::json!({
-                    "protocol_version": 2,
-                    "type": "health",
-                    "request_id": req_id,
-                });
-                writeln!(stdout, "{}", resp)?;
-                stdout.flush()?;
-                std::process::exit(0);
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-"#,
-        );
-
-        let _ = std::process::Command::new("chmod")
-            .args(["+x", &fixture_path.to_string_lossy()])
-            .output();
+        make_script(&fixture_path, ECHO_MODULE_PY);
 
         let descriptor = ExternalModuleDescriptor {
             id: "echo".to_owned(),
@@ -525,76 +564,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fs::set_permissions(dir.join("bin"), fs::Permissions::from_mode(0o700)).unwrap();
 
         let fixture_path = dir.join("bin").join("child-spawner");
-        compile_fixture(
-            &fixture_path,
-            r#"
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::{self, BufRead, Write};
-    use std::process::{Command, Stdio};
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        let val: serde_json::Value = serde_json::from_str(&line)?;
-        let req_id = val["request_id"].as_str().unwrap_or("?").to_owned();
-        match val["type"].as_str().unwrap_or("") {
-            "initialize" => {
-                let _child = Command::new("sh")
-                    .arg("-c")
-                    .arg("sleep 60")
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()?;
-                let resp = serde_json::json!({
-                    "protocol_version": 2,
-                    "type": "initialized",
-                    "request_id": req_id,
-                    "module_id": val["module_id"],
-                });
-                writeln!(stdout, "{}", resp)?;
-                stdout.flush()?;
-            }
-            "execute" => {
-                let args = val["arguments"].as_str().unwrap_or("");
-                let resp = serde_json::json!({
-                    "protocol_version": 2,
-                    "type": "result",
-                    "request_id": req_id,
-                    "text": args,
-                });
-                writeln!(stdout, "{}", resp)?;
-                stdout.flush()?;
-            }
-            "health" => {
-                let resp = serde_json::json!({
-                    "protocol_version": 2,
-                    "type": "health",
-                    "request_id": req_id,
-                });
-                writeln!(stdout, "{}", resp)?;
-                stdout.flush()?;
-            }
-            "shutdown" => {
-                let resp = serde_json::json!({
-                    "protocol_version": 2,
-                    "type": "health",
-                    "request_id": req_id,
-                });
-                writeln!(stdout, "{}", resp)?;
-                stdout.flush()?;
-                std::process::exit(0);
-            }
-            _ => {}
-        }
-    }
-}
-"#,
-        );
-
-        let _ = std::process::Command::new("chmod")
-            .args(["+x", &fixture_path.to_string_lossy()])
-            .output();
+        make_script(&fixture_path, CHILD_SPAWNER_PY);
 
         let descriptor = ExternalModuleDescriptor {
             id: "child-spawner".to_owned(),
@@ -609,23 +579,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (descriptor, dir)
     }
 
-    fn compile_fixture(output: &Path, source: &str) {
-        use std::process::Command;
-        let mut rustc = Command::new("rustc")
-            .args(["-", "-o", &output.to_string_lossy(), "--edition", "2021"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("rustc must be available for tests");
-        if let Some(stdin) = rustc.stdin.as_mut() {
-            use std::io::Write;
-            let _ = stdin.write_all(source.as_bytes());
-        }
-        let _ = rustc.wait_with_output();
-    }
-
-    fn create_fixture_module(source: &str, id: &str) -> (ExternalModuleDescriptor, PathBuf) {
+    fn create_fixture_module(body: &str, id: &str) -> (ExternalModuleDescriptor, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -636,11 +590,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fs::set_permissions(dir.join("bin"), fs::Permissions::from_mode(0o700)).unwrap();
 
         let fixture_path = dir.join("bin").join(id);
-        compile_fixture(&fixture_path, source);
-
-        let _ = std::process::Command::new("chmod")
-            .args(["+x", &fixture_path.to_string_lossy()])
-            .output();
+        make_script(&fixture_path, body);
 
         let descriptor = ExternalModuleDescriptor {
             id: id.to_owned(),
@@ -691,34 +641,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    const BAD_PROTO_PY: &str = r#"#!/usr/bin/env python3
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    val = json.loads(line)
+    req_id = val.get("request_id", "?")
+    msg_type = val.get("type", "")
+    if msg_type == "initialize":
+        resp = {"protocol_version": 1, "type": "initialized", "request_id": req_id, "module_id": val.get("module_id", "")}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+"#;
+
     #[tokio::test]
     async fn test_wrong_protocol_version() {
-        let source = r#"
-fn main() {
-    use std::io::{self, BufRead, Write};
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line.unwrap();
-        let val: serde_json::Value = serde_json::from_str(&line).unwrap();
-        let req_id = val["request_id"].as_str().unwrap_or("?").to_owned();
-        match val["type"].as_str().unwrap_or("") {
-            "initialize" => {
-                let resp = serde_json::json!({
-                    "protocol_version": 1,
-                    "type": "initialized",
-                    "request_id": req_id,
-                    "module_id": val["module_id"],
-                });
-                writeln!(stdout, "{}", resp).unwrap();
-                stdout.flush().unwrap();
-            }
-            _ => {}
-        }
-    }
-}
-"#;
-        let (desc, dir) = create_fixture_module(source, "bad-proto");
+        let (desc, dir) = create_fixture_module(BAD_PROTO_PY, "bad-proto");
         let result = ModuleProcess::start(desc).await;
         assert!(matches!(
             result,
@@ -727,45 +667,29 @@ fn main() {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    const TIMEOUT_PY: &str = r#"#!/usr/bin/env python3
+import sys, json, time
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    val = json.loads(line)
+    req_id = val.get("request_id", "?")
+    msg_type = val.get("type", "")
+    if msg_type == "initialize":
+        resp = {"protocol_version": 2, "type": "initialized", "request_id": req_id, "module_id": val.get("module_id", "")}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif msg_type == "execute":
+        time.sleep(10)
+        resp = {"protocol_version": 2, "type": "result", "request_id": req_id, "text": "too late"}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+"#;
+
     #[tokio::test]
     async fn test_execute_timeout() {
-        let source = r#"
-fn main() {
-    use std::io::{self, BufRead, Write};
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    for line in stdin.lock().lines() {
-        let line = line.unwrap();
-        let val: serde_json::Value = serde_json::from_str(&line).unwrap();
-        let req_id = val["request_id"].as_str().unwrap_or("?").to_owned();
-        match val["type"].as_str().unwrap_or("") {
-            "initialize" => {
-                let resp = serde_json::json!({
-                    "protocol_version": 2,
-                    "type": "initialized",
-                    "request_id": req_id,
-                    "module_id": val["module_id"],
-                });
-                writeln!(stdout, "{}", resp).unwrap();
-                stdout.flush().unwrap();
-            }
-            "execute" => {
-                std::thread::sleep(std::time::Duration::from_secs(10));
-                let resp = serde_json::json!({
-                    "protocol_version": 2,
-                    "type": "result",
-                    "request_id": req_id,
-                    "text": "too late",
-                });
-                writeln!(stdout, "{}", resp).unwrap();
-                stdout.flush().unwrap();
-            }
-            _ => {}
-        }
-    }
-}
-"#;
-        let (desc, dir) = create_fixture_module(source, "timeout");
+        let (desc, dir) = create_fixture_module(TIMEOUT_PY, "timeout");
         let mut proc = ModuleProcess::start(desc).await.unwrap();
         let result = proc.execute("repeat", "test").await;
         assert!(matches!(result, Err(ExternalError::ExecutionTimeout)));

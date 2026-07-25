@@ -336,11 +336,11 @@ pub fn validate_manifest_at(
         if mc
             .description_ru
             .chars()
-            .any(|c| c.is_control() && c != '\n')
+            .any(|c| (c.is_control() && c != '\n') || is_bidi_control(c))
         {
             return Err(ExternalError::InvalidMetadata);
         }
-        if mc.usage.len() > 256 {
+        if !validate_single_line(&mc.usage) || mc.usage.chars().count() > 256 {
             return Err(ExternalError::InvalidMetadata);
         }
 
@@ -348,7 +348,7 @@ pub fn validate_manifest_at(
             return Err(ExternalError::InvalidMetadata);
         }
         for ex in &mc.examples {
-            if ex.chars().count() > MAX_EXAMPLE_CHARS {
+            if !validate_single_line(ex) || ex.chars().count() > MAX_EXAMPLE_CHARS {
                 return Err(ExternalError::InvalidMetadata);
             }
         }

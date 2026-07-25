@@ -314,7 +314,7 @@ impl Response {
 mod tests {
     use super::{
         DOCUMENTATION_TRUNCATION_SUFFIX, MAX_UTF16_UNITS, Response, TRUNCATION_SUFFIX,
-        truncate_utf16,
+        sanitize_external_output, truncate_utf16,
     };
 
     #[test]
@@ -464,5 +464,80 @@ mod tests {
                 .ends_with("Источник: полный источник")
         );
         assert!(primary_and_heading.response.text.encode_utf16().count() <= MAX_UTF16_UNITS);
+    }
+
+    #[test]
+    fn external_result_preserves_provenance() {
+        let result = Response::external_result("Привет мир", "Тест", "test", "1.0.0");
+        assert!(result.text.contains("Привет мир"));
+        assert!(
+            result
+                .text
+                .contains("⚠️ Внешний модуль «Тест» (test v1.0.0) — код без песочницы.")
+        );
+        assert!(result.text.encode_utf16().count() <= MAX_UTF16_UNITS);
+    }
+
+    #[test]
+    fn external_result_sanitizes_output() {
+        let result = Response::external_result(
+            "\x1b[31mкрасный\x1b[0m\n\t\x00bidi\u{202e}",
+            "Тест",
+            "t",
+            "1.0",
+        );
+        assert!(!result.text.contains("\x1b["));
+        assert!(!result.text.contains('\x00'));
+        assert!(!result.text.contains('\u{202e}'));
+        assert!(result.text.contains("красный"));
+        assert!(result.text.contains('\n'));
+        assert!(result.text.contains('\t'));
+        assert!(
+            result
+                .text
+                .contains("⚠️ Внешний модуль «Тест» (t v1.0) — код без песочницы.")
+        );
+    }
+
+    #[test]
+    fn external_result_truncates_when_text_overflows() {
+        let long = "🦀".repeat(MAX_UTF16_UNITS);
+        let result = Response::external_result(&long, "Длинный", "long", "0.1");
+        assert!(result.text.contains(TRUNCATION_SUFFIX));
+        assert!(
+            result
+                .text
+                .contains("⚠️ Внешний модуль «Длинный» (long v0.1) — код без песочницы.")
+        );
+        assert!(result.text.encode_utf16().count() <= MAX_UTF16_UNITS);
+    }
+
+    #[test]
+    fn external_result_provenance_present_even_for_empty_text() {
+        let result = Response::external_result("", "Пусто", "empty", "0.0");
+        assert!(
+            result
+                .text
+                .contains("⚠️ Внешний модуль «Пусто» (empty v0.0) — код без песочницы.")
+        );
+        assert!(result.text.encode_utf16().count() <= MAX_UTF16_UNITS);
+    }
+
+    #[test]
+    fn sanitize_removes_ansi_bidi_and_controls() {
+        let cleaned = sanitize_external_output("a\x1b[1mb\x1b[0mc\u{200f}d\x00e");
+        assert_eq!(cleaned, "abcde");
+    }
+
+    #[test]
+    fn sanitize_preserves_newlines_and_tabs() {
+        let cleaned = sanitize_external_output("line1\n\tindented\nline3");
+        assert_eq!(cleaned, "line1\n\tindented\nline3");
+    }
+
+    #[test]
+    fn sanitize_handles_ansi_without_terminator() {
+        let cleaned = sanitize_external_output("hello\x1b[31m");
+        assert_eq!(cleaned, "hello");
     }
 }
