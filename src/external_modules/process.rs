@@ -629,7 +629,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("rustc must be available for tests");
-        if let Some(mut stdin) = rustc.stdin {
+        if let Some(stdin) = rustc.stdin.as_mut() {
             use std::io::Write;
             let _ = stdin.write_all(source.as_bytes());
         }

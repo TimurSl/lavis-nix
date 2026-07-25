@@ -247,21 +247,11 @@ impl ExternalManager {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ExternalRuntimeSnapshot {
     pub command_refs: Vec<ExternalCommandRef>,
     pub descriptors: Vec<ExternalModuleDescriptor>,
     pub active_commands: std::collections::HashSet<String>,
-}
-
-impl Default for ExternalRuntimeSnapshot {
-    fn default() -> Self {
-        Self {
-            command_refs: Vec::new(),
-            descriptors: Vec::new(),
-            active_commands: std::collections::HashSet::new(),
-        }
-    }
 }
 
 impl ExternalRuntimeSnapshot {
