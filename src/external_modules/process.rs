@@ -3,7 +3,7 @@ use super::{
     protocol::{self, CoreMessage, MAX_LINE_BYTES, MAX_RESULT_BYTES, ModuleMessage},
 };
 use crate::error::ExternalError;
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{process::Stdio, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
@@ -33,7 +33,6 @@ pub struct ModuleProcess {
     descriptor: ExternalModuleDescriptor,
     status: ProcessStatus,
     in_flight_request: Option<String>,
-    live_replies: std::collections::VecDeque<ModuleMessage>,
 }
 
 struct StderrCapture {
@@ -58,18 +57,15 @@ impl ModuleProcess {
         self.in_flight_request.as_deref()
     }
 
-    pub async fn start(
-        descriptor: ExternalModuleDescriptor,
-        module_root: &Path,
-    ) -> Result<Self, ExternalError> {
+    pub async fn start(descriptor: ExternalModuleDescriptor) -> Result<Self, ExternalError> {
         let entrypoint = descriptor.entrypoint.clone();
-        if !entrypoint.starts_with(module_root) {
+        if !entrypoint.starts_with(&descriptor.module_dir) {
             return Err(ExternalError::PathEscape);
         }
 
         let mut command = Command::new(&entrypoint);
         command
-            .current_dir(module_root)
+            .current_dir(&descriptor.module_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -113,7 +109,6 @@ impl ModuleProcess {
             descriptor,
             status: ProcessStatus::Running,
             in_flight_request: None,
-            live_replies: std::collections::VecDeque::new(),
         };
 
         process.handshake().await?;
@@ -167,9 +162,9 @@ impl ModuleProcess {
         let result = match timeout(EXECUTE_TIMEOUT, self.collect_reply(&req_id)).await {
             Ok(inner) => inner?,
             Err(_) => {
-                self.status = ProcessStatus::Crashed;
-                self.in_flight_request = None;
-                return Err(ExternalError::ExecutionTimeout);
+                return Err(self
+                    .fail_and_terminate(ExternalError::ExecutionTimeout)
+                    .await);
             }
         };
 
@@ -197,47 +192,23 @@ impl ModuleProcess {
     }
 
     async fn collect_reply(&mut self, expected_id: &str) -> Result<ModuleMessage, ExternalError> {
-        while let Some(msg) = self.live_replies.pop_front() {
-            match &msg {
+        loop {
+            let line = self.read_line().await?;
+            let Some(msg) = line else {
+                self.status = ProcessStatus::Crashed;
+                return Err(ExternalError::Unavailable);
+            };
+            match msg {
                 ModuleMessage::Log { .. } => continue,
-                ModuleMessage::Result { request_id, .. }
-                | ModuleMessage::Error { request_id, .. }
-                | ModuleMessage::Health { request_id } => {
-                    if request_id == expected_id {
+                ModuleMessage::Result { ref request_id, .. }
+                | ModuleMessage::Error { ref request_id, .. }
+                | ModuleMessage::Health { ref request_id } => {
+                    if *request_id == *expected_id {
                         return Ok(msg);
-                    }
-                    if request_id.as_str() < expected_id {
-                        continue;
                     }
                     return Err(ExternalError::WrongRequestId);
                 }
                 _ => return Err(ExternalError::ProtocolDecode),
-            }
-        }
-
-        loop {
-            let line = self.read_line().await?;
-            match line {
-                Some(ModuleMessage::Log { .. }) => continue,
-                Some(
-                    ModuleMessage::Result { ref request_id, .. }
-                    | ModuleMessage::Error { ref request_id, .. }
-                    | ModuleMessage::Health { ref request_id },
-                ) => {
-                    if request_id == expected_id {
-                        return Ok(line.unwrap());
-                    }
-                    if request_id.as_str() < expected_id {
-                        continue;
-                    }
-                    self.live_replies.push_back(line.unwrap());
-                    return Err(ExternalError::WrongRequestId);
-                }
-                Some(_) => return Err(ExternalError::ProtocolDecode),
-                None => {
-                    self.status = ProcessStatus::Crashed;
-                    return Err(ExternalError::Unavailable);
-                }
             }
         }
     }
@@ -249,19 +220,23 @@ impl ModuleProcess {
         };
         self.send(&msg).await?;
 
-        let response = timeout(HEALTH_TIMEOUT, self.collect_reply(&req_id))
-            .await
-            .map_err(|_| ExternalError::ExecutionTimeout)?;
+        let response = match timeout(HEALTH_TIMEOUT, self.collect_reply(&req_id)).await {
+            Ok(inner) => inner?,
+            Err(_) => {
+                return Err(self
+                    .fail_and_terminate(ExternalError::ExecutionTimeout)
+                    .await);
+            }
+        };
 
         match response {
-            Ok(ModuleMessage::Health { request_id }) => {
+            ModuleMessage::Health { request_id } => {
                 if request_id != req_id {
                     return Err(ExternalError::WrongRequestId);
                 }
                 Ok(())
             }
-            Ok(_) => Err(ExternalError::ProtocolDecode),
-            Err(e) => Err(e),
+            _ => Err(ExternalError::ProtocolDecode),
         }
     }
 
@@ -271,6 +246,7 @@ impl ModuleProcess {
             request_id: req_id.clone(),
         };
         if self.send(&msg).await.is_err() {
+            self.in_flight_request = None;
             self.terminate().await;
             return Err(ExternalError::ShutdownTimeout);
         }
@@ -278,10 +254,12 @@ impl ModuleProcess {
         match timeout(SHUTDOWN_TIMEOUT, self.reap_child()).await {
             Ok(()) => {
                 self.join_stderr_drain().await;
+                self.in_flight_request = None;
                 self.status = ProcessStatus::Terminated;
                 Ok(())
             }
             Err(_) => {
+                self.in_flight_request = None;
                 self.terminate().await;
                 Err(ExternalError::ShutdownTimeout)
             }
@@ -290,6 +268,15 @@ impl ModuleProcess {
 
     pub fn mark_failed(&mut self) {
         self.status = ProcessStatus::Failed;
+    }
+
+    async fn fail_and_terminate(&mut self, error: ExternalError) -> ExternalError {
+        self.in_flight_request = None;
+        self.status = ProcessStatus::Crashed;
+        self.terminate_process_group().await;
+        self.reap_child().await;
+        self.join_stderr_drain().await;
+        error
     }
 
     pub async fn terminate(&mut self) {
@@ -436,7 +423,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn create_echo_module() -> (ExternalModuleDescriptor, PathBuf) {
@@ -520,6 +507,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             version: "0.1.0".to_owned(),
             author: "Test".to_owned(),
             entrypoint: fixture_path,
+            module_dir: dir.clone(),
             capabilities: Vec::new(),
             commands: vec![],
         };
@@ -614,6 +602,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             version: "0.1.0".to_owned(),
             author: "Test".to_owned(),
             entrypoint: fixture_path,
+            module_dir: dir.clone(),
             capabilities: Vec::new(),
             commands: vec![],
         };
@@ -659,6 +648,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             version: "0.1.0".to_owned(),
             author: "Test".to_owned(),
             entrypoint: fixture_path,
+            module_dir: dir.clone(),
             capabilities: Vec::new(),
             commands: vec![],
         };
@@ -668,7 +658,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[tokio::test]
     async fn test_handshake_success() {
         let (desc, dir) = create_echo_module();
-        let mut proc = ModuleProcess::start(desc, &dir).await.unwrap();
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
         assert_eq!(proc.status(), ProcessStatus::Running);
         proc.terminate().await;
         fs::remove_dir_all(&dir).unwrap();
@@ -677,7 +667,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[tokio::test]
     async fn test_execute_command() {
         let (desc, dir) = create_echo_module();
-        let mut proc = ModuleProcess::start(desc, &dir).await.unwrap();
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
         let result = proc.execute("repeat", "Привет 🎉").await.unwrap();
         assert_eq!(result, "Привет 🎉");
         proc.terminate().await;
@@ -687,7 +677,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[tokio::test]
     async fn test_health_check() {
         let (desc, dir) = create_echo_module();
-        let mut proc = ModuleProcess::start(desc, &dir).await.unwrap();
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
         proc.health_check().await.unwrap();
         proc.terminate().await;
         fs::remove_dir_all(&dir).unwrap();
@@ -696,7 +686,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[tokio::test]
     async fn test_graceful_shutdown() {
         let (desc, dir) = create_echo_module();
-        let mut proc = ModuleProcess::start(desc, &dir).await.unwrap();
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
         proc.graceful_shutdown().await.unwrap();
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -729,7 +719,7 @@ fn main() {
 }
 "#;
         let (desc, dir) = create_fixture_module(source, "bad-proto");
-        let result = ModuleProcess::start(desc, &dir).await;
+        let result = ModuleProcess::start(desc).await;
         assert!(matches!(
             result,
             Err(ExternalError::ProtocolVersionMismatch)
@@ -776,18 +766,17 @@ fn main() {
 }
 "#;
         let (desc, dir) = create_fixture_module(source, "timeout");
-        let mut proc = ModuleProcess::start(desc, &dir).await.unwrap();
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
         let result = proc.execute("repeat", "test").await;
         assert!(matches!(result, Err(ExternalError::ExecutionTimeout)));
-        assert_eq!(proc.status(), ProcessStatus::Failed);
-        proc.terminate().await;
+        assert_eq!(proc.status(), ProcessStatus::Crashed);
         fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
     async fn test_terminate_process_group() {
         let (desc, dir) = create_child_spawner_module();
-        let mut proc = ModuleProcess::start(desc, &dir).await.unwrap();
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
         proc.terminate().await;
         fs::remove_dir_all(&dir).unwrap();
     }

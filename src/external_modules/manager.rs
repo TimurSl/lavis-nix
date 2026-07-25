@@ -1,5 +1,5 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::{collections::BTreeMap, path::PathBuf};
 use tokio::sync::Mutex;
 use tracing;
 
@@ -34,15 +34,19 @@ pub struct ExternalModuleStatus {
 pub struct ExternalManager {
     descriptors: Vec<ExternalModuleDescriptor>,
     processes: BTreeMap<String, ModuleProcess>,
-    module_root: PathBuf,
+}
+
+impl Default for ExternalManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ExternalManager {
-    pub fn new(module_root: PathBuf) -> Self {
+    pub fn new() -> Self {
         Self {
             descriptors: Vec::new(),
             processes: BTreeMap::new(),
-            module_root,
         }
     }
 
@@ -102,7 +106,7 @@ impl ExternalManager {
             if !enabled_ids.contains(&desc.id) {
                 continue;
             }
-            match ModuleProcess::start(desc.clone(), &self.module_root).await {
+            match ModuleProcess::start(desc.clone()).await {
                 Ok(process) => {
                     tracing::info!(
                         event = "external_module_started",
@@ -219,16 +223,23 @@ impl ExternalManager {
         );
         let ids: Vec<String> = self.processes.keys().cloned().collect();
         for id in &ids {
-            if let Some(process) = self.processes.get_mut(id)
-                && process.status() == ProcessStatus::Running
-                && process.graceful_shutdown().await.is_err()
-            {
-                tracing::warn!(
-                    event = "external_module_shutdown_forced",
-                    module_id = %id,
-                    "Forcefully terminating external module"
-                );
-                process.terminate().await;
+            let Some(process) = self.processes.get_mut(id) else {
+                continue;
+            };
+            match process.status() {
+                ProcessStatus::Running => {
+                    if process.graceful_shutdown().await.is_err() {
+                        tracing::warn!(
+                            event = "external_module_shutdown_forced",
+                            module_id = %id,
+                            "Forcefully terminating external module"
+                        );
+                        process.terminate().await;
+                    }
+                }
+                ProcessStatus::Crashed | ProcessStatus::Failed | ProcessStatus::Terminated => {
+                    process.terminate().await;
+                }
             }
         }
         self.processes.clear();

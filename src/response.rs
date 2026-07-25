@@ -258,6 +258,58 @@ fn utf16_i32_len(text: &str) -> Option<i32> {
     i32::try_from(text.encode_utf16().count()).ok()
 }
 
+pub fn sanitize_external_output(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            while let Some(&next) = chars.peek() {
+                chars.next();
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else if c == '\n' || c == '\t' {
+            out.push(c);
+        } else if c.is_control() || is_bidi_control(c) {
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+impl Response {
+    pub fn external_result(
+        module_text: &str,
+        display_name: &str,
+        module_id: &str,
+        version: &str,
+    ) -> Self {
+        let sanitized = sanitize_external_output(module_text);
+        let provenance = format!(
+            "\n\n⚠️ Внешний модуль «{}» ({} v{}) — код без песочницы.",
+            display_name, module_id, version
+        );
+        let provenance_units = provenance.encode_utf16().count();
+        if sanitized.encode_utf16().count() + provenance_units <= MAX_UTF16_UNITS {
+            let text = format!("{sanitized}{provenance}");
+            return Self::plain(text);
+        }
+        let available = MAX_UTF16_UNITS.saturating_sub(provenance_units);
+        let truncated = truncate_to_utf16(&sanitized, available, TRUNCATION_SUFFIX);
+        let text = format!("{truncated}{provenance}");
+        Self::plain(text)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

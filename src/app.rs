@@ -192,7 +192,7 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
             Vec::new()
         });
 
-    let external_manager = external_modules::manager::ExternalManager::new(module_root);
+    let external_manager = external_modules::manager::ExternalManager::new();
     let handle = external_modules::manager::ExternalManagerHandle::new(external_manager);
     {
         let mut mgr = handle.lock().await;
@@ -215,12 +215,13 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
 
     drop(stream);
 
-    // Shut down external modules
+    let shutdown_result = client.shutdown().await;
+
+    // Shut down external modules after Telegram has disconnected
     let mut mgr = handle.lock().await;
     mgr.shutdown_all().await;
     drop(mgr);
 
-    let shutdown_result = client.shutdown().await;
     match (run_result, shutdown_result) {
         (Ok(()), Ok(())) => {
             tracing::info!(event = "application_stopped", "lavis stopped");
@@ -428,12 +429,13 @@ async fn modules_validate(path: PathBuf) -> anyhow::Result<()> {
                     .collect::<Vec<_>>()
                     .join(", ")
             );
+            Ok(())
         }
         Err(error) => {
             println!("❌ Ошибка валидации: {error}");
+            Err(error.into())
         }
     }
-    Ok(())
 }
 
 async fn modules_enable(id: String) -> anyhow::Result<()> {

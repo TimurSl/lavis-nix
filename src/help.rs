@@ -117,10 +117,10 @@ fn render_module_card(module: &ModuleSpec, prefix: &str) -> RenderedHelp {
 
 fn render_overview_with_external(
     prefix: &str,
-    _external_descriptors: &[ExternalModuleDescriptor],
-    _external_command_refs: &[ExternalCommandRef],
+    external_descriptors: &[ExternalModuleDescriptor],
+    external_command_refs: &[ExternalCommandRef],
 ) -> RenderedHelp {
-    let body = modules()
+    let mut body: Vec<String> = modules()
         .iter()
         .map(|module| {
             let names = commands_for_module(module.id)
@@ -129,15 +129,37 @@ fn render_overview_with_external(
                 .join(", ");
             format!("{} {}: {names}", module.icon, module.name)
         })
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect();
+    for desc in external_descriptors {
+        let cmd_names: Vec<String> = external_command_refs
+            .iter()
+            .filter(|r| r.module_id == desc.id)
+            .map(|r| format!("{prefix}{}.{}", r.module_id, r.command_name))
+            .collect();
+        if !cmd_names.is_empty() {
+            body.push(format!(
+                "📦 {} ({}): {}",
+                desc.display_name,
+                desc.id,
+                cmd_names.join(", ")
+            ));
+        }
+    }
+    let total_modules = modules().len()
+        + external_descriptors
+            .iter()
+            .filter(|d| external_command_refs.iter().any(|r| r.module_id == d.id))
+            .count();
+    let total_commands = commands().len() + external_command_refs.len();
     documentation(
         format!(
             "🛠 Справка Lavis: {} модулей, {} команд",
-            modules().len(),
-            commands().len()
+            total_modules, total_commands
         ),
-        format!("{body}\n\nИспользуйте {prefix}help <команда или модуль> для подробностей."),
+        format!(
+            "{}\n\nИспользуйте {prefix}help <команда или модуль> для подробностей.",
+            body.join("\n")
+        ),
         core_provenance(),
     )
 }

@@ -24,6 +24,7 @@ pub struct ExternalModuleDescriptor {
     pub version: String,
     pub author: String,
     pub entrypoint: PathBuf,
+    pub module_dir: PathBuf,
     pub capabilities: Vec<ExternalCapability>,
     pub commands: Vec<ExternalCommandDescriptor>,
 }
@@ -367,6 +368,7 @@ pub fn validate_manifest_at(
         version: manifest.version,
         author: manifest.author,
         entrypoint: entrypoint_path,
+        module_dir: canonical_parent,
         capabilities: seen_capabilities,
         commands,
     })
