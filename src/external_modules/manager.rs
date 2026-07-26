@@ -378,4 +378,22 @@ impl ExternalManagerHandle {
         }
         process.dispatch_created_event(payload).await
     }
+
+    pub async fn execute(
+        &self,
+        module_id: &str,
+        command_name: &str,
+        arguments: &str,
+    ) -> Result<String, ExternalError> {
+        let process = {
+            let manager = self.inner.lock().await;
+            manager.processes.get(module_id).cloned()
+        }
+        .ok_or(ExternalError::Unavailable)?;
+        let mut process = process.lock().await;
+        if process.status() != ProcessStatus::Running {
+            return Err(ExternalError::Unavailable);
+        }
+        process.execute(command_name, arguments).await
+    }
 }

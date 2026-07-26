@@ -229,8 +229,7 @@ impl RuntimeState {
             Some(h) => h,
             None => return Response::plain("⚠️ Внешние модули не доступны.".to_owned()),
         };
-        let mut mgr = handle.lock().await;
-        let result = mgr
+        let result = handle
             .execute(
                 &invocation.module_id,
                 &invocation.command_name,
@@ -292,7 +291,6 @@ impl RuntimeState {
                 ))
             }
         };
-        drop(mgr);
         if result.is_err() {
             self.refresh_snapshot().await;
         }
