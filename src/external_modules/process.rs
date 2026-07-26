@@ -399,6 +399,9 @@ impl ModuleProcess {
 
     async fn join_stderr_drain(&mut self) {
         if let Some(handle) = self.stderr_drain.take() {
+            // Descendants can retain stderr after the managed child exits; do
+            // not let their inherited FD block module cleanup forever.
+            handle.abort();
             let _ = handle.await;
         }
     }

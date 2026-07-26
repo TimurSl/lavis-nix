@@ -271,9 +271,9 @@ impl ExternalManager {
                         process.terminate().await;
                     }
                 }
-                ProcessStatus::Crashed | ProcessStatus::Failed | ProcessStatus::Terminated => {
-                    process.terminate().await
-                }
+                // A crashed process already ran fatal cleanup. Re-signalling
+                // its old PID could hit a reused process group.
+                ProcessStatus::Crashed | ProcessStatus::Failed | ProcessStatus::Terminated => {}
             }
         }
         self.processes.clear();
