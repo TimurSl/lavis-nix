@@ -662,6 +662,21 @@ mod tests {
     }
 
     #[test]
+    fn v2_manifest_rejects_a_default_command() {
+        let base = temp_dir();
+        let dir = create_module_dir(&base, "echo");
+        let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
+        json["default_command"] = serde_json::json!("repeat");
+        let path = write_manifest(&dir, &serde_json::to_vec(&json).unwrap());
+
+        assert!(matches!(
+            validate_manifest_at(&path, Some("echo")),
+            Err(ExternalError::UnsupportedSchemaVersion)
+        ));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
     fn oversized_manifest_rejected() {
         let base = temp_dir();
         let dir = create_module_dir(&base, "echo");

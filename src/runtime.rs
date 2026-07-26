@@ -152,6 +152,11 @@ impl RuntimeState {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_external_snapshot_for_tests(&mut self, snapshot: ExternalRuntimeSnapshot) {
+        self.external_snapshot = snapshot;
+    }
+
     pub fn prepare_created_event_dispatch(
         &self,
         text: &str,
@@ -290,6 +295,13 @@ impl RuntimeState {
             arguments: args.to_owned(),
             argument_entities: Vec::new(),
         }))
+    }
+
+    pub fn has_external_module(&self, module_id: &str) -> bool {
+        self.external_snapshot
+            .descriptors
+            .iter()
+            .any(|descriptor| descriptor.id == module_id)
     }
 
     async fn execute_external(&mut self, invocation: &ExternalInvocation) -> Response {

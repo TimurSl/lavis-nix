@@ -237,8 +237,13 @@ fn route(authored_by_self: bool, text: &str, runtime: &RuntimeState) -> Option<A
     // Order: built-in > external namespaced > external default > alias.
     dispatch(&command)
         .or_else(|| runtime.resolve_external(&command.name, &command.args))
-        .or_else(|| runtime.resolve_external_default(&command.name, &command.args))
-        .or_else(|| runtime.resolve_alias(&command.name, &command.args))
+        .or_else(|| {
+            if runtime.has_external_module(&command.name) {
+                runtime.resolve_external_default(&command.name, &command.args)
+            } else {
+                runtime.resolve_alias(&command.name, &command.args)
+            }
+        })
 }
 
 #[cfg(test)]
@@ -246,13 +251,17 @@ mod tests {
     use grammers_session::types::PeerId;
 
     use super::{is_self_authored, route};
-    use crate::commands::{Action, PrefixRequest};
+    use crate::commands::{Action, ExternalInvocation, PrefixRequest};
     use crate::{
         aliases::{Alias, AliasStore},
+        external_modules::{
+            manager::ExternalRuntimeSnapshot,
+            manifest::{ExternalCommandDescriptor, ExternalModuleDescriptor},
+        },
         runtime::RuntimeState,
         settings::SettingsStore,
     };
-    use std::{path::PathBuf, time::Instant};
+    use std::{collections::HashMap, path::PathBuf, time::Instant};
 
     async fn runtime() -> RuntimeState {
         RuntimeState::new(
@@ -378,6 +387,103 @@ mod tests {
             Some(Action::Modules(crate::commands::ModulesRequest::Overview))
         );
         assert_eq!(route(true, ",modules", &runtime), None);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn routes_builtins_externals_defaults_and_aliases_in_priority_order() {
+        fn descriptor(id: &str, default_command: Option<&str>) -> ExternalModuleDescriptor {
+            ExternalModuleDescriptor {
+                protocol_version: 3,
+                id: id.to_owned(),
+                display_name: id.to_owned(),
+                version: "test".to_owned(),
+                author: "test".to_owned(),
+                entrypoint: PathBuf::new(),
+                module_dir: PathBuf::new(),
+                capabilities: vec![],
+                default_command: default_command.map(str::to_owned),
+                subscriptions: vec![],
+                actions: vec![],
+                commands: vec![ExternalCommandDescriptor {
+                    name: "run".to_owned(),
+                    summary_ru: "test".to_owned(),
+                    description_ru: "test".to_owned(),
+                    usage: "".to_owned(),
+                    examples: vec![],
+                }],
+            }
+        }
+
+        let directory = std::env::temp_dir().join(format!(
+            "lavis-updates-routing-priority-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut aliases = AliasStore::load(directory.join("aliases.json"))
+            .await
+            .unwrap();
+        for name in ["shortcut", "inactive", "crashed", "withoutdefault"] {
+            aliases
+                .add(
+                    name,
+                    Alias {
+                        target: "ping".to_owned(),
+                        args: vec![],
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let settings = SettingsStore::load(directory.join("settings.json"))
+            .await
+            .unwrap();
+        let mut runtime = RuntimeState::new(
+            Instant::now(),
+            aliases,
+            settings,
+            directory.join("fastfetch.json"),
+        );
+        runtime.set_external_snapshot_for_tests(ExternalRuntimeSnapshot {
+            active_commands: ["external.run".to_owned()].into(),
+            active_defaults: HashMap::from([
+                ("default".to_owned(), "run".to_owned()),
+                ("ping".to_owned(), "run".to_owned()),
+            ]),
+            descriptors: vec![
+                descriptor("external", None),
+                descriptor("default", Some("run")),
+                descriptor("ping", Some("run")),
+                descriptor("inactive", Some("run")),
+                descriptor("crashed", Some("run")),
+                descriptor("withoutdefault", None),
+            ],
+            ..ExternalRuntimeSnapshot::new()
+        });
+
+        assert_eq!(route(true, ",ping", &runtime), Some(Action::Ping));
+        assert_eq!(
+            route(true, ",external.run args", &runtime),
+            Some(Action::External(ExternalInvocation {
+                module_id: "external".to_owned(),
+                command_name: "run".to_owned(),
+                arguments: "args".to_owned(),
+                argument_entities: vec![],
+            }))
+        );
+        assert_eq!(
+            route(true, ",default args", &runtime),
+            Some(Action::External(ExternalInvocation {
+                module_id: "default".to_owned(),
+                command_name: "run".to_owned(),
+                arguments: "args".to_owned(),
+                argument_entities: vec![],
+            }))
+        );
+        assert_eq!(route(true, ",shortcut", &runtime), Some(Action::Ping));
+        assert_eq!(route(true, ",inactive", &runtime), None);
+        assert_eq!(route(true, ",crashed", &runtime), None);
+        assert_eq!(route(true, ",withoutdefault", &runtime), None);
         std::fs::remove_dir_all(directory).unwrap();
     }
 
