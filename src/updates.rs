@@ -118,7 +118,10 @@ fn route(authored_by_self: bool, text: &str, runtime: &RuntimeState) -> Option<A
     let command = authored_by_self
         .then(|| parse(text, runtime.prefix()))
         .flatten()?;
-    dispatch(&command).or_else(|| runtime.resolve_alias(&command.name, &command.args))
+    // Order: built-in > external namespaced > alias
+    dispatch(&command)
+        .or_else(|| runtime.resolve_external(&command.name, &command.args))
+        .or_else(|| runtime.resolve_alias(&command.name, &command.args))
 }
 
 #[cfg(test)]

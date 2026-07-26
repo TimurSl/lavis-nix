@@ -10,9 +10,11 @@ use grammers_session::types::PeerId;
 use crate::{
     aliases::{Alias, AliasStore, DeleteResult},
     command::Command,
-    commands::{Action, AliasRequest, ModulesRequest, PrefixRequest, dispatch},
+    commands::{Action, AliasRequest, ExternalInvocation, ModulesRequest, PrefixRequest, dispatch},
+    error::ExternalError,
+    external_modules::manager::{ExternalManagerHandle, ExternalRuntimeSnapshot},
     fastfetch::{self, FastfetchInputError, FastfetchProfileError, FastfetchResult},
-    help::{render, render_modules_overview},
+    help::{render_modules_overview_with_external, render_with_external},
     response::Response,
     settings::{DEFAULT_PREFIX, SettingsStore},
 };
@@ -23,6 +25,8 @@ pub struct RuntimeState {
     aliases: AliasStore,
     settings: SettingsStore,
     fastfetch_profile_path: PathBuf,
+    external_manager: Option<ExternalManagerHandle>,
+    external_snapshot: ExternalRuntimeSnapshot,
     expected_self_edits: VecDeque<ExpectedSelfEdit>,
 }
 
@@ -48,8 +52,39 @@ impl RuntimeState {
             aliases,
             settings,
             fastfetch_profile_path,
+            external_manager: None,
+            external_snapshot: ExternalRuntimeSnapshot::new(),
             expected_self_edits: VecDeque::new(),
         }
+    }
+
+    pub async fn set_external_manager(&mut self, handle: ExternalManagerHandle) {
+        self.external_snapshot = handle.snapshot().await;
+        self.external_manager = Some(handle);
+    }
+
+    pub fn external_manager(&self) -> Option<&ExternalManagerHandle> {
+        self.external_manager.as_ref()
+    }
+
+    pub async fn refresh_snapshot(&mut self) {
+        if let Some(handle) = &self.external_manager {
+            self.external_snapshot = handle.snapshot().await;
+        }
+    }
+
+    pub fn external_command_refs(&self) -> &[crate::external_modules::manager::ExternalCommandRef] {
+        &self.external_snapshot.command_refs
+    }
+
+    pub fn has_active_external_command(&self, name: &str) -> bool {
+        self.external_snapshot.active_commands.contains(name)
+    }
+
+    pub fn external_descriptors(
+        &self,
+    ) -> &[crate::external_modules::manifest::ExternalModuleDescriptor] {
+        &self.external_snapshot.descriptors
     }
 
     pub fn prefix(&self) -> &str {
@@ -110,6 +145,101 @@ impl RuntimeState {
         })
     }
 
+    /// Resolve a dotted external command `module-id.command-name`.
+    /// Uses the pre-computed set for sync routing.
+    pub fn resolve_external(&self, name: &str, args: &str) -> Option<Action> {
+        if !self.has_active_external_command(name) {
+            return None;
+        }
+        let dot = name.find('.')?;
+        let module_id = name[..dot].to_owned();
+        let command_name = name[dot + 1..].to_owned();
+        Some(Action::External(ExternalInvocation {
+            module_id,
+            command_name,
+            arguments: if args.is_empty() {
+                String::new()
+            } else {
+                args.to_owned()
+            },
+        }))
+    }
+
+    async fn execute_external(&mut self, invocation: &ExternalInvocation) -> Response {
+        let handle = match self.external_manager.clone() {
+            Some(h) => h,
+            None => return Response::plain("⚠️ Внешние модули не доступны.".to_owned()),
+        };
+        let mut mgr = handle.lock().await;
+        let result = mgr
+            .execute(
+                &invocation.module_id,
+                &invocation.command_name,
+                &invocation.arguments,
+            )
+            .await;
+        let response = match &result {
+            Ok(text) => {
+                let found = self
+                    .external_snapshot
+                    .descriptors
+                    .iter()
+                    .find(|d| d.id == invocation.module_id);
+                match found {
+                    Some(desc) => {
+                        Response::external_result(text, &desc.display_name, &desc.id, &desc.version)
+                    }
+                    None => Response::plain(format!(
+                        "{text}\n\n⚠️ Модуль «{}» не найден в описаниях.",
+                        invocation.module_id
+                    )),
+                }
+            }
+            Err(ExternalError::Unavailable) => Response::plain(format!(
+                "⚠️ Модуль «{}» недоступен или завершился с ошибкой.",
+                invocation.module_id
+            )),
+            Err(ExternalError::ExecutionTimeout) => Response::plain(format!(
+                "⚠️ Модуль «{}» не ответил вовремя.",
+                invocation.module_id
+            )),
+            Err(ExternalError::ProtocolDecode) => Response::plain(format!(
+                "⚠️ Модуль «{}» прислал некорректный ответ.",
+                invocation.module_id
+            )),
+            Err(ExternalError::WrongRequestId) => Response::plain(format!(
+                "⚠️ Модуль «{}» прислал ответ с неверным идентификатором.",
+                invocation.module_id
+            )),
+            Err(ExternalError::ModuleError) => Response::plain(format!(
+                "⚠️ Модуль «{}» сообщил об ошибке выполнения.",
+                invocation.module_id
+            )),
+            Err(ExternalError::ResultTooLarge) => Response::plain(format!(
+                "⚠️ Результат модуля «{}» слишком большой.",
+                invocation.module_id
+            )),
+            Err(error) => {
+                tracing::warn!(
+                    event = "external_command_error",
+                    module_id = %invocation.module_id,
+                    command = %invocation.command_name,
+                    error = %error,
+                    "External command failed"
+                );
+                Response::plain(format!(
+                    "⚠️ Ошибка модуля «{}»: {}",
+                    invocation.module_id, error
+                ))
+            }
+        };
+        drop(mgr);
+        if result.is_err() {
+            self.refresh_snapshot().await;
+        }
+        response
+    }
+
     pub async fn execute(&mut self, client: &Client, action: &Action, message_id: i32) -> Response {
         self.recognized_commands = self.recognized_commands.saturating_add(1);
         let prefix = self.prefix().to_owned();
@@ -139,7 +269,13 @@ impl RuntimeState {
                 ))
             }
             Action::Help(request) => {
-                let rendered = render(request, &prefix, &self.aliases);
+                let rendered = render_with_external(
+                    request,
+                    &prefix,
+                    &self.aliases,
+                    self.external_command_refs(),
+                    self.external_descriptors(),
+                );
                 if rendered.entity_fallback {
                     tracing::warn!(
                         event = "help_entity_fallback",
@@ -156,6 +292,7 @@ impl RuntimeState {
             Action::Alias(request) => self.execute_alias(request, &prefix).await,
             Action::Prefix(request) => self.execute_prefix(request).await,
             Action::Modules(request) => self.execute_modules(request, &prefix),
+            Action::External(invocation) => self.execute_external(invocation).await,
         }
     }
 
@@ -168,7 +305,11 @@ impl RuntimeState {
                     command_count = crate::commands::commands().len(),
                     "Rendered module overview"
                 );
-                let rendered = render_modules_overview(prefix);
+                let rendered = render_modules_overview_with_external(
+                    prefix,
+                    self.external_descriptors(),
+                    self.external_command_refs(),
+                );
                 if rendered.entity_fallback {
                     tracing::warn!(
                         event = "modules_entity_fallback",

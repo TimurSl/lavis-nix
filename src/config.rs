@@ -86,6 +86,40 @@ impl ConfigPaths {
         valid_root(&config_directory)?;
         Ok(config_directory.join("lavis"))
     }
+
+    pub fn data_dir_with<F>(environment: &F) -> Result<PathBuf, ConfigError>
+    where
+        F: Fn(&str) -> Option<OsString>,
+    {
+        let data_directory = environment("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|path| !path.as_os_str().is_empty())
+            .or_else(|| {
+                environment("HOME")
+                    .filter(|home| !home.is_empty())
+                    .map(|home| PathBuf::from(home).join(".local/share"))
+            })
+            .ok_or(ConfigError::MissingStateDirectory)?;
+        valid_root(&data_directory)?;
+        Ok(data_directory)
+    }
+
+    pub fn external_modules_state_path_with<F>(environment: &F) -> Result<PathBuf, ConfigError>
+    where
+        F: Fn(&str) -> Option<OsString>,
+    {
+        let state_directory = environment("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .filter(|path| !path.as_os_str().is_empty())
+            .or_else(|| {
+                environment("HOME")
+                    .filter(|home| !home.is_empty())
+                    .map(|home| PathBuf::from(home).join(".local/state"))
+            })
+            .ok_or(ConfigError::MissingStateDirectory)?;
+        valid_root(&state_directory)?;
+        Ok(state_directory.join("lavis/external-modules.json"))
+    }
 }
 
 impl Config {

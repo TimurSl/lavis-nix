@@ -642,6 +642,7 @@ dependencies = [
  "grammers-client",
  "grammers-mtsender",
  "grammers-session",
+ "libc",
  "rpassword",
  "serde",
  "serde_json",

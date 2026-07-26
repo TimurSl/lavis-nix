@@ -59,6 +59,30 @@ Lavis — личный Telegram userbot на Rust, использующий MTPr
 
 Module API v1 **не** добавляет динамический загрузчик внешних модулей, установщик, терминал, `sudo` или запуск произвольных процессов. Метаданные внешнего происхождения нужны только для безопасного отображения происхождения; они не являются загрузчиком или песочницей.
 
+## Внешние модули (alpha)
+
+Module API v2 и runtime внешних модулей позволяют расширять Lavis командами
+на любом языке. Каждый модуль запускается как отдельный процесс и общается
+с Lavis через JSON-строки (stdin/stdout).
+
+```bash
+# Локальная CLI: управление модулями
+lavis modules validate ./my-module/module.json
+lavis modules enable my-module
+lavis modules disable my-module
+lavis modules status
+
+# Команда Telegram с текущим префиксом
+,my-module.command-name аргументы
+```
+
+Документация: [Module API v2](docs/module-api-v2.md) и
+[External Modules](docs/external-modules.md). Пример:
+[examples/external-module-echo/](examples/external-module-echo/).
+
+**Предупреждение:** внешние модули запускаются без песочницы. Включайте
+только код, которому доверяете.
+
 ## Требования
 
 - Linux; текущие outputs Nix flake предназначены только для `x86_64-linux`;
@@ -172,9 +196,9 @@ Lavis не добавляет логотип или структуру, если
 ```bash
 nix develop
 cargo fmt --check
-cargo check --all-targets
+cargo check --all-targets --all-features
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
+cargo test --all-targets --all-features
 nix flake check --print-build-logs
 nix build --print-build-logs
 ```

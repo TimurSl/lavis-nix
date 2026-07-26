@@ -47,6 +47,7 @@
           rustc
           rustfmt
           fastfetch
+          python3 # JSON-line external-process fixtures
         ];
       };
       checks.${system}.default = package;

@@ -1,6 +1,6 @@
 # Участие в разработке Lavis
 
-Lavis — небольшой, статически типизированный и безопасный по умолчанию Telegram userbot на Rust и Nix. Вносите минимальные связные изменения, добавляйте тесты для изменённого поведения и обновляйте пользовательскую документацию при изменении интерфейса, команд, безопасности или конфигурации. Полный контракт: [Module API v1](docs/module-api-v1.md).
+Lavis — небольшой, статически типизированный и безопасный по умолчанию Telegram userbot на Rust и Nix. Вносите минимальные связные изменения, добавляйте тесты для изменённого поведения и обновляйте пользовательскую документацию при изменении интерфейса, команд, безопасности или конфигурации. Полные контракты: [Module API v1](docs/module-api-v1.md) (встроенные модули) и [Module API v2](docs/module-api-v2.md) (внешние модули).
 
 ## Module API v1
 
@@ -66,9 +66,9 @@ Help v2 получает русские `summary_ru`, `description_ru` и при
 ```bash
 nix develop
 cargo fmt --check
-cargo check --all-targets
+cargo check --all-targets --all-features
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
+cargo test --all-targets --all-features
 nix flake check
 nix build
 ```
