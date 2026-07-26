@@ -703,6 +703,22 @@ if child:
         (descriptor, dir)
     }
 
+    fn create_v3_event_module(id: &str) -> (ExternalModuleDescriptor, PathBuf) {
+        let (mut descriptor, directory) = create_fixture_module(V3_EVENT_MODULE_PY, id);
+        descriptor.protocol_version = 3;
+        (descriptor, directory)
+    }
+
+    fn created_event() -> MessageCreatedEvent {
+        MessageCreatedEvent {
+            event_id: "event-1".to_owned(),
+            message_ref: "message-1".to_owned(),
+            text: "hello".to_owned(),
+            outgoing: true,
+            entities: vec![],
+        }
+    }
+
     #[tokio::test]
     async fn test_handshake_success() {
         let (desc, dir) = create_echo_module();
@@ -801,5 +817,106 @@ for line in sys.stdin:
         let mut proc = ModuleProcess::start(desc).await.unwrap();
         proc.terminate().await;
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    const V3_EVENT_MODULE_PY: &str = r#"#!/usr/bin/env python3
+import json, sys, time
+for line in sys.stdin:
+    message = json.loads(line)
+    request_id = message["request_id"]
+    if message["type"] == "initialize":
+        response = {"protocol_version": 3, "type": "initialized", "request_id": request_id, "module_id": message["module_id"]}
+    elif message["type"] == "event":
+        module_id = "" # replaced by the test fixture name
+        message_ref = message["payload"]["message_ref"]
+        if module_id == "timeout":
+            time.sleep(10)
+        if module_id == "exit":
+            sys.exit(0)
+        if module_id == "wrong-id":
+            request_id = "999"
+        if module_id == "ordinary":
+            actions = [{"type": "message.react", "message_ref": message_ref, "reaction": {"type": "emoji", "emoji": "👍"}}]
+        elif module_id == "custom":
+            actions = [{"type": "message.react", "message_ref": message_ref, "reaction": {"type": "custom_emoji", "document_id": "5456140674028019486"}}]
+        elif module_id == "malformed":
+            actions = [{"type": "unexpected", "message_ref": message_ref, "reaction": {"type": "emoji", "emoji": "👍"}}]
+        elif module_id == "multiple":
+            actions = [{"type": "message.react", "message_ref": message_ref, "reaction": {"type": "emoji", "emoji": "👍"}}, {"type": "message.react", "message_ref": message_ref, "reaction": {"type": "emoji", "emoji": "👎"}}]
+        else:
+            actions = []
+        response = {"protocol_version": 3, "type": "event_result", "request_id": request_id, "actions": actions}
+    else:
+        continue
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
+"#;
+
+    #[tokio::test]
+    async fn v3_event_result_accepts_zero_ordinary_and_custom_emoji_actions() {
+        for (id, expected) in [
+            ("zero", vec![]),
+            (
+                "ordinary",
+                vec![protocol::EventAction {
+                    message_ref: "message-1".to_owned(),
+                    reaction: protocol::ReactionSpec::Emoji("👍".to_owned()),
+                }],
+            ),
+            (
+                "custom",
+                vec![protocol::EventAction {
+                    message_ref: "message-1".to_owned(),
+                    reaction: protocol::ReactionSpec::CustomEmoji {
+                        document_id: "5456140674028019486".to_owned(),
+                    },
+                }],
+            ),
+        ] {
+            let (descriptor, directory) = create_v3_event_module(id);
+            let entrypoint = descriptor.entrypoint.clone();
+            make_script(
+                &entrypoint,
+                &V3_EVENT_MODULE_PY.replace("module_id = \"\"", &format!("module_id = {id:?}")),
+            );
+            let mut process = ModuleProcess::start(descriptor).await.unwrap();
+            let (_, actions) = process
+                .dispatch_created_event(created_event())
+                .await
+                .unwrap();
+            assert_eq!(actions, expected);
+            process.terminate().await;
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn v3_event_failures_reject_the_protocol_and_clean_up_processes() {
+        for (id, expected) in [
+            ("wrong-id", ExternalError::WrongRequestId),
+            ("malformed", ExternalError::ProtocolDecode),
+            ("multiple", ExternalError::ProtocolDecode),
+            ("exit", ExternalError::Unavailable),
+            ("timeout", ExternalError::ExecutionTimeout),
+        ] {
+            let (descriptor, directory) = create_v3_event_module(id);
+            let entrypoint = descriptor.entrypoint.clone();
+            make_script(
+                &entrypoint,
+                &V3_EVENT_MODULE_PY.replace("module_id = \"\"", &format!("module_id = {id:?}")),
+            );
+            let mut process = ModuleProcess::start(descriptor).await.unwrap();
+            let error = process
+                .dispatch_created_event(created_event())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                std::mem::discriminant(&error),
+                std::mem::discriminant(&expected)
+            );
+            assert_eq!(process.status(), ProcessStatus::Crashed);
+            assert_eq!(process.in_flight_request(), None);
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 }

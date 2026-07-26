@@ -1041,13 +1041,15 @@ mod tests {
         const EVENT_MODULE: &str = r#"#!/usr/bin/env python3
 import json, os, sys, time
 ready_dir = os.environ["READY_DIR"]
+module_id = None
 for line in sys.stdin:
     message = json.loads(line)
     request_id = message["request_id"]
     if message["type"] == "initialize":
-        response = {"protocol_version": 3, "type": "initialized", "request_id": request_id, "module_id": message["module_id"]}
+        module_id = message["module_id"]
+        response = {"protocol_version": message["protocol_version"], "type": "initialized", "request_id": request_id, "module_id": message["module_id"]}
     elif message["type"] == "event":
-        open(os.path.join(ready_dir, "started-" + message["payload"]["text"]), "w").close()
+        open(os.path.join(ready_dir, "started-" + module_id), "w").close()
         while not os.path.exists(os.path.join(ready_dir, "release")):
             time.sleep(0.01)
         response = {"protocol_version": 3, "type": "event_result", "request_id": request_id, "actions": []}
@@ -1063,9 +1065,11 @@ for line in sys.stdin:
             id: &str,
             entrypoint: PathBuf,
             module_dir: PathBuf,
+            protocol_version: u32,
+            subscribed: bool,
         ) -> crate::external_modules::manifest::ExternalModuleDescriptor {
             crate::external_modules::manifest::ExternalModuleDescriptor {
-                protocol_version: 3,
+                protocol_version,
                 id: id.to_owned(),
                 display_name: id.to_owned(),
                 version: "test".to_owned(),
@@ -1076,9 +1080,12 @@ for line in sys.stdin:
                     crate::external_modules::manifest::ExternalCapability::MessageRead,
                 ],
                 default_command: None,
-                subscriptions: vec![
-                    crate::external_modules::manifest::ExternalSubscription::MessageCreated,
-                ],
+                subscriptions: subscribed
+                    .then_some(
+                        crate::external_modules::manifest::ExternalSubscription::MessageCreated,
+                    )
+                    .into_iter()
+                    .collect(),
                 actions: vec![],
                 commands: vec![],
             }
@@ -1097,7 +1104,12 @@ for line in sys.stdin:
             .find(|path| path.is_file())
             .expect("fixture tests require python3 in PATH");
         let mut descriptors = Vec::new();
-        for id in ["first", "second"] {
+        for (id, protocol_version, subscribed) in [
+            ("first", 3, true),
+            ("second", 3, true),
+            ("legacy", 2, true),
+            ("unsubscribed", 3, false),
+        ] {
             let module_dir = directory.join(id);
             fs::create_dir_all(&module_dir).unwrap();
             let entrypoint = module_dir.join("module.py");
@@ -1116,7 +1128,13 @@ for line in sys.stdin:
             )
             .unwrap();
             fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700)).unwrap();
-            descriptors.push(descriptor(id, entrypoint, module_dir));
+            descriptors.push(descriptor(
+                id,
+                entrypoint,
+                module_dir,
+                protocol_version,
+                subscribed,
+            ));
         }
 
         let mut manager = crate::external_modules::manager::ExternalManager::new();
@@ -1130,23 +1148,11 @@ for line in sys.stdin:
                     .collect(),
             )
             .await;
-        let dispatch = super::CreatedEventDispatch {
-            handle: handle.clone(),
-            requests: descriptors
-                .into_iter()
-                .map(|descriptor| super::CreatedEventRequest {
-                    message_ref: descriptor.id.clone(),
-                    payload: crate::external_modules::protocol::MessageCreatedEvent {
-                        event_id: descriptor.id.clone(),
-                        message_ref: descriptor.id.clone(),
-                        text: descriptor.id.clone(),
-                        outgoing: true,
-                        entities: vec![],
-                    },
-                    descriptor,
-                })
-                .collect(),
-        };
+        let (mut runtime, state_directory) = runtime_with_alias().await;
+        runtime.set_external_manager(handle.clone()).await;
+        let dispatch = runtime
+            .prepare_created_event_dispatch("event", true, vec![])
+            .expect("only subscribed v3 modules should receive events");
 
         let execute = dispatch.execute();
         tokio::pin!(execute);
@@ -1160,10 +1166,13 @@ for line in sys.stdin:
         })
         .await
         .expect("independent module requests did not begin together");
+        assert!(!directory.join("started-legacy").exists());
+        assert!(!directory.join("started-unsubscribed").exists());
         fs::write(directory.join("release"), "").unwrap();
         assert!(execute.await.actions.is_empty());
         handle.shutdown_all().await;
         fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(state_directory).unwrap();
     }
 
     #[test]
