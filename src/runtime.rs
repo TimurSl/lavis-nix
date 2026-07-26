@@ -110,9 +110,15 @@ impl RuntimeState {
                         request_id: request_id.clone(),
                         message_ref,
                     };
-                    accepted.extend(actions.into_iter().filter(|action| {
-                        validate_reaction_action(descriptor, &scope, &request_id, action)
-                    }));
+                    for action in actions {
+                        if let Err(category) =
+                            validate_reaction_action(descriptor, &scope, &request_id, &action)
+                        {
+                            tracing::warn!(event = "external_reaction_rejected", ?category, module_id = %descriptor.id, "External reaction action rejected");
+                            continue;
+                        }
+                        accepted.push(action);
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(event = "external_event_failed", module_id = %descriptor.id, error = %error, "External event failed")

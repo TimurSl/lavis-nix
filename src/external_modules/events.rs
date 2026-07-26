@@ -20,11 +20,34 @@ pub struct EventScope {
     pub message_ref: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReactionValidationError {
+    ActionNotDeclared,
+    CapabilityMissing,
+    WrongModuleScope,
+    WrongRequestScope,
+    WrongMessageReference,
+    InvalidEmoji,
+    InvalidCustomEmojiDocumentId,
+}
+
 impl EventScope {
-    pub fn accepts(&self, module_id: &str, request_id: &str, action: &EventAction) -> bool {
-        self.module_id == module_id
-            && self.request_id == request_id
-            && self.message_ref == action.message_ref
+    pub fn validate(
+        &self,
+        module_id: &str,
+        request_id: &str,
+        action: &EventAction,
+    ) -> Result<(), ReactionValidationError> {
+        if self.module_id != module_id {
+            return Err(ReactionValidationError::WrongModuleScope);
+        }
+        if self.request_id != request_id {
+            return Err(ReactionValidationError::WrongRequestScope);
+        }
+        if self.message_ref != action.message_ref {
+            return Err(ReactionValidationError::WrongMessageReference);
+        }
+        Ok(())
     }
 }
 
@@ -43,13 +66,26 @@ pub fn validate_reaction_action(
     scope: &EventScope,
     request_id: &str,
     action: &EventAction,
-) -> bool {
-    descriptor.actions.contains(&ExternalAction::MessageReact)
-        && descriptor
-            .capabilities
-            .contains(&ExternalCapability::MessageReact)
-        && scope.accepts(&descriptor.id, request_id, action)
-        && valid_reaction(&action.reaction)
+) -> Result<(), ReactionValidationError> {
+    if !descriptor.actions.contains(&ExternalAction::MessageReact) {
+        return Err(ReactionValidationError::ActionNotDeclared);
+    }
+    if !descriptor
+        .capabilities
+        .contains(&ExternalCapability::MessageReact)
+    {
+        return Err(ReactionValidationError::CapabilityMissing);
+    }
+    scope.validate(&descriptor.id, request_id, action)?;
+    match &action.reaction {
+        ReactionSpec::Emoji(_) if !valid_reaction(&action.reaction) => {
+            Err(ReactionValidationError::InvalidEmoji)
+        }
+        ReactionSpec::CustomEmoji { .. } if !valid_reaction(&action.reaction) => {
+            Err(ReactionValidationError::InvalidCustomEmojiDocumentId)
+        }
+        _ => Ok(()),
+    }
 }
 
 fn valid_reaction(reaction: &ReactionSpec) -> bool {
@@ -106,8 +142,11 @@ mod tests {
             },
         };
         assert!(module_can_receive_created_event(&descriptor));
-        assert!(validate_reaction_action(&descriptor, &scope, "7", &action));
-        assert!(!validate_reaction_action(&descriptor, &scope, "8", &action));
+        assert!(validate_reaction_action(&descriptor, &scope, "7", &action).is_ok());
+        assert_eq!(
+            validate_reaction_action(&descriptor, &scope, "8", &action),
+            Err(ReactionValidationError::WrongRequestScope)
+        );
     }
 
     #[test]
