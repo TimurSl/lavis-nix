@@ -7,6 +7,12 @@ use super::{
 
 pub const MAX_EMOJI_CHARS: usize = 32;
 
+pub fn opaque_message_ref() -> Result<String, getrandom::Error> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventScope {
     pub module_id: String,
@@ -102,5 +108,14 @@ mod tests {
         assert!(module_can_receive_created_event(&descriptor));
         assert!(validate_reaction_action(&descriptor, &scope, "7", &action));
         assert!(!validate_reaction_action(&descriptor, &scope, "8", &action));
+    }
+
+    #[test]
+    fn opaque_references_have_no_scope_components() {
+        let first = opaque_message_ref().unwrap();
+        let second = opaque_message_ref().unwrap();
+        assert_eq!(first.len(), 64);
+        assert_ne!(first, second);
+        assert!(!first.contains("autoreact"));
     }
 }

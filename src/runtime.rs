@@ -14,7 +14,10 @@ use crate::{
     error::ExternalError,
     external_modules::manager::{ExternalManagerHandle, ExternalRuntimeSnapshot},
     external_modules::{
-        events::{EventScope, module_can_receive_created_event, validate_reaction_action},
+        events::{
+            EventScope, module_can_receive_created_event, opaque_message_ref,
+            validate_reaction_action,
+        },
         protocol::{EventAction, MessageCreatedEvent},
     },
     fastfetch::{self, FastfetchInputError, FastfetchProfileError, FastfetchResult},
@@ -88,11 +91,10 @@ impl RuntimeState {
             .filter(|descriptor| module_can_receive_created_event(descriptor))
         {
             let event_id = crate::external_modules::protocol::request_id();
-            let message_ref = format!(
-                "mref-{}-{}",
-                descriptor.id,
-                crate::external_modules::protocol::request_id()
-            );
+            let Ok(message_ref) = opaque_message_ref() else {
+                tracing::warn!(event = "external_event_reference_failed", module_id = %descriptor.id, "Could not create an external event reference");
+                continue;
+            };
             let payload = MessageCreatedEvent {
                 event_id,
                 message_ref: message_ref.clone(),
@@ -100,11 +102,7 @@ impl RuntimeState {
                 outgoing,
                 entities: Vec::new(),
             };
-            let mut manager = handle.lock().await;
-            let result = manager
-                .dispatch_created_event(&descriptor.id, payload)
-                .await;
-            drop(manager);
+            let result = handle.dispatch_created_event(&descriptor.id, payload).await;
             match result {
                 Ok((request_id, actions)) => {
                     let scope = EventScope {
