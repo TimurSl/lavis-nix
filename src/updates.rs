@@ -5,6 +5,7 @@ use grammers_client::{
     update::{Message, Update},
 };
 use grammers_session::types::PeerId;
+use std::future::Future;
 use tokio::task::JoinSet;
 
 use crate::{
@@ -15,6 +16,57 @@ use crate::{
 
 const MAX_EVENT_DISPATCH_TASKS: usize = 32;
 
+struct EventDispatches {
+    tasks: JoinSet<()>,
+}
+
+enum UpdateOrEvent<U> {
+    Update(U),
+    Event(Option<Result<(), tokio::task::JoinError>>),
+}
+
+impl EventDispatches {
+    fn new() -> Self {
+        Self {
+            tasks: JoinSet::new(),
+        }
+    }
+
+    fn try_spawn(&mut self, task: impl Future<Output = ()> + Send + 'static) -> bool {
+        if self.tasks.len() >= MAX_EVENT_DISPATCH_TASKS {
+            return false;
+        }
+        self.tasks.spawn(task);
+        true
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+
+    fn has_capacity(&self) -> bool {
+        self.tasks.len() < MAX_EVENT_DISPATCH_TASKS
+    }
+
+    async fn next_update_or_event<U>(
+        &mut self,
+        update: impl Future<Output = U>,
+    ) -> UpdateOrEvent<U> {
+        if self.is_empty() {
+            return UpdateOrEvent::Update(update.await);
+        }
+        tokio::select! {
+            update = update => UpdateOrEvent::Update(update),
+            completed = self.tasks.join_next() => UpdateOrEvent::Event(completed),
+        }
+    }
+
+    async fn abort_and_drain(&mut self) {
+        self.tasks.abort_all();
+        while self.tasks.join_next().await.is_some() {}
+    }
+}
+
 pub async fn run(
     stream: &mut UpdateStream,
     self_user_id: PeerId,
@@ -23,14 +75,13 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
-    let mut event_dispatches = JoinSet::new();
+    let mut event_dispatches = EventDispatches::new();
 
     loop {
         tokio::select! {
             signal = &mut shutdown => {
                 signal.context("failed to listen for Ctrl-C shutdown signal")?;
-                event_dispatches.abort_all();
-                while event_dispatches.join_next().await.is_some() {}
+                event_dispatches.abort_and_drain().await;
                 stream
                     .sync_update_state()
                     .await
@@ -38,26 +89,25 @@ pub async fn run(
                     .context("failed to synchronize Telegram update state")?;
                 return Ok(());
             }
-            completed = event_dispatches.join_next(), if !event_dispatches.is_empty() => {
-                match completed {
-                    Some(Ok((message, result))) => handle_event_dispatch(message, result).await,
-                    Some(Err(error)) => tracing::warn!(event = "external_event_task_failed", error = %error, "External event task failed"),
-                    None => {}
+            next = event_dispatches.next_update_or_event(stream.next()) => {
+                match next {
+                    UpdateOrEvent::Event(Some(Ok(()))) => {}
+                    UpdateOrEvent::Event(Some(Err(error))) => tracing::warn!(event = "external_event_task_failed", error = %error, "External event task failed"),
+                    UpdateOrEvent::Event(None) => {}
+                    UpdateOrEvent::Update(update) => {
+                        if update.is_err() {
+                            event_dispatches.abort_and_drain().await;
+                        }
+                        let update = update.context("Telegram update stream ended or failed")?;
+                        process_update(
+                            update,
+                            self_user_id,
+                            client,
+                            runtime,
+                            &mut event_dispatches,
+                        ).await;
+                    }
                 }
-            }
-            update = stream.next() => {
-                if update.is_err() {
-                    event_dispatches.abort_all();
-                    while event_dispatches.join_next().await.is_some() {}
-                }
-                let update = update.context("Telegram update stream ended or failed")?;
-                process_update(
-                    update,
-                    self_user_id,
-                    client,
-                    runtime,
-                    &mut event_dispatches,
-                ).await;
             }
         }
     }
@@ -68,7 +118,7 @@ async fn process_update(
     self_user_id: PeerId,
     client: &grammers_client::Client,
     runtime: &mut RuntimeState,
-    event_dispatches: &mut JoinSet<(Message, CreatedEventDispatchResult)>,
+    event_dispatches: &mut EventDispatches,
 ) {
     let (message, edited) = match update {
         Update::NewMessage(message) => (message, false),
@@ -101,7 +151,7 @@ async fn process_update(
             0,
             message.text().encode_utf16().count(),
         );
-        if event_dispatches.len() >= MAX_EVENT_DISPATCH_TASKS {
+        if !event_dispatches.has_capacity() {
             tracing::warn!(
                 event = "external_event_task_skipped",
                 capacity = MAX_EVENT_DISPATCH_TASKS,
@@ -111,7 +161,14 @@ async fn process_update(
             runtime.prepare_created_event_dispatch(message.text(), outgoing, entities)
         {
             let reaction_message = message.clone();
-            event_dispatches.spawn(async move { (reaction_message, dispatch.execute().await) });
+            let spawned = event_dispatches.try_spawn(async move {
+                let result = dispatch.execute().await;
+                handle_event_dispatch(reaction_message, result).await;
+            });
+            debug_assert!(
+                spawned,
+                "event dispatch capacity was checked before spawning"
+            );
         }
     }
 
@@ -249,8 +306,11 @@ fn route(authored_by_self: bool, text: &str, runtime: &RuntimeState) -> Option<A
 #[cfg(test)]
 mod tests {
     use grammers_session::types::PeerId;
+    use tokio::sync::oneshot;
 
-    use super::{is_self_authored, route};
+    use super::{
+        EventDispatches, MAX_EVENT_DISPATCH_TASKS, UpdateOrEvent, is_self_authored, route,
+    };
     use crate::commands::{Action, ExternalInvocation, PrefixRequest};
     use crate::{
         aliases::{Alias, AliasStore},
@@ -262,6 +322,75 @@ mod tests {
         settings::SettingsStore,
     };
     use std::{collections::HashMap, path::PathBuf, time::Instant};
+
+    #[tokio::test]
+    async fn event_dispatches_limit_pending_tasks_and_skip_overload() {
+        let mut dispatches = EventDispatches::new();
+        assert_eq!(MAX_EVENT_DISPATCH_TASKS, 32);
+
+        for _ in 0..MAX_EVENT_DISPATCH_TASKS {
+            assert!(dispatches.try_spawn(std::future::pending()));
+        }
+        assert!(!dispatches.try_spawn(std::future::pending()));
+
+        dispatches.abort_and_drain().await;
+        assert!(dispatches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ready_update_is_processed_while_an_event_dispatch_is_pending() {
+        let mut dispatches = EventDispatches::new();
+        assert!(dispatches.try_spawn(std::future::pending()));
+
+        assert!(matches!(
+            dispatches.next_update_or_event(async { "update" }).await,
+            UpdateOrEvent::Update("update")
+        ));
+
+        dispatches.abort_and_drain().await;
+    }
+
+    #[tokio::test]
+    async fn completed_event_is_reaped_while_another_dispatch_is_pending() {
+        let mut dispatches = EventDispatches::new();
+        assert!(dispatches.try_spawn(std::future::pending()));
+        assert!(dispatches.try_spawn(async {}));
+
+        assert!(matches!(
+            dispatches
+                .next_update_or_event(std::future::pending::<()>())
+                .await,
+            UpdateOrEvent::Event(Some(Ok(())))
+        ));
+        assert_eq!(dispatches.tasks.len(), 1);
+
+        dispatches.abort_and_drain().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_and_drains_event_dispatches() {
+        struct DropSignal(Option<oneshot::Sender<()>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let mut dispatches = EventDispatches::new();
+        let (dropped, received_drop) = oneshot::channel();
+        assert!(dispatches.try_spawn(async move {
+            let _signal = DropSignal(Some(dropped));
+            std::future::pending::<()>().await;
+        }));
+        tokio::task::yield_now().await;
+
+        dispatches.abort_and_drain().await;
+        assert!(dispatches.is_empty());
+        assert_eq!(received_drop.await, Ok(()));
+    }
 
     async fn runtime() -> RuntimeState {
         RuntimeState::new(
