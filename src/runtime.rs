@@ -163,9 +163,7 @@ impl RuntimeState {
         outgoing: bool,
         entities: Vec<crate::external_modules::protocol::CustomEmojiEntity>,
     ) -> Option<CreatedEventDispatch> {
-        let Some(handle) = self.external_manager.clone() else {
-            return None;
-        };
+        let handle = self.external_manager.clone()?;
         let mut requests = Vec::new();
         for descriptor in self
             .external_snapshot
