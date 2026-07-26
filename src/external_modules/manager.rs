@@ -361,6 +361,54 @@ impl ExternalManagerHandle {
         ExternalRuntimeSnapshot::from_manager(&mgr)
     }
 
+    /// Starts children without retaining the manager mutex. Process I/O belongs
+    /// to the individual process mutex; the manager only owns the index.
+    pub async fn startup_enabled(&self, enabled_ids: &std::collections::BTreeSet<String>) {
+        let descriptors = {
+            let manager = self.inner.lock().await;
+            manager
+                .descriptors
+                .iter()
+                .filter(|descriptor| enabled_ids.contains(&descriptor.id))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for descriptor in descriptors {
+            let id = descriptor.id.clone();
+            match ModuleProcess::start(descriptor).await {
+                Ok(process) => {
+                    let mut manager = self.inner.lock().await;
+                    manager
+                        .processes
+                        .insert(id.clone(), Arc::new(Mutex::new(process)));
+                    tracing::info!(event = "external_module_started", module_id = %id, "External module started");
+                }
+                Err(error) => {
+                    tracing::warn!(event = "external_module_startup_failed", module_id = %id, error = %error, "Не удалось запустить внешний модуль")
+                }
+            }
+        }
+    }
+
+    /// Removes the index before awaiting child shutdown, so status refresh and
+    /// routing never wait behind a slow process shutdown.
+    pub async fn shutdown_all(&self) {
+        let processes = {
+            let mut manager = self.inner.lock().await;
+            std::mem::take(&mut manager.processes)
+        };
+        for (id, process) in processes {
+            let mut process = process.lock().await;
+            if process.status() == ProcessStatus::Running
+                && process.graceful_shutdown().await.is_ok()
+            {
+                continue;
+            }
+            tracing::warn!(event = "external_module_shutdown_forced", module_id = %id, "Forcefully terminating external module");
+            process.terminate().await;
+        }
+    }
+
     pub async fn dispatch_created_event(
         &self,
         module_id: &str,
