@@ -28,7 +28,7 @@ pub enum ProcessStatus {
 
 pub struct ModuleProcess {
     child: Option<Child>,
-    pid: u32,
+    process_group_id: Option<u32>,
     stdin: tokio::process::ChildStdin,
     stdout_reader: tokio::io::BufReader<tokio::process::ChildStdout>,
     stderr_drain: Option<tokio::task::JoinHandle<StderrCapture>>,
@@ -119,7 +119,7 @@ impl ModuleProcess {
 
         let mut process = Self {
             child: Some(child),
-            pid,
+            process_group_id: Some(pid),
             stdin,
             stdout_reader,
             stderr_drain: Some(stderr_drain),
@@ -377,14 +377,19 @@ impl ModuleProcess {
     async fn terminate_process_group(&self) {
         #[cfg(unix)]
         {
-            let pgid = self.pid as i32;
+            let Some(process_group_id) = self.process_group_id else {
+                return;
+            };
+            let Ok(pgid) = i32::try_from(process_group_id) else {
+                return;
+            };
             let ret = unsafe { libc::kill(-pgid, libc::SIGKILL) };
             if ret == -1 {
                 let err = std::io::Error::last_os_error();
                 if err.raw_os_error() != Some(libc::ESRCH) {
                     tracing::warn!(
                         event = "process_group_kill_failed",
-                        pid = self.pid,
+                        pid = process_group_id,
                         error = %err,
                         "Failed to kill process group"
                     );
@@ -393,7 +398,7 @@ impl ModuleProcess {
         }
         #[cfg(not(unix))]
         {
-            let _ = self.pid;
+            let _ = self.process_group_id;
         }
     }
 
@@ -410,6 +415,10 @@ impl ModuleProcess {
         if let Some(mut child) = self.child.take() {
             let _ = child.wait().await;
         }
+        // The process group ID is only valid while this ModuleProcess owns the
+        // child. Clearing it after reaping prevents repeated cleanup from
+        // signalling a PID that the kernel may have reused.
+        self.process_group_id = None;
     }
 
     async fn send(&mut self, msg: &CoreMessage) -> Result<(), ExternalError> {
@@ -752,6 +761,11 @@ if child:
         let (desc, dir) = create_echo_module();
         let mut proc = ModuleProcess::start(desc).await.unwrap();
         proc.graceful_shutdown().await.unwrap();
+        assert_eq!(proc.process_group_id, None);
+        // Repeated cleanup after the child has exited must not retain a stale
+        // PGID that could be reused by an unrelated process.
+        proc.terminate().await;
+        assert_eq!(proc.process_group_id, None);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -916,6 +930,9 @@ for line in sys.stdin:
             );
             assert_eq!(process.status(), ProcessStatus::Crashed);
             assert_eq!(process.in_flight_request(), None);
+            assert_eq!(process.process_group_id, None);
+            process.terminate().await;
+            assert_eq!(process.process_group_id, None);
             fs::remove_dir_all(directory).unwrap();
         }
     }

@@ -399,9 +399,10 @@ impl ExternalManagerHandle {
         };
         for (id, process) in processes {
             let mut process = process.lock().await;
-            if process.status() == ProcessStatus::Running
-                && process.graceful_shutdown().await.is_ok()
-            {
+            if process.status() != ProcessStatus::Running {
+                continue;
+            }
+            if process.graceful_shutdown().await.is_ok() {
                 continue;
             }
             tracing::warn!(event = "external_module_shutdown_forced", module_id = %id, "Forcefully terminating external module");
