@@ -4,6 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures_util::future::join_all;
 use grammers_client::{Client, tl};
 use grammers_session::types::PeerId;
 
@@ -65,26 +66,33 @@ pub struct CreatedEventDispatchResult {
 impl CreatedEventDispatch {
     pub async fn execute(self) -> CreatedEventDispatchResult {
         let mut result = CreatedEventDispatchResult::default();
-        for request in self.requests {
-            let module_id = request.descriptor.id.clone();
-            let response = self
-                .handle
-                .dispatch_created_event(&module_id, request.payload)
-                .await;
+        let dispatches = self.requests.into_iter().map(|request| {
+            let handle = self.handle.clone();
+            async move {
+                let CreatedEventRequest {
+                    descriptor,
+                    message_ref,
+                    payload,
+                } = request;
+                let module_id = descriptor.id.clone();
+                let response = handle.dispatch_created_event(&module_id, payload).await;
+                (descriptor, message_ref, response)
+            }
+        });
+
+        for (descriptor, message_ref, response) in join_all(dispatches).await {
+            let module_id = descriptor.id.clone();
             match response {
                 Ok((request_id, actions)) => {
                     let scope = EventScope {
                         module_id: module_id.clone(),
                         request_id: request_id.clone(),
-                        message_ref: request.message_ref,
+                        message_ref,
                     };
                     for action in actions {
-                        if let Err(category) = validate_reaction_action(
-                            &request.descriptor,
-                            &scope,
-                            &request_id,
-                            &action,
-                        ) {
+                        if let Err(category) =
+                            validate_reaction_action(&descriptor, &scope, &request_id, &action)
+                        {
                             tracing::warn!(event = "external_reaction_rejected", ?category, module_id = %module_id, "External reaction action rejected");
                             continue;
                         }
@@ -766,6 +774,9 @@ mod tests {
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
+    #[cfg(all(feature = "fixture-tests", unix))]
+    use std::os::unix::fs::PermissionsExt;
+
     async fn runtime_with_alias() -> (super::RuntimeState, PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1010,6 +1021,137 @@ mod tests {
             external_event_error_category(&crate::error::ExternalError::NotReadable),
             "other"
         );
+    }
+
+    #[cfg(all(feature = "fixture-tests", unix))]
+    #[tokio::test]
+    async fn dispatches_independent_created_events_concurrently() {
+        const EVENT_MODULE: &str = r#"#!/usr/bin/env python3
+import json, os, sys, time
+ready_dir = os.environ["READY_DIR"]
+for line in sys.stdin:
+    message = json.loads(line)
+    request_id = message["request_id"]
+    if message["type"] == "initialize":
+        response = {"protocol_version": 3, "type": "initialized", "request_id": request_id, "module_id": message["module_id"]}
+    elif message["type"] == "event":
+        open(os.path.join(ready_dir, "started-" + message["payload"]["text"]), "w").close()
+        while not os.path.exists(os.path.join(ready_dir, "release")):
+            time.sleep(0.01)
+        response = {"protocol_version": 3, "type": "event_result", "request_id": request_id, "actions": []}
+    elif message["type"] == "shutdown":
+        response = {"protocol_version": 3, "type": "health", "request_id": request_id}
+    else:
+        continue
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
+"#;
+
+        fn descriptor(
+            id: &str,
+            entrypoint: PathBuf,
+            module_dir: PathBuf,
+        ) -> crate::external_modules::manifest::ExternalModuleDescriptor {
+            crate::external_modules::manifest::ExternalModuleDescriptor {
+                protocol_version: 3,
+                id: id.to_owned(),
+                display_name: id.to_owned(),
+                version: "test".to_owned(),
+                author: "test".to_owned(),
+                entrypoint,
+                module_dir,
+                capabilities: vec![
+                    crate::external_modules::manifest::ExternalCapability::MessageRead,
+                ],
+                default_command: None,
+                subscriptions: vec![
+                    crate::external_modules::manifest::ExternalSubscription::MessageCreated,
+                ],
+                actions: vec![],
+                commands: vec![],
+            }
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("lavis-runtime-events-{nonce}"));
+        fs::create_dir_all(&directory).unwrap();
+        let python = std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .map(|path| path.join("python3"))
+            .find(|path| path.is_file())
+            .expect("fixture tests require python3 in PATH");
+        let mut descriptors = Vec::new();
+        for id in ["first", "second"] {
+            let module_dir = directory.join(id);
+            fs::create_dir_all(&module_dir).unwrap();
+            let entrypoint = module_dir.join("module.py");
+            fs::write(
+                &entrypoint,
+                EVENT_MODULE
+                    .replacen(
+                        "#!/usr/bin/env python3",
+                        &format!("#!{}", python.display()),
+                        1,
+                    )
+                    .replace(
+                        "ready_dir = os.environ[\"READY_DIR\"]",
+                        &format!("ready_dir = {:?}", directory),
+                    ),
+            )
+            .unwrap();
+            fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700)).unwrap();
+            descriptors.push(descriptor(id, entrypoint, module_dir));
+        }
+
+        let mut manager = crate::external_modules::manager::ExternalManager::new();
+        manager.set_descriptors(descriptors.clone());
+        let handle = crate::external_modules::manager::ExternalManagerHandle::new(manager);
+        handle
+            .startup_enabled(
+                &descriptors
+                    .iter()
+                    .map(|descriptor| descriptor.id.clone())
+                    .collect(),
+            )
+            .await;
+        let dispatch = super::CreatedEventDispatch {
+            handle: handle.clone(),
+            requests: descriptors
+                .into_iter()
+                .map(|descriptor| super::CreatedEventRequest {
+                    message_ref: descriptor.id.clone(),
+                    payload: crate::external_modules::protocol::MessageCreatedEvent {
+                        event_id: descriptor.id.clone(),
+                        message_ref: descriptor.id.clone(),
+                        text: descriptor.id.clone(),
+                        outgoing: true,
+                        entities: vec![],
+                    },
+                    descriptor,
+                })
+                .collect(),
+        };
+
+        let execute = dispatch.execute();
+        tokio::pin!(execute);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !directory.join("started-first").exists() || !directory.join("started-second").exists() {
+                tokio::select! {
+                    _ = &mut execute => panic!("event dispatch completed before both modules began"),
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+            }
+        })
+        .await
+        .expect("independent module requests did not begin together");
+        fs::write(directory.join("release"), "").unwrap();
+        assert!(execute.await.actions.is_empty());
+        handle.shutdown_all().await;
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
