@@ -90,7 +90,10 @@ impl RuntimeState {
             return Vec::new();
         };
         let descriptors = self.external_snapshot.descriptors.clone();
-        let mut tasks = Vec::new();
+        // Keep the per-message fan-out structured: this future is itself owned
+        // by the update loop's event task, so dropping it cancels every module
+        // request rather than detaching child tasks.
+        let mut dispatches = Vec::new();
         for descriptor in descriptors
             .iter()
             .filter(|descriptor| module_can_receive_created_event(descriptor))
@@ -109,20 +112,13 @@ impl RuntimeState {
             };
             let handle = handle.clone();
             let descriptor = descriptor.clone();
-            tasks.push(tokio::spawn(async move {
+            dispatches.push(async move {
                 let result = handle.dispatch_created_event(&descriptor.id, payload).await;
                 (descriptor, message_ref, result)
-            }));
+            });
         }
         let mut accepted = Vec::new();
-        for task in tasks {
-            let Ok((descriptor, message_ref, result)) = task.await else {
-                tracing::warn!(
-                    event = "external_event_task_failed",
-                    "External event task failed"
-                );
-                continue;
-            };
+        for (descriptor, message_ref, result) in futures_util::future::join_all(dispatches).await {
             match result {
                 Ok((request_id, actions)) => {
                     let scope = EventScope {
