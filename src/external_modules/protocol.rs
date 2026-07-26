@@ -359,6 +359,36 @@ mod tests {
     }
 
     #[test]
+    fn v3_event_result_preserves_custom_emoji_document_id_as_string() {
+        let event = CoreMessage::Event {
+            request_id: "9".to_owned(),
+            payload: MessageCreatedEvent {
+                event_id: "evt".to_owned(),
+                message_ref: "opaque".to_owned(),
+                text: "Привет 🦀".to_owned(),
+                outgoing: false,
+                entities: vec![CustomEmojiEntity {
+                    offset_utf16: 7,
+                    length_utf16: 2,
+                    document_id: "5456140674028019486".to_owned(),
+                }],
+            },
+        };
+        let serialized = event.serialize_for(3).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(value["protocol_version"], 3);
+        assert_eq!(
+            value["payload"]["entities"][0]["document_id"],
+            "5456140674028019486"
+        );
+        let reply = r#"{"protocol_version":3,"type":"event_result","request_id":"9","actions":[{"type":"message.react","message_ref":"opaque","reaction":{"type":"custom_emoji","document_id":"5456140674028019486"}}]}"#;
+        assert!(matches!(
+            parse_module_line_for(reply, 3),
+            Ok(Some(ModuleMessage::EventResult { .. }))
+        ));
+    }
+
+    #[test]
     fn parse_initialized() {
         let line =
             r#"{"protocol_version":2,"type":"initialized","request_id":"1","module_id":"echo"}"#;
