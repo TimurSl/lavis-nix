@@ -5,6 +5,35 @@ pub const MAX_LINE_BYTES: usize = 64 * 1024;
 pub const MAX_RESULT_BYTES: usize = 32 * 1024;
 pub const MAX_ERROR_MESSAGE_CHARS: usize = 256;
 pub const MAX_LOG_MESSAGE_CHARS: usize = 1024;
+pub const MAX_EVENT_ACTIONS: usize = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomEmojiEntity {
+    pub offset_utf16: usize,
+    pub length_utf16: usize,
+    pub document_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageCreatedEvent {
+    pub event_id: String,
+    pub message_ref: String,
+    pub text: String,
+    pub outgoing: bool,
+    pub entities: Vec<CustomEmojiEntity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReactionSpec {
+    Emoji(String),
+    CustomEmoji { document_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventAction {
+    pub message_ref: String,
+    pub reaction: ReactionSpec,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CoreMessage {
@@ -22,6 +51,10 @@ pub enum CoreMessage {
     },
     Shutdown {
         request_id: String,
+    },
+    Event {
+        request_id: String,
+        payload: MessageCreatedEvent,
     },
 }
 
@@ -47,6 +80,10 @@ pub enum ModuleMessage {
         request_id: String,
         level: String,
         message: String,
+    },
+    EventResult {
+        request_id: String,
+        actions: Vec<EventAction>,
     },
 }
 
@@ -87,6 +124,27 @@ impl CoreMessage {
                 "type": "shutdown",
                 "request_id": request_id,
             })),
+            Self::Event {
+                request_id,
+                payload,
+            } => serde_json::to_string(&serde_json::json!({
+                "protocol_version": protocol_version,
+                "type": "event",
+                "request_id": request_id,
+                "event": "message.created",
+                "payload": {
+                    "event_id": payload.event_id,
+                    "message_ref": payload.message_ref,
+                    "text": payload.text,
+                    "outgoing": payload.outgoing,
+                    "entities": payload.entities.iter().map(|entity| serde_json::json!({
+                        "type": "custom_emoji",
+                        "offset_utf16": entity.offset_utf16,
+                        "length_utf16": entity.length_utf16,
+                        "document_id": entity.document_id,
+                    })).collect::<Vec<_>>(),
+                },
+            })),
         }
         .map_err(|_| ExternalError::ProtocolEncode)
     }
@@ -96,7 +154,8 @@ impl CoreMessage {
             Self::Initialize { request_id, .. }
             | Self::Execute { request_id, .. }
             | Self::Health { request_id }
-            | Self::Shutdown { request_id } => request_id,
+            | Self::Shutdown { request_id }
+            | Self::Event { request_id, .. } => request_id,
         }
     }
 }
@@ -190,8 +249,45 @@ pub fn parse_module_line_for(
                 message,
             }))
         }
+        "event_result" => {
+            let request_id = validate_request_id(&value)?;
+            let actions = value
+                .get("actions")
+                .and_then(|value| value.as_array())
+                .ok_or(ExternalError::ProtocolDecode)?;
+            if actions.len() > MAX_EVENT_ACTIONS {
+                return Err(ExternalError::ProtocolDecode);
+            }
+            let actions = actions
+                .iter()
+                .map(parse_event_action)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Some(ModuleMessage::EventResult {
+                request_id,
+                actions,
+            }))
+        }
         _ => Err(ExternalError::ProtocolDecode),
     }
+}
+
+fn parse_event_action(value: &serde_json::Value) -> Result<EventAction, ExternalError> {
+    if value.get("type").and_then(|value| value.as_str()) != Some("message.react") {
+        return Err(ExternalError::ProtocolDecode);
+    }
+    let message_ref = get_string(value, "message_ref")?;
+    let reaction = value.get("reaction").ok_or(ExternalError::ProtocolDecode)?;
+    let reaction = match reaction.get("type").and_then(|value| value.as_str()) {
+        Some("emoji") => ReactionSpec::Emoji(get_string(reaction, "emoji")?),
+        Some("custom_emoji") => ReactionSpec::CustomEmoji {
+            document_id: get_string(reaction, "document_id")?,
+        },
+        _ => return Err(ExternalError::ProtocolDecode),
+    };
+    Ok(EventAction {
+        message_ref,
+        reaction,
+    })
 }
 
 fn get_string(value: &serde_json::Value, key: &str) -> Result<String, ExternalError> {
