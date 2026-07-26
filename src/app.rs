@@ -234,8 +234,8 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
         {
             let mut mgr = handle.lock().await;
             mgr.set_descriptors(descriptors);
-            mgr.startup_enabled(external_state.enabled_ids()).await;
         }
+        handle.startup_enabled(external_state.enabled_ids()).await;
         tracing::info!(event = "application_started", "lavis is running");
 
         let mut runtime = runtime::RuntimeState::new(
@@ -260,7 +260,7 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
     if let Some(handle) = external_handle {
         // Telegram disconnects before external modules so no module outlives the
         // Telegram runner on any application exit path.
-        handle.lock().await.shutdown_all().await;
+        handle.shutdown_all().await;
     }
 
     combine_application_and_shutdown(application_result, shutdown_result)

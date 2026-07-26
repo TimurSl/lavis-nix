@@ -158,6 +158,7 @@ pub struct ExternalInvocation {
     pub module_id: String,
     pub command_name: String,
     pub arguments: String,
+    pub argument_entities: Vec<crate::external_modules::protocol::CustomEmojiEntity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

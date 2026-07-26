@@ -33,7 +33,7 @@ pub struct ExternalModuleStatus {
 
 pub struct ExternalManager {
     descriptors: Vec<ExternalModuleDescriptor>,
-    processes: BTreeMap<String, ModuleProcess>,
+    processes: BTreeMap<String, Arc<Mutex<ModuleProcess>>>,
 }
 
 impl Default for ExternalManager {
@@ -63,9 +63,10 @@ impl ExternalManager {
     }
 
     pub fn has_running_process(&self, id: &str) -> bool {
-        self.processes
-            .get(id)
-            .is_some_and(|p| p.status() == ProcessStatus::Running)
+        self.processes.get(id).is_some_and(|p| {
+            p.try_lock()
+                .is_ok_and(|p| p.status() == ProcessStatus::Running)
+        })
     }
 
     pub fn running_command_count(&self) -> usize {
@@ -75,7 +76,11 @@ impl ExternalManager {
     pub fn statuses(&self) -> Vec<ExternalModuleStatus> {
         let mut statuses = Vec::new();
         for desc in &self.descriptors {
-            let (status_label, command_count) = if let Some(proc) = self.processes.get(&desc.id) {
+            let (status_label, command_count) = if let Some(proc) = self
+                .processes
+                .get(&desc.id)
+                .and_then(|proc| proc.try_lock().ok())
+            {
                 match proc.status() {
                     ProcessStatus::Running => ("активен", proc.descriptor().commands.len()),
                     ProcessStatus::Failed | ProcessStatus::Crashed => ("ошибка", 0),
@@ -114,7 +119,7 @@ impl ExternalManager {
                         "External module started"
                     );
                     let id = desc.id.clone();
-                    self.processes.insert(id, process);
+                    self.processes.insert(id, Arc::new(Mutex::new(process)));
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -145,9 +150,20 @@ impl ExternalManager {
         Some((module_id.to_owned(), command_name.to_owned()))
     }
 
+    pub fn resolve_default_command(&self, module_id: &str) -> Option<(String, String)> {
+        let process = self.processes.get(module_id)?.try_lock().ok()?;
+        (process.status() == ProcessStatus::Running)
+            .then(|| process.descriptor().default_command.as_ref())
+            .flatten()
+            .map(|command| (module_id.to_owned(), command.clone()))
+    }
+
     pub fn command_refs(&self) -> Vec<ExternalCommandRef> {
         let mut refs = Vec::new();
         for process in self.processes.values() {
+            let Ok(process) = process.try_lock() else {
+                continue;
+            };
             if process.status() != ProcessStatus::Running {
                 continue;
             }
@@ -167,7 +183,7 @@ impl ExternalManager {
     }
 
     pub fn find_command(&self, module_id: &str, command_name: &str) -> Option<ExternalCommandRef> {
-        let process = self.processes.get(module_id)?;
+        let process = self.processes.get(module_id)?.try_lock().ok()?;
         if process.status() != ProcessStatus::Running {
             return None;
         }
@@ -205,8 +221,10 @@ impl ExternalManager {
     ) -> Result<String, ExternalError> {
         let process = self
             .processes
-            .get_mut(module_id)
+            .get(module_id)
+            .cloned()
             .ok_or(ExternalError::Unavailable)?;
+        let mut process = process.lock().await;
 
         if process.status() != ProcessStatus::Running {
             return Err(ExternalError::Unavailable);
@@ -216,30 +234,46 @@ impl ExternalManager {
         Ok(result)
     }
 
+    pub async fn dispatch_created_event(
+        &mut self,
+        module_id: &str,
+        payload: super::protocol::MessageCreatedEvent,
+    ) -> Result<(String, Vec<super::protocol::EventAction>), ExternalError> {
+        let process = self
+            .processes
+            .get(module_id)
+            .cloned()
+            .ok_or(ExternalError::Unavailable)?;
+        let mut process = process.lock().await;
+        if process.status() != ProcessStatus::Running || process.descriptor().protocol_version != 3
+        {
+            return Err(ExternalError::Unavailable);
+        }
+        process.dispatch_created_event(payload).await
+    }
+
     pub async fn shutdown_all(&mut self) {
         tracing::info!(
             event = "external_modules_shutdown",
             "Shutting down external modules"
         );
-        let ids: Vec<String> = self.processes.keys().cloned().collect();
-        for id in &ids {
-            let Some(process) = self.processes.get_mut(id) else {
-                continue;
-            };
+        let processes: Vec<(String, Arc<Mutex<ModuleProcess>>)> = self
+            .processes
+            .iter()
+            .map(|(id, process)| (id.clone(), process.clone()))
+            .collect();
+        for (id, process) in processes {
+            let mut process = process.lock().await;
             match process.status() {
                 ProcessStatus::Running => {
                     if process.graceful_shutdown().await.is_err() {
-                        tracing::warn!(
-                            event = "external_module_shutdown_forced",
-                            module_id = %id,
-                            "Forcefully terminating external module"
-                        );
+                        tracing::warn!(event = "external_module_shutdown_forced", module_id = %id, "Forcefully terminating external module");
                         process.terminate().await;
                     }
                 }
-                ProcessStatus::Crashed | ProcessStatus::Failed | ProcessStatus::Terminated => {
-                    process.terminate().await;
-                }
+                // A crashed process already ran fatal cleanup. Re-signalling
+                // its old PID could hit a reused process group.
+                ProcessStatus::Crashed | ProcessStatus::Failed | ProcessStatus::Terminated => {}
             }
         }
         self.processes.clear();
@@ -247,7 +281,9 @@ impl ExternalManager {
 
     pub fn remove_crashed(&mut self, module_id: &str) {
         if let Some(proc) = self.processes.get(module_id)
-            && proc.status() == ProcessStatus::Crashed
+            && proc
+                .try_lock()
+                .is_ok_and(|proc| proc.status() == ProcessStatus::Crashed)
         {
             self.processes.remove(module_id);
         }
@@ -263,6 +299,7 @@ pub struct ExternalRuntimeSnapshot {
     pub command_refs: Vec<ExternalCommandRef>,
     pub descriptors: Vec<ExternalModuleDescriptor>,
     pub active_commands: std::collections::HashSet<String>,
+    pub active_defaults: std::collections::HashMap<String, String>,
 }
 
 impl ExternalRuntimeSnapshot {
@@ -277,10 +314,24 @@ impl ExternalRuntimeSnapshot {
             .iter()
             .map(|r| format!("{}.{}", r.module_id, r.command_name))
             .collect();
+        let active_defaults = manager
+            .processes
+            .values()
+            .filter_map(|process| process.try_lock().ok())
+            .filter(|process| process.status() == ProcessStatus::Running)
+            .filter_map(|process| {
+                process
+                    .descriptor()
+                    .default_command
+                    .as_ref()
+                    .map(|command| (process.descriptor().id.clone(), command.clone()))
+            })
+            .collect();
         Self {
             command_refs,
             descriptors,
             active_commands,
+            active_defaults,
         }
     }
 
@@ -308,5 +359,93 @@ impl ExternalManagerHandle {
     pub async fn snapshot(&self) -> ExternalRuntimeSnapshot {
         let mgr = self.inner.lock().await;
         ExternalRuntimeSnapshot::from_manager(&mgr)
+    }
+
+    /// Starts children without retaining the manager mutex. Process I/O belongs
+    /// to the individual process mutex; the manager only owns the index.
+    pub async fn startup_enabled(&self, enabled_ids: &std::collections::BTreeSet<String>) {
+        let descriptors = {
+            let manager = self.inner.lock().await;
+            manager
+                .descriptors
+                .iter()
+                .filter(|descriptor| enabled_ids.contains(&descriptor.id))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for descriptor in descriptors {
+            let id = descriptor.id.clone();
+            match ModuleProcess::start(descriptor).await {
+                Ok(process) => {
+                    let mut manager = self.inner.lock().await;
+                    manager
+                        .processes
+                        .insert(id.clone(), Arc::new(Mutex::new(process)));
+                    tracing::info!(event = "external_module_started", module_id = %id, "External module started");
+                }
+                Err(error) => {
+                    tracing::warn!(event = "external_module_startup_failed", module_id = %id, error = %error, "Не удалось запустить внешний модуль")
+                }
+            }
+        }
+    }
+
+    /// Removes the index before awaiting child shutdown, so status refresh and
+    /// routing never wait behind a slow process shutdown.
+    pub async fn shutdown_all(&self) {
+        let processes = {
+            let mut manager = self.inner.lock().await;
+            std::mem::take(&mut manager.processes)
+        };
+        for (id, process) in processes {
+            let mut process = process.lock().await;
+            if process.status() != ProcessStatus::Running {
+                continue;
+            }
+            if process.graceful_shutdown().await.is_ok() {
+                continue;
+            }
+            tracing::warn!(event = "external_module_shutdown_forced", module_id = %id, "Forcefully terminating external module");
+            process.terminate().await;
+        }
+    }
+
+    pub async fn dispatch_created_event(
+        &self,
+        module_id: &str,
+        payload: super::protocol::MessageCreatedEvent,
+    ) -> Result<(String, Vec<super::protocol::EventAction>), ExternalError> {
+        let process = {
+            let manager = self.inner.lock().await;
+            manager.processes.get(module_id).cloned()
+        }
+        .ok_or(ExternalError::Unavailable)?;
+        let mut process = process.lock().await;
+        if process.status() != ProcessStatus::Running || process.descriptor().protocol_version != 3
+        {
+            return Err(ExternalError::Unavailable);
+        }
+        process.dispatch_created_event(payload).await
+    }
+
+    pub async fn execute(
+        &self,
+        module_id: &str,
+        command_name: &str,
+        arguments: &str,
+        argument_entities: &[super::protocol::CustomEmojiEntity],
+    ) -> Result<String, ExternalError> {
+        let process = {
+            let manager = self.inner.lock().await;
+            manager.processes.get(module_id).cloned()
+        }
+        .ok_or(ExternalError::Unavailable)?;
+        let mut process = process.lock().await;
+        if process.status() != ProcessStatus::Running {
+            return Err(ExternalError::Unavailable);
+        }
+        process
+            .execute_with_entities(command_name, arguments, argument_entities)
+            .await
     }
 }

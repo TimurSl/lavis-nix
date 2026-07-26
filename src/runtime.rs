@@ -4,6 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures_util::future::join_all;
 use grammers_client::{Client, tl};
 use grammers_session::types::PeerId;
 
@@ -13,6 +14,13 @@ use crate::{
     commands::{Action, AliasRequest, ExternalInvocation, ModulesRequest, PrefixRequest, dispatch},
     error::ExternalError,
     external_modules::manager::{ExternalManagerHandle, ExternalRuntimeSnapshot},
+    external_modules::{
+        events::{
+            EventScope, module_can_receive_created_event, opaque_message_ref,
+            validate_reaction_action,
+        },
+        protocol::{EventAction, MessageCreatedEvent},
+    },
     fastfetch::{self, FastfetchInputError, FastfetchProfileError, FastfetchResult},
     help::{render_modules_overview_with_external, render_with_external},
     response::Response,
@@ -31,6 +39,77 @@ pub struct RuntimeState {
 }
 
 const MAX_EXPECTED_SELF_EDITS: usize = 128;
+
+pub struct CreatedEventDispatch {
+    handle: ExternalManagerHandle,
+    requests: Vec<CreatedEventRequest>,
+}
+
+struct CreatedEventRequest {
+    descriptor: crate::external_modules::manifest::ExternalModuleDescriptor,
+    message_ref: String,
+    payload: MessageCreatedEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedEventDispatchFailure {
+    pub module_id: String,
+    pub category: &'static str,
+}
+
+#[derive(Debug, Default)]
+pub struct CreatedEventDispatchResult {
+    pub actions: Vec<EventAction>,
+    pub failures: Vec<CreatedEventDispatchFailure>,
+}
+
+impl CreatedEventDispatch {
+    pub async fn execute(self) -> CreatedEventDispatchResult {
+        let mut result = CreatedEventDispatchResult::default();
+        let dispatches = self.requests.into_iter().map(|request| {
+            let handle = self.handle.clone();
+            async move {
+                let CreatedEventRequest {
+                    descriptor,
+                    message_ref,
+                    payload,
+                } = request;
+                let module_id = descriptor.id.clone();
+                let response = handle.dispatch_created_event(&module_id, payload).await;
+                (descriptor, message_ref, response)
+            }
+        });
+
+        for (descriptor, message_ref, response) in join_all(dispatches).await {
+            let module_id = descriptor.id.clone();
+            match response {
+                Ok((request_id, actions)) => {
+                    let scope = EventScope {
+                        module_id: module_id.clone(),
+                        request_id: request_id.clone(),
+                        message_ref,
+                    };
+                    for action in actions {
+                        if let Err(category) =
+                            validate_reaction_action(&descriptor, &scope, &request_id, &action)
+                        {
+                            tracing::warn!(event = "external_reaction_rejected", ?category, module_id = %module_id, "External reaction action rejected");
+                            continue;
+                        }
+                        result.actions.push(action);
+                    }
+                }
+                Err(error) => {
+                    result.failures.push(CreatedEventDispatchFailure {
+                        module_id,
+                        category: external_event_error_category(&error),
+                    });
+                }
+            }
+        }
+        result
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ExpectedSelfEdit {
@@ -71,6 +150,46 @@ impl RuntimeState {
         if let Some(handle) = &self.external_manager {
             self.external_snapshot = handle.snapshot().await;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_external_snapshot_for_tests(&mut self, snapshot: ExternalRuntimeSnapshot) {
+        self.external_snapshot = snapshot;
+    }
+
+    pub fn prepare_created_event_dispatch(
+        &self,
+        text: &str,
+        outgoing: bool,
+        entities: Vec<crate::external_modules::protocol::CustomEmojiEntity>,
+    ) -> Option<CreatedEventDispatch> {
+        let handle = self.external_manager.clone()?;
+        let mut requests = Vec::new();
+        for descriptor in self
+            .external_snapshot
+            .descriptors
+            .iter()
+            .filter(|descriptor| module_can_receive_created_event(descriptor))
+        {
+            let event_id = crate::external_modules::protocol::request_id();
+            let Ok(message_ref) = opaque_message_ref() else {
+                tracing::warn!(event = "external_event_reference_failed", module_id = %descriptor.id, "Could not create an external event reference");
+                continue;
+            };
+            let payload = MessageCreatedEvent {
+                event_id,
+                message_ref: message_ref.clone(),
+                text: text.to_owned(),
+                outgoing,
+                entities: entities.clone(),
+            };
+            requests.push(CreatedEventRequest {
+                descriptor: descriptor.clone(),
+                message_ref,
+                payload,
+            });
+        }
+        (!requests.is_empty()).then_some(CreatedEventDispatch { handle, requests })
     }
 
     pub fn external_command_refs(&self) -> &[crate::external_modules::manager::ExternalCommandRef] {
@@ -162,7 +281,25 @@ impl RuntimeState {
             } else {
                 args.to_owned()
             },
+            argument_entities: Vec::new(),
         }))
+    }
+
+    pub fn resolve_external_default(&self, name: &str, args: &str) -> Option<Action> {
+        let command_name = self.external_snapshot.active_defaults.get(name)?.clone();
+        Some(Action::External(ExternalInvocation {
+            module_id: name.to_owned(),
+            command_name,
+            arguments: args.to_owned(),
+            argument_entities: Vec::new(),
+        }))
+    }
+
+    pub fn has_external_module(&self, module_id: &str) -> bool {
+        self.external_snapshot
+            .descriptors
+            .iter()
+            .any(|descriptor| descriptor.id == module_id)
     }
 
     async fn execute_external(&mut self, invocation: &ExternalInvocation) -> Response {
@@ -170,12 +307,12 @@ impl RuntimeState {
             Some(h) => h,
             None => return Response::plain("⚠️ Внешние модули не доступны.".to_owned()),
         };
-        let mut mgr = handle.lock().await;
-        let result = mgr
+        let result = handle
             .execute(
                 &invocation.module_id,
                 &invocation.command_name,
                 &invocation.arguments,
+                &invocation.argument_entities,
             )
             .await;
         let response = match &result {
@@ -233,7 +370,6 @@ impl RuntimeState {
                 ))
             }
         };
-        drop(mgr);
         if result.is_err() {
             self.refresh_snapshot().await;
         }
@@ -495,6 +631,20 @@ fn log_ping_failure(action: &Action, message_id: i32, error: &grammers_mtsender:
     );
 }
 
+fn external_event_error_category(error: &ExternalError) -> &'static str {
+    match error {
+        ExternalError::Unavailable => "unavailable",
+        ExternalError::ExecutionTimeout => "timeout",
+        ExternalError::ProtocolDecode
+        | ExternalError::LineTooLarge
+        | ExternalError::WrongRequestId
+        | ExternalError::WrongModuleId => "protocol",
+        ExternalError::ResultTooLarge => "result_too_large",
+        ExternalError::ModuleError => "module_error",
+        _ => "other",
+    }
+}
+
 pub(crate) fn invocation_error_category(
     error: &grammers_mtsender::InvocationError,
 ) -> &'static str {
@@ -619,8 +769,8 @@ fn format_stats(
 #[cfg(test)]
 mod tests {
     use super::{
-        ProcStats, fastfetch_response, format_duration, format_latency, format_stats,
-        parse_memory_kib, parse_system_uptime,
+        ProcStats, external_event_error_category, fastfetch_response, format_duration,
+        format_latency, format_stats, parse_memory_kib, parse_system_uptime,
     };
     use crate::response::Response;
     use crate::{
@@ -633,6 +783,9 @@ mod tests {
         path::PathBuf,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
+
+    #[cfg(all(feature = "fixture-tests", unix))]
+    use std::os::unix::fs::PermissionsExt;
 
     async fn runtime_with_alias() -> (super::RuntimeState, PathBuf) {
         let nonce = SystemTime::now()
@@ -854,6 +1007,170 @@ mod tests {
         assert_eq!(format_latency(Duration::ZERO), "<1 ms");
         assert_eq!(format_latency(Duration::from_micros(999)), "<1 ms");
         assert_eq!(format_latency(Duration::from_millis(12)), "12 ms");
+    }
+
+    #[test]
+    fn categorizes_external_event_failures_without_exposing_error_details() {
+        assert_eq!(
+            external_event_error_category(&crate::error::ExternalError::Unavailable),
+            "unavailable"
+        );
+        assert_eq!(
+            external_event_error_category(&crate::error::ExternalError::ExecutionTimeout),
+            "timeout"
+        );
+        assert_eq!(
+            external_event_error_category(&crate::error::ExternalError::ProtocolDecode),
+            "protocol"
+        );
+        assert_eq!(
+            external_event_error_category(&crate::error::ExternalError::ModuleError),
+            "module_error"
+        );
+        assert_eq!(
+            external_event_error_category(&crate::error::ExternalError::NotReadable),
+            "other"
+        );
+    }
+
+    #[cfg(all(feature = "fixture-tests", unix))]
+    #[tokio::test]
+    async fn dispatches_independent_created_events_concurrently() {
+        const EVENT_MODULE: &str = r#"#!/usr/bin/env python3
+import json, os, sys, time
+ready_dir = os.environ["READY_DIR"]
+module_id = None
+for line in sys.stdin:
+    message = json.loads(line)
+    request_id = message["request_id"]
+    if message["type"] == "initialize":
+        module_id = message["module_id"]
+        response = {"protocol_version": message["protocol_version"], "type": "initialized", "request_id": request_id, "module_id": message["module_id"]}
+    elif message["type"] == "event":
+        open(os.path.join(ready_dir, "started-" + module_id), "w").close()
+        while not os.path.exists(os.path.join(ready_dir, "release")):
+            time.sleep(0.01)
+        response = {"protocol_version": 3, "type": "event_result", "request_id": request_id, "actions": []}
+    elif message["type"] == "shutdown":
+        response = {"protocol_version": 3, "type": "health", "request_id": request_id}
+    else:
+        continue
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
+"#;
+
+        fn descriptor(
+            id: &str,
+            entrypoint: PathBuf,
+            module_dir: PathBuf,
+            protocol_version: u32,
+            subscribed: bool,
+        ) -> crate::external_modules::manifest::ExternalModuleDescriptor {
+            crate::external_modules::manifest::ExternalModuleDescriptor {
+                protocol_version,
+                id: id.to_owned(),
+                display_name: id.to_owned(),
+                version: "test".to_owned(),
+                author: "test".to_owned(),
+                entrypoint,
+                module_dir,
+                capabilities: vec![
+                    crate::external_modules::manifest::ExternalCapability::MessageRead,
+                ],
+                default_command: None,
+                subscriptions: subscribed
+                    .then_some(
+                        crate::external_modules::manifest::ExternalSubscription::MessageCreated,
+                    )
+                    .into_iter()
+                    .collect(),
+                actions: vec![],
+                commands: vec![],
+            }
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("lavis-runtime-events-{nonce}"));
+        fs::create_dir_all(&directory).unwrap();
+        let python = std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .map(|path| path.join("python3"))
+            .find(|path| path.is_file())
+            .expect("fixture tests require python3 in PATH");
+        let mut descriptors = Vec::new();
+        for (id, protocol_version, subscribed) in [
+            ("first", 3, true),
+            ("second", 3, true),
+            ("legacy", 2, true),
+            ("unsubscribed", 3, false),
+        ] {
+            let module_dir = directory.join(id);
+            fs::create_dir_all(&module_dir).unwrap();
+            let entrypoint = module_dir.join("module.py");
+            fs::write(
+                &entrypoint,
+                EVENT_MODULE
+                    .replacen(
+                        "#!/usr/bin/env python3",
+                        &format!("#!{}", python.display()),
+                        1,
+                    )
+                    .replace(
+                        "ready_dir = os.environ[\"READY_DIR\"]",
+                        &format!("ready_dir = {:?}", directory),
+                    ),
+            )
+            .unwrap();
+            fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700)).unwrap();
+            descriptors.push(descriptor(
+                id,
+                entrypoint,
+                module_dir,
+                protocol_version,
+                subscribed,
+            ));
+        }
+
+        let mut manager = crate::external_modules::manager::ExternalManager::new();
+        manager.set_descriptors(descriptors.clone());
+        let handle = crate::external_modules::manager::ExternalManagerHandle::new(manager);
+        handle
+            .startup_enabled(
+                &descriptors
+                    .iter()
+                    .map(|descriptor| descriptor.id.clone())
+                    .collect(),
+            )
+            .await;
+        let (mut runtime, state_directory) = runtime_with_alias().await;
+        runtime.set_external_manager(handle.clone()).await;
+        let dispatch = runtime
+            .prepare_created_event_dispatch("event", true, vec![])
+            .expect("only subscribed v3 modules should receive events");
+
+        let execute = dispatch.execute();
+        tokio::pin!(execute);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !directory.join("started-first").exists() || !directory.join("started-second").exists() {
+                tokio::select! {
+                    _ = &mut execute => panic!("event dispatch completed before both modules began"),
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+            }
+        })
+        .await
+        .expect("independent module requests did not begin together");
+        assert!(!directory.join("started-legacy").exists());
+        assert!(!directory.join("started-unsubscribed").exists());
+        fs::write(directory.join("release"), "").unwrap();
+        assert!(execute.await.actions.is_empty());
+        handle.shutdown_all().await;
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(state_directory).unwrap();
     }
 
     #[test]

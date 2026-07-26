@@ -5,6 +5,35 @@ pub const MAX_LINE_BYTES: usize = 64 * 1024;
 pub const MAX_RESULT_BYTES: usize = 32 * 1024;
 pub const MAX_ERROR_MESSAGE_CHARS: usize = 256;
 pub const MAX_LOG_MESSAGE_CHARS: usize = 1024;
+pub const MAX_EVENT_ACTIONS: usize = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomEmojiEntity {
+    pub offset_utf16: usize,
+    pub length_utf16: usize,
+    pub document_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageCreatedEvent {
+    pub event_id: String,
+    pub message_ref: String,
+    pub text: String,
+    pub outgoing: bool,
+    pub entities: Vec<CustomEmojiEntity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReactionSpec {
+    Emoji(String),
+    CustomEmoji { document_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventAction {
+    pub message_ref: String,
+    pub reaction: ReactionSpec,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CoreMessage {
@@ -16,12 +45,17 @@ pub enum CoreMessage {
         request_id: String,
         command: String,
         arguments: String,
+        argument_entities: Vec<CustomEmojiEntity>,
     },
     Health {
         request_id: String,
     },
     Shutdown {
         request_id: String,
+    },
+    Event {
+        request_id: String,
+        payload: MessageCreatedEvent,
     },
 }
 
@@ -48,16 +82,24 @@ pub enum ModuleMessage {
         level: String,
         message: String,
     },
+    EventResult {
+        request_id: String,
+        actions: Vec<EventAction>,
+    },
 }
 
 impl CoreMessage {
     pub fn serialize(&self) -> Result<String, ExternalError> {
+        self.serialize_for(PROTOCOL_VERSION)
+    }
+
+    pub fn serialize_for(&self, protocol_version: u32) -> Result<String, ExternalError> {
         match self {
             Self::Initialize {
                 request_id,
                 module_id,
             } => serde_json::to_string(&serde_json::json!({
-                "protocol_version": PROTOCOL_VERSION,
+                "protocol_version": protocol_version,
                 "type": "initialize",
                 "request_id": request_id,
                 "module_id": module_id,
@@ -66,22 +108,57 @@ impl CoreMessage {
                 request_id,
                 command,
                 arguments,
-            } => serde_json::to_string(&serde_json::json!({
-                "protocol_version": PROTOCOL_VERSION,
-                "type": "execute",
-                "request_id": request_id,
-                "command": command,
-                "arguments": arguments,
-            })),
+                argument_entities,
+            } => {
+                let mut message = serde_json::json!({
+                    "protocol_version": protocol_version,
+                    "type": "execute",
+                    "request_id": request_id,
+                    "command": command,
+                    "arguments": arguments,
+                });
+                if protocol_version == 3 {
+                    message["context"] = serde_json::json!({
+                        "argument_entities": argument_entities.iter().map(|entity| serde_json::json!({
+                            "type": "custom_emoji",
+                            "offset_utf16": entity.offset_utf16,
+                            "length_utf16": entity.length_utf16,
+                            "document_id": entity.document_id,
+                        })).collect::<Vec<_>>(),
+                    });
+                }
+                serde_json::to_string(&message)
+            }
             Self::Health { request_id } => serde_json::to_string(&serde_json::json!({
-                "protocol_version": PROTOCOL_VERSION,
+                "protocol_version": protocol_version,
                 "type": "health",
                 "request_id": request_id,
             })),
             Self::Shutdown { request_id } => serde_json::to_string(&serde_json::json!({
-                "protocol_version": PROTOCOL_VERSION,
+                "protocol_version": protocol_version,
                 "type": "shutdown",
                 "request_id": request_id,
+            })),
+            Self::Event {
+                request_id,
+                payload,
+            } => serde_json::to_string(&serde_json::json!({
+                "protocol_version": protocol_version,
+                "type": "event",
+                "request_id": request_id,
+                "event": "message.created",
+                "payload": {
+                    "event_id": payload.event_id,
+                    "message_ref": payload.message_ref,
+                    "text": payload.text,
+                    "outgoing": payload.outgoing,
+                    "entities": payload.entities.iter().map(|entity| serde_json::json!({
+                        "type": "custom_emoji",
+                        "offset_utf16": entity.offset_utf16,
+                        "length_utf16": entity.length_utf16,
+                        "document_id": entity.document_id,
+                    })).collect::<Vec<_>>(),
+                },
             })),
         }
         .map_err(|_| ExternalError::ProtocolEncode)
@@ -92,7 +169,8 @@ impl CoreMessage {
             Self::Initialize { request_id, .. }
             | Self::Execute { request_id, .. }
             | Self::Health { request_id }
-            | Self::Shutdown { request_id } => request_id,
+            | Self::Shutdown { request_id }
+            | Self::Event { request_id, .. } => request_id,
         }
     }
 }
@@ -109,6 +187,13 @@ fn validate_request_id(value: &serde_json::Value) -> Result<String, ExternalErro
 }
 
 pub fn parse_module_line(line: &str) -> Result<Option<ModuleMessage>, ExternalError> {
+    parse_module_line_for(line, PROTOCOL_VERSION)
+}
+
+pub fn parse_module_line_for(
+    line: &str,
+    expected_protocol_version: u32,
+) -> Result<Option<ModuleMessage>, ExternalError> {
     if line.len() > MAX_LINE_BYTES {
         return Err(ExternalError::LineTooLarge);
     }
@@ -119,7 +204,7 @@ pub fn parse_module_line(line: &str) -> Result<Option<ModuleMessage>, ExternalEr
         .get("protocol_version")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    if proto != PROTOCOL_VERSION as u64 {
+    if proto != expected_protocol_version as u64 {
         return Err(ExternalError::ProtocolVersionMismatch);
     }
 
@@ -179,8 +264,45 @@ pub fn parse_module_line(line: &str) -> Result<Option<ModuleMessage>, ExternalEr
                 message,
             }))
         }
+        "event_result" => {
+            let request_id = validate_request_id(&value)?;
+            let actions = value
+                .get("actions")
+                .and_then(|value| value.as_array())
+                .ok_or(ExternalError::ProtocolDecode)?;
+            if actions.len() > MAX_EVENT_ACTIONS {
+                return Err(ExternalError::ProtocolDecode);
+            }
+            let actions = actions
+                .iter()
+                .map(parse_event_action)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Some(ModuleMessage::EventResult {
+                request_id,
+                actions,
+            }))
+        }
         _ => Err(ExternalError::ProtocolDecode),
     }
+}
+
+fn parse_event_action(value: &serde_json::Value) -> Result<EventAction, ExternalError> {
+    if value.get("type").and_then(|value| value.as_str()) != Some("message.react") {
+        return Err(ExternalError::ProtocolDecode);
+    }
+    let message_ref = get_string(value, "message_ref")?;
+    let reaction = value.get("reaction").ok_or(ExternalError::ProtocolDecode)?;
+    let reaction = match reaction.get("type").and_then(|value| value.as_str()) {
+        Some("emoji") => ReactionSpec::Emoji(get_string(reaction, "emoji")?),
+        Some("custom_emoji") => ReactionSpec::CustomEmoji {
+            document_id: get_string(reaction, "document_id")?,
+        },
+        _ => return Err(ExternalError::ProtocolDecode),
+    };
+    Ok(EventAction {
+        message_ref,
+        reaction,
+    })
 }
 
 fn get_string(value: &serde_json::Value, key: &str) -> Result<String, ExternalError> {
@@ -221,6 +343,7 @@ mod tests {
             request_id: "2".to_owned(),
             command: "repeat".to_owned(),
             arguments: "Привет".to_owned(),
+            argument_entities: Vec::new(),
         };
         let json = msg.serialize().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -229,6 +352,29 @@ mod tests {
         assert_eq!(parsed["request_id"], "2");
         assert_eq!(parsed["command"], "repeat");
         assert_eq!(parsed["arguments"], "Привет");
+        assert!(parsed.get("context").is_none());
+    }
+
+    #[test]
+    fn v3_execute_projects_custom_emoji_context() {
+        let msg = CoreMessage::Execute {
+            request_id: "2".to_owned(),
+            command: "manage".to_owned(),
+            arguments: "добавить 🦀".to_owned(),
+            argument_entities: vec![CustomEmojiEntity {
+                offset_utf16: 9,
+                length_utf16: 2,
+                document_id: "5456140674028019486".to_owned(),
+            }],
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&msg.serialize_for(3).unwrap()).unwrap();
+        assert_eq!(parsed["context"]["argument_entities"][0]["offset_utf16"], 9);
+        assert_eq!(parsed["context"]["argument_entities"][0]["length_utf16"], 2);
+        assert_eq!(
+            parsed["context"]["argument_entities"][0]["document_id"],
+            "5456140674028019486"
+        );
     }
 
     #[test]
@@ -249,6 +395,36 @@ mod tests {
         let json = msg.serialize().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["type"], "shutdown");
+    }
+
+    #[test]
+    fn v3_event_result_preserves_custom_emoji_document_id_as_string() {
+        let event = CoreMessage::Event {
+            request_id: "9".to_owned(),
+            payload: MessageCreatedEvent {
+                event_id: "evt".to_owned(),
+                message_ref: "opaque".to_owned(),
+                text: "Привет 🦀".to_owned(),
+                outgoing: false,
+                entities: vec![CustomEmojiEntity {
+                    offset_utf16: 7,
+                    length_utf16: 2,
+                    document_id: "5456140674028019486".to_owned(),
+                }],
+            },
+        };
+        let serialized = event.serialize_for(3).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(value["protocol_version"], 3);
+        assert_eq!(
+            value["payload"]["entities"][0]["document_id"],
+            "5456140674028019486"
+        );
+        let reply = r#"{"protocol_version":3,"type":"event_result","request_id":"9","actions":[{"type":"message.react","message_ref":"opaque","reaction":{"type":"custom_emoji","document_id":"5456140674028019486"}}]}"#;
+        assert!(matches!(
+            parse_module_line_for(reply, 3),
+            Ok(Some(ModuleMessage::EventResult { .. }))
+        ));
     }
 
     #[test]

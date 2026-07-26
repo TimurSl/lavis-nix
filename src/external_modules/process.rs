@@ -1,6 +1,8 @@
 use super::{
     manifest::ExternalModuleDescriptor,
-    protocol::{self, CoreMessage, MAX_LINE_BYTES, MAX_RESULT_BYTES, ModuleMessage},
+    protocol::{
+        self, CoreMessage, MAX_LINE_BYTES, MAX_RESULT_BYTES, MessageCreatedEvent, ModuleMessage,
+    },
 };
 use crate::error::ExternalError;
 use std::{process::Stdio, time::Duration};
@@ -26,7 +28,7 @@ pub enum ProcessStatus {
 
 pub struct ModuleProcess {
     child: Option<Child>,
-    pid: u32,
+    process_group_id: Option<u32>,
     stdin: tokio::process::ChildStdin,
     stdout_reader: tokio::io::BufReader<tokio::process::ChildStdout>,
     stderr_drain: Option<tokio::task::JoinHandle<StderrCapture>>,
@@ -117,7 +119,7 @@ impl ModuleProcess {
 
         let mut process = Self {
             child: Some(child),
-            pid,
+            process_group_id: Some(pid),
             stdin,
             stdout_reader,
             stderr_drain: Some(stderr_drain),
@@ -183,11 +185,21 @@ impl ModuleProcess {
         command: &str,
         arguments: &str,
     ) -> Result<String, ExternalError> {
+        self.execute_with_entities(command, arguments, &[]).await
+    }
+
+    pub async fn execute_with_entities(
+        &mut self,
+        command: &str,
+        arguments: &str,
+        argument_entities: &[protocol::CustomEmojiEntity],
+    ) -> Result<String, ExternalError> {
         let req_id = protocol::request_id();
         let msg = CoreMessage::Execute {
             request_id: req_id.clone(),
             command: command.to_owned(),
             arguments: arguments.to_owned(),
+            argument_entities: argument_entities.to_vec(),
         };
         self.in_flight_request = Some(req_id.clone());
         if let Err(e) = self.send(&msg).await {
@@ -229,6 +241,44 @@ impl ModuleProcess {
         }
     }
 
+    pub async fn dispatch_created_event(
+        &mut self,
+        payload: MessageCreatedEvent,
+    ) -> Result<(String, Vec<protocol::EventAction>), ExternalError> {
+        if self.descriptor.protocol_version != 3 {
+            return Err(ExternalError::InvalidArgument);
+        }
+        let request_id = protocol::request_id();
+        self.in_flight_request = Some(request_id.clone());
+        let message = CoreMessage::Event {
+            request_id: request_id.clone(),
+            payload,
+        };
+        if let Err(error) = self.send(&message).await {
+            return Err(self.fail_and_terminate(error).await);
+        }
+        let reply = match timeout(EXECUTE_TIMEOUT, self.collect_reply(&request_id)).await {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(error)) => return Err(self.fail_and_terminate(error).await),
+            Err(_) => {
+                return Err(self
+                    .fail_and_terminate(ExternalError::ExecutionTimeout)
+                    .await);
+            }
+        };
+        self.in_flight_request = None;
+        match reply {
+            ModuleMessage::EventResult {
+                request_id: actual,
+                actions,
+            } if actual == request_id => Ok((request_id, actions)),
+            ModuleMessage::EventResult { .. } => {
+                Err(self.fail_and_terminate(ExternalError::WrongRequestId).await)
+            }
+            _ => Err(self.fail_and_terminate(ExternalError::ProtocolDecode).await),
+        }
+    }
+
     async fn collect_reply(&mut self, expected_id: &str) -> Result<ModuleMessage, ExternalError> {
         loop {
             let line = self.read_line().await?;
@@ -240,7 +290,8 @@ impl ModuleProcess {
                 ModuleMessage::Log { .. } => continue,
                 ModuleMessage::Result { ref request_id, .. }
                 | ModuleMessage::Error { ref request_id, .. }
-                | ModuleMessage::Health { ref request_id } => {
+                | ModuleMessage::Health { ref request_id }
+                | ModuleMessage::EventResult { ref request_id, .. } => {
                     if *request_id == *expected_id {
                         return Ok(msg);
                     }
@@ -326,14 +377,19 @@ impl ModuleProcess {
     async fn terminate_process_group(&self) {
         #[cfg(unix)]
         {
-            let pgid = self.pid as i32;
+            let Some(process_group_id) = self.process_group_id else {
+                return;
+            };
+            let Ok(pgid) = i32::try_from(process_group_id) else {
+                return;
+            };
             let ret = unsafe { libc::kill(-pgid, libc::SIGKILL) };
             if ret == -1 {
                 let err = std::io::Error::last_os_error();
                 if err.raw_os_error() != Some(libc::ESRCH) {
                     tracing::warn!(
                         event = "process_group_kill_failed",
-                        pid = self.pid,
+                        pid = process_group_id,
                         error = %err,
                         "Failed to kill process group"
                     );
@@ -342,12 +398,15 @@ impl ModuleProcess {
         }
         #[cfg(not(unix))]
         {
-            let _ = self.pid;
+            let _ = self.process_group_id;
         }
     }
 
     async fn join_stderr_drain(&mut self) {
         if let Some(handle) = self.stderr_drain.take() {
+            // Descendants can retain stderr after the managed child exits; do
+            // not let their inherited FD block module cleanup forever.
+            handle.abort();
             let _ = handle.await;
         }
     }
@@ -356,10 +415,14 @@ impl ModuleProcess {
         if let Some(mut child) = self.child.take() {
             let _ = child.wait().await;
         }
+        // The process group ID is only valid while this ModuleProcess owns the
+        // child. Clearing it after reaping prevents repeated cleanup from
+        // signalling a PID that the kernel may have reused.
+        self.process_group_id = None;
     }
 
     async fn send(&mut self, msg: &CoreMessage) -> Result<(), ExternalError> {
-        let line = msg.serialize()?;
+        let line = msg.serialize_for(self.descriptor.protocol_version)?;
         let mut full = line;
         full.push('\n');
         self.stdin
@@ -404,7 +467,7 @@ impl ModuleProcess {
 
         let trimmed = std::str::from_utf8(&buf).map_err(|_| ExternalError::ProtocolDecode)?;
 
-        protocol::parse_module_line(trimmed)
+        protocol::parse_module_line_for(trimmed, self.descriptor.protocol_version)
     }
 }
 
@@ -573,6 +636,7 @@ if child:
         make_script(&fixture_path, ECHO_MODULE_PY);
 
         let descriptor = ExternalModuleDescriptor {
+            protocol_version: 2,
             id: "echo".to_owned(),
             display_name: "Echo".to_owned(),
             version: "0.1.0".to_owned(),
@@ -580,6 +644,9 @@ if child:
             entrypoint: fixture_path,
             module_dir: dir.clone(),
             capabilities: Vec::new(),
+            default_command: None,
+            subscriptions: Vec::new(),
+            actions: Vec::new(),
             commands: vec![],
         };
         (descriptor, dir)
@@ -599,6 +666,7 @@ if child:
         make_script(&fixture_path, CHILD_SPAWNER_PY);
 
         let descriptor = ExternalModuleDescriptor {
+            protocol_version: 2,
             id: "child-spawner".to_owned(),
             display_name: "ChildSpawner".to_owned(),
             version: "0.1.0".to_owned(),
@@ -606,6 +674,9 @@ if child:
             entrypoint: fixture_path,
             module_dir: dir.clone(),
             capabilities: Vec::new(),
+            default_command: None,
+            subscriptions: Vec::new(),
+            actions: Vec::new(),
             commands: vec![],
         };
         (descriptor, dir)
@@ -625,6 +696,7 @@ if child:
         make_script(&fixture_path, body);
 
         let descriptor = ExternalModuleDescriptor {
+            protocol_version: 2,
             id: id.to_owned(),
             display_name: id.to_owned(),
             version: "0.1.0".to_owned(),
@@ -632,9 +704,28 @@ if child:
             entrypoint: fixture_path,
             module_dir: dir.clone(),
             capabilities: Vec::new(),
+            default_command: None,
+            subscriptions: Vec::new(),
+            actions: Vec::new(),
             commands: vec![],
         };
         (descriptor, dir)
+    }
+
+    fn create_v3_event_module(id: &str) -> (ExternalModuleDescriptor, PathBuf) {
+        let (mut descriptor, directory) = create_fixture_module(V3_EVENT_MODULE_PY, id);
+        descriptor.protocol_version = 3;
+        (descriptor, directory)
+    }
+
+    fn created_event() -> MessageCreatedEvent {
+        MessageCreatedEvent {
+            event_id: "event-1".to_owned(),
+            message_ref: "message-1".to_owned(),
+            text: "hello".to_owned(),
+            outgoing: true,
+            entities: vec![],
+        }
     }
 
     #[tokio::test]
@@ -670,6 +761,11 @@ if child:
         let (desc, dir) = create_echo_module();
         let mut proc = ModuleProcess::start(desc).await.unwrap();
         proc.graceful_shutdown().await.unwrap();
+        assert_eq!(proc.process_group_id, None);
+        // Repeated cleanup after the child has exited must not retain a stale
+        // PGID that could be reused by an unrelated process.
+        proc.terminate().await;
+        assert_eq!(proc.process_group_id, None);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -735,5 +831,109 @@ for line in sys.stdin:
         let mut proc = ModuleProcess::start(desc).await.unwrap();
         proc.terminate().await;
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    const V3_EVENT_MODULE_PY: &str = r#"#!/usr/bin/env python3
+import json, sys, time
+for line in sys.stdin:
+    message = json.loads(line)
+    request_id = message["request_id"]
+    if message["type"] == "initialize":
+        response = {"protocol_version": 3, "type": "initialized", "request_id": request_id, "module_id": message["module_id"]}
+    elif message["type"] == "event":
+        module_id = "" # replaced by the test fixture name
+        message_ref = message["payload"]["message_ref"]
+        if module_id == "timeout":
+            time.sleep(10)
+        if module_id == "exit":
+            sys.exit(0)
+        if module_id == "wrong-id":
+            request_id = "999"
+        if module_id == "ordinary":
+            actions = [{"type": "message.react", "message_ref": message_ref, "reaction": {"type": "emoji", "emoji": "👍"}}]
+        elif module_id == "custom":
+            actions = [{"type": "message.react", "message_ref": message_ref, "reaction": {"type": "custom_emoji", "document_id": "5456140674028019486"}}]
+        elif module_id == "malformed":
+            actions = [{"type": "unexpected", "message_ref": message_ref, "reaction": {"type": "emoji", "emoji": "👍"}}]
+        elif module_id == "multiple":
+            actions = [{"type": "message.react", "message_ref": message_ref, "reaction": {"type": "emoji", "emoji": "👍"}}, {"type": "message.react", "message_ref": message_ref, "reaction": {"type": "emoji", "emoji": "👎"}}]
+        else:
+            actions = []
+        response = {"protocol_version": 3, "type": "event_result", "request_id": request_id, "actions": actions}
+    else:
+        continue
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
+"#;
+
+    #[tokio::test]
+    async fn v3_event_result_accepts_zero_ordinary_and_custom_emoji_actions() {
+        for (id, expected) in [
+            ("zero", vec![]),
+            (
+                "ordinary",
+                vec![protocol::EventAction {
+                    message_ref: "message-1".to_owned(),
+                    reaction: protocol::ReactionSpec::Emoji("👍".to_owned()),
+                }],
+            ),
+            (
+                "custom",
+                vec![protocol::EventAction {
+                    message_ref: "message-1".to_owned(),
+                    reaction: protocol::ReactionSpec::CustomEmoji {
+                        document_id: "5456140674028019486".to_owned(),
+                    },
+                }],
+            ),
+        ] {
+            let (descriptor, directory) = create_v3_event_module(id);
+            let entrypoint = descriptor.entrypoint.clone();
+            make_script(
+                &entrypoint,
+                &V3_EVENT_MODULE_PY.replace("module_id = \"\"", &format!("module_id = {id:?}")),
+            );
+            let mut process = ModuleProcess::start(descriptor).await.unwrap();
+            let (_, actions) = process
+                .dispatch_created_event(created_event())
+                .await
+                .unwrap();
+            assert_eq!(actions, expected);
+            process.terminate().await;
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn v3_event_failures_reject_the_protocol_and_clean_up_processes() {
+        for (id, expected) in [
+            ("wrong-id", ExternalError::WrongRequestId),
+            ("malformed", ExternalError::ProtocolDecode),
+            ("multiple", ExternalError::ProtocolDecode),
+            ("exit", ExternalError::Unavailable),
+            ("timeout", ExternalError::ExecutionTimeout),
+        ] {
+            let (descriptor, directory) = create_v3_event_module(id);
+            let entrypoint = descriptor.entrypoint.clone();
+            make_script(
+                &entrypoint,
+                &V3_EVENT_MODULE_PY.replace("module_id = \"\"", &format!("module_id = {id:?}")),
+            );
+            let mut process = ModuleProcess::start(descriptor).await.unwrap();
+            let error = process
+                .dispatch_created_event(created_event())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                std::mem::discriminant(&error),
+                std::mem::discriminant(&expected)
+            );
+            assert_eq!(process.status(), ProcessStatus::Crashed);
+            assert_eq!(process.in_flight_request(), None);
+            assert_eq!(process.process_group_id, None);
+            process.terminate().await;
+            assert_eq!(process.process_group_id, None);
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
 }

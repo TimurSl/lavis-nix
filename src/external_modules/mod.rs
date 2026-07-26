@@ -1,3 +1,5 @@
+pub mod entities;
+pub mod events;
 pub mod manager;
 pub mod manifest;
 pub mod process;

@@ -20,6 +20,7 @@ const MAX_USAGE_CHARS: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalModuleDescriptor {
+    pub protocol_version: u32,
     pub id: String,
     pub display_name: String,
     pub version: String,
@@ -27,6 +28,9 @@ pub struct ExternalModuleDescriptor {
     pub entrypoint: PathBuf,
     pub module_dir: PathBuf,
     pub capabilities: Vec<ExternalCapability>,
+    pub default_command: Option<String>,
+    pub subscriptions: Vec<ExternalSubscription>,
+    pub actions: Vec<ExternalAction>,
     pub commands: Vec<ExternalCommandDescriptor>,
 }
 
@@ -45,6 +49,8 @@ pub enum ExternalCapability {
     Network,
     PersistentStateRead,
     PersistentStateWrite,
+    MessageRead,
+    MessageReact,
 }
 
 impl ExternalCapability {
@@ -54,6 +60,8 @@ impl ExternalCapability {
             Self::Network => "network",
             Self::PersistentStateRead => "persistent_state_read",
             Self::PersistentStateWrite => "persistent_state_write",
+            Self::MessageRead => "message.read",
+            Self::MessageReact => "message.react",
         }
     }
 
@@ -63,6 +71,8 @@ impl ExternalCapability {
             Self::Network => "сеть",
             Self::PersistentStateRead => "чтение постоянного состояния",
             Self::PersistentStateWrite => "изменение постоянного состояния",
+            Self::MessageRead => "чтение сообщений",
+            Self::MessageReact => "реакции на сообщения",
         }
     }
 
@@ -72,8 +82,30 @@ impl ExternalCapability {
             "network" => Some(Self::Network),
             "persistent_state_read" => Some(Self::PersistentStateRead),
             "persistent_state_write" => Some(Self::PersistentStateWrite),
+            "message.read" => Some(Self::MessageRead),
+            "message.react" => Some(Self::MessageReact),
             _ => None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExternalSubscription {
+    MessageCreated,
+}
+impl ExternalSubscription {
+    fn from_str(value: &str) -> Option<Self> {
+        (value == "message.created").then_some(Self::MessageCreated)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExternalAction {
+    MessageReact,
+}
+impl ExternalAction {
+    fn from_str(value: &str) -> Option<Self> {
+        (value == "message.react").then_some(Self::MessageReact)
     }
 }
 
@@ -90,6 +122,12 @@ struct ManifestFile {
     capabilities: Vec<String>,
     #[serde(default)]
     commands: Vec<ManifestCommand>,
+    #[serde(default)]
+    default_command: Option<String>,
+    #[serde(default)]
+    subscriptions: Vec<String>,
+    #[serde(default)]
+    actions: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,7 +306,7 @@ pub fn validate_manifest_at(
     let manifest: ManifestFile =
         serde_json::from_slice(&bytes).map_err(|_| ExternalError::MalformedManifest)?;
 
-    if manifest.schema_version != 2 {
+    if !matches!(manifest.schema_version, 2 | 3) {
         return Err(ExternalError::UnsupportedSchemaVersion);
     }
 
@@ -314,6 +352,31 @@ pub fn validate_manifest_at(
             return Err(ExternalError::InvalidCapability);
         }
         seen_capabilities.push(cap);
+    }
+
+    let mut subscriptions = Vec::new();
+    let mut actions = Vec::new();
+    if manifest.schema_version == 2
+        && (manifest.default_command.is_some()
+            || !manifest.subscriptions.is_empty()
+            || !manifest.actions.is_empty())
+    {
+        return Err(ExternalError::UnsupportedSchemaVersion);
+    }
+    for value in &manifest.subscriptions {
+        let subscription =
+            ExternalSubscription::from_str(value).ok_or(ExternalError::InvalidArgument)?;
+        if subscriptions.contains(&subscription) {
+            return Err(ExternalError::InvalidArgument);
+        }
+        subscriptions.push(subscription);
+    }
+    for value in &manifest.actions {
+        let action = ExternalAction::from_str(value).ok_or(ExternalError::InvalidArgument)?;
+        if actions.contains(&action) {
+            return Err(ExternalError::InvalidArgument);
+        }
+        actions.push(action);
     }
 
     if manifest.commands.is_empty() {
@@ -373,7 +436,28 @@ pub fn validate_manifest_at(
         });
     }
 
+    if let Some(default_command) = &manifest.default_command {
+        validate_command_name(default_command)?;
+        if !commands
+            .iter()
+            .any(|command| command.name == *default_command)
+        {
+            return Err(ExternalError::InvalidArgument);
+        }
+    }
+    if subscriptions.contains(&ExternalSubscription::MessageCreated)
+        && !seen_capabilities.contains(&ExternalCapability::MessageRead)
+    {
+        return Err(ExternalError::InvalidCapability);
+    }
+    if actions.contains(&ExternalAction::MessageReact)
+        && !seen_capabilities.contains(&ExternalCapability::MessageReact)
+    {
+        return Err(ExternalError::InvalidCapability);
+    }
+
     Ok(ExternalModuleDescriptor {
+        protocol_version: manifest.schema_version,
         id: manifest.id,
         display_name: manifest.name,
         version: manifest.version,
@@ -381,6 +465,9 @@ pub fn validate_manifest_at(
         entrypoint: entrypoint_path,
         module_dir: canonical_parent,
         capabilities: seen_capabilities,
+        default_command: manifest.default_command,
+        subscriptions,
+        actions,
         commands,
     })
 }
@@ -543,6 +630,45 @@ mod tests {
         json["schema_version"] = serde_json::json!(1);
         write_manifest(&dir, &serde_json::to_vec(&json).unwrap());
         let path = dir.join("module.json");
+        assert!(matches!(
+            validate_manifest_at(&path, Some("echo")),
+            Err(ExternalError::UnsupportedSchemaVersion)
+        ));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn v3_manifest_requires_declared_permissions_and_default_target() {
+        let base = temp_dir();
+        let dir = create_module_dir(&base, "echo");
+        let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
+        json["schema_version"] = serde_json::json!(3);
+        json["default_command"] = serde_json::json!("repeat");
+        json["subscriptions"] = serde_json::json!(["message.created"]);
+        json["actions"] = serde_json::json!(["message.react"]);
+        json["capabilities"] = serde_json::json!(["message.read", "message.react"]);
+        let path = write_manifest(&dir, &serde_json::to_vec(&json).unwrap());
+        let descriptor = validate_manifest_at(&path, Some("echo")).unwrap();
+        assert_eq!(descriptor.protocol_version, 3);
+        assert_eq!(descriptor.default_command.as_deref(), Some("repeat"));
+
+        json["capabilities"] = serde_json::json!([]);
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(matches!(
+            validate_manifest_at(&path, Some("echo")),
+            Err(ExternalError::InvalidCapability)
+        ));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn v2_manifest_rejects_a_default_command() {
+        let base = temp_dir();
+        let dir = create_module_dir(&base, "echo");
+        let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
+        json["default_command"] = serde_json::json!("repeat");
+        let path = write_manifest(&dir, &serde_json::to_vec(&json).unwrap());
+
         assert!(matches!(
             validate_manifest_at(&path, Some("echo")),
             Err(ExternalError::UnsupportedSchemaVersion)
