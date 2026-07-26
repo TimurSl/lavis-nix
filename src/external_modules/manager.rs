@@ -432,6 +432,7 @@ impl ExternalManagerHandle {
         module_id: &str,
         command_name: &str,
         arguments: &str,
+        argument_entities: &[super::protocol::CustomEmojiEntity],
     ) -> Result<String, ExternalError> {
         let process = {
             let manager = self.inner.lock().await;
@@ -442,6 +443,8 @@ impl ExternalManagerHandle {
         if process.status() != ProcessStatus::Running {
             return Err(ExternalError::Unavailable);
         }
-        process.execute(command_name, arguments).await
+        process
+            .execute_with_entities(command_name, arguments, argument_entities)
+            .await
     }
 }

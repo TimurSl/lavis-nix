@@ -238,6 +238,7 @@ impl RuntimeState {
             } else {
                 args.to_owned()
             },
+            argument_entities: Vec::new(),
         }))
     }
 
@@ -247,6 +248,7 @@ impl RuntimeState {
             module_id: name.to_owned(),
             command_name,
             arguments: args.to_owned(),
+            argument_entities: Vec::new(),
         }))
     }
 
@@ -260,6 +262,7 @@ impl RuntimeState {
                 &invocation.module_id,
                 &invocation.command_name,
                 &invocation.arguments,
+                &invocation.argument_entities,
             )
             .await;
         let response = match &result {

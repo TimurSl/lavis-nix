@@ -45,6 +45,7 @@ pub enum CoreMessage {
         request_id: String,
         command: String,
         arguments: String,
+        argument_entities: Vec<CustomEmojiEntity>,
     },
     Health {
         request_id: String,
@@ -107,13 +108,27 @@ impl CoreMessage {
                 request_id,
                 command,
                 arguments,
-            } => serde_json::to_string(&serde_json::json!({
-                "protocol_version": protocol_version,
-                "type": "execute",
-                "request_id": request_id,
-                "command": command,
-                "arguments": arguments,
-            })),
+                argument_entities,
+            } => {
+                let mut message = serde_json::json!({
+                    "protocol_version": protocol_version,
+                    "type": "execute",
+                    "request_id": request_id,
+                    "command": command,
+                    "arguments": arguments,
+                });
+                if protocol_version == 3 {
+                    message["context"] = serde_json::json!({
+                        "argument_entities": argument_entities.iter().map(|entity| serde_json::json!({
+                            "type": "custom_emoji",
+                            "offset_utf16": entity.offset_utf16,
+                            "length_utf16": entity.length_utf16,
+                            "document_id": entity.document_id,
+                        })).collect::<Vec<_>>(),
+                    });
+                }
+                serde_json::to_string(&message)
+            }
             Self::Health { request_id } => serde_json::to_string(&serde_json::json!({
                 "protocol_version": protocol_version,
                 "type": "health",
@@ -328,6 +343,7 @@ mod tests {
             request_id: "2".to_owned(),
             command: "repeat".to_owned(),
             arguments: "Привет".to_owned(),
+            argument_entities: Vec::new(),
         };
         let json = msg.serialize().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -336,6 +352,29 @@ mod tests {
         assert_eq!(parsed["request_id"], "2");
         assert_eq!(parsed["command"], "repeat");
         assert_eq!(parsed["arguments"], "Привет");
+        assert!(parsed.get("context").is_none());
+    }
+
+    #[test]
+    fn v3_execute_projects_custom_emoji_context() {
+        let msg = CoreMessage::Execute {
+            request_id: "2".to_owned(),
+            command: "manage".to_owned(),
+            arguments: "добавить 🦀".to_owned(),
+            argument_entities: vec![CustomEmojiEntity {
+                offset_utf16: 9,
+                length_utf16: 2,
+                document_id: "5456140674028019486".to_owned(),
+            }],
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&msg.serialize_for(3).unwrap()).unwrap();
+        assert_eq!(parsed["context"]["argument_entities"][0]["offset_utf16"], 9);
+        assert_eq!(parsed["context"]["argument_entities"][0]["length_utf16"], 2);
+        assert_eq!(
+            parsed["context"]["argument_entities"][0]["document_id"],
+            "5456140674028019486"
+        );
     }
 
     #[test]

@@ -185,11 +185,21 @@ impl ModuleProcess {
         command: &str,
         arguments: &str,
     ) -> Result<String, ExternalError> {
+        self.execute_with_entities(command, arguments, &[]).await
+    }
+
+    pub async fn execute_with_entities(
+        &mut self,
+        command: &str,
+        arguments: &str,
+        argument_entities: &[protocol::CustomEmojiEntity],
+    ) -> Result<String, ExternalError> {
         let req_id = protocol::request_id();
         let msg = CoreMessage::Execute {
             request_id: req_id.clone(),
             command: command.to_owned(),
             arguments: arguments.to_owned(),
+            argument_entities: argument_entities.to_vec(),
         };
         self.in_flight_request = Some(req_id.clone());
         if let Err(e) = self.send(&msg).await {

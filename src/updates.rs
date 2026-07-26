@@ -98,9 +98,17 @@ async fn process_update(
         }
     }
 
-    let Some(action) = route(authored_by_self, message.text(), runtime) else {
+    let Some(mut action) = route(authored_by_self, message.text(), runtime) else {
         return;
     };
+    if let Action::External(invocation) = &mut action {
+        invocation.argument_entities = command_argument_entities(
+            message.text(),
+            runtime.prefix(),
+            &invocation.arguments,
+            message.fmt_entities(),
+        );
+    }
     tracing::debug!(
         event = "command_matched",
         command = action.name(),
@@ -135,6 +143,35 @@ async fn process_update(
             );
         }
     }
+}
+
+fn command_argument_entities(
+    text: &str,
+    prefix: &str,
+    arguments: &str,
+    entities: Option<&Vec<grammers_client::tl::enums::MessageEntity>>,
+) -> Vec<crate::external_modules::protocol::CustomEmojiEntity> {
+    if arguments.is_empty() {
+        return Vec::new();
+    }
+    let Some(command_text) = text.strip_prefix(prefix) else {
+        return Vec::new();
+    };
+    let command_text = command_text.trim_start();
+    let Some((_, trailing)) = command_text.split_once(char::is_whitespace) else {
+        return Vec::new();
+    };
+    let argument_text = trailing.trim();
+    if argument_text != arguments {
+        return Vec::new();
+    }
+    let start_byte = argument_text.as_ptr() as usize - text.as_ptr() as usize;
+    let start_utf16 = text[..start_byte].encode_utf16().count();
+    crate::external_modules::entities::project_custom_emoji_entities(
+        entities,
+        start_utf16,
+        start_utf16 + argument_text.encode_utf16().count(),
+    )
 }
 
 fn is_self_authored(sender_id: Option<PeerId>, outgoing: bool, self_user_id: PeerId) -> bool {
