@@ -64,14 +64,15 @@ impl ModuleProcess {
         }
 
         let mut command = Command::new(&entrypoint);
-        let path = std::env::var_os("PATH").unwrap_or_default();
         command
             .current_dir(&descriptor.module_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env_clear()
-            .env("PATH", path)
+            // Do not inherit the host search path (or any credentials it may
+            // expose through wrappers). Entrypoints must be executable paths.
+            .env("PATH", "/usr/bin:/bin")
             .env("NO_COLOR", "1")
             .env("CLICOLOR", "0")
             .env("CLICOLOR_FORCE", "0")
@@ -93,11 +94,23 @@ impl ModuleProcess {
 
         let mut child = command.spawn().map_err(|_| ExternalError::Unavailable)?;
 
-        let pid = child.id().ok_or(ExternalError::Unavailable)?;
+        let Some(pid) = child.id() else {
+            cleanup_spawned_child(&mut child, None).await;
+            return Err(ExternalError::Unavailable);
+        };
 
-        let stdin = child.stdin.take().ok_or(ExternalError::Unavailable)?;
-        let stderr = child.stderr.take().ok_or(ExternalError::Unavailable)?;
-        let stdout = child.stdout.take().ok_or(ExternalError::Unavailable)?;
+        let Some(stdin) = child.stdin.take() else {
+            cleanup_spawned_child(&mut child, Some(pid)).await;
+            return Err(ExternalError::Unavailable);
+        };
+        let Some(stderr) = child.stderr.take() else {
+            cleanup_spawned_child(&mut child, Some(pid)).await;
+            return Err(ExternalError::Unavailable);
+        };
+        let Some(stdout) = child.stdout.take() else {
+            cleanup_spawned_child(&mut child, Some(pid)).await;
+            return Err(ExternalError::Unavailable);
+        };
         let stdout_reader = BufReader::new(stdout);
 
         let stderr_drain = tokio::spawn(drain_stderr(stderr));
@@ -154,9 +167,7 @@ impl ModuleProcess {
                     return Err(self.fail_and_terminate(ExternalError::WrongRequestId).await);
                 }
                 if module_id != self.descriptor.id {
-                    return Err(self
-                        .fail_and_terminate(ExternalError::ProtocolVersionMismatch)
-                        .await);
+                    return Err(self.fail_and_terminate(ExternalError::WrongModuleId).await);
                 }
                 Ok(())
             }
@@ -255,9 +266,7 @@ impl ModuleProcess {
                 Err(e) => return Err(self.fail_and_terminate(e).await),
             },
             Err(_) => {
-                return Err(self
-                    .fail_and_terminate(ExternalError::ExecutionTimeout)
-                    .await);
+                return Err(self.fail_and_terminate(ExternalError::HealthTimeout).await);
             }
         };
 
@@ -277,10 +286,8 @@ impl ModuleProcess {
         let msg = CoreMessage::Shutdown {
             request_id: req_id.clone(),
         };
-        if self.send(&msg).await.is_err() {
-            self.in_flight_request = None;
-            self.terminate().await;
-            return Err(ExternalError::ShutdownTimeout);
+        if let Err(error) = self.send(&msg).await {
+            return Err(self.fail_and_terminate(error).await);
         }
 
         match timeout(SHUTDOWN_TIMEOUT, self.reap_child()).await {
@@ -290,11 +297,9 @@ impl ModuleProcess {
                 self.status = ProcessStatus::Terminated;
                 Ok(())
             }
-            Err(_) => {
-                self.in_flight_request = None;
-                self.terminate().await;
-                Err(ExternalError::ShutdownTimeout)
-            }
+            Err(_) => Err(self
+                .fail_and_terminate(ExternalError::ShutdownTimeout)
+                .await),
         }
     }
 
@@ -431,6 +436,19 @@ async fn drain_stderr(mut stderr: tokio::process::ChildStderr) -> StderrCapture 
     }
 }
 
+async fn cleanup_spawned_child(child: &mut Child, pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        let ret = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        if ret == -1 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+            let _ = child.kill().await;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+    let _ = child.wait().await;
+}
+
 fn truncate_result(text: &str) -> String {
     if text.len() <= MAX_RESULT_BYTES {
         text.to_owned()
@@ -453,6 +471,7 @@ pub async fn reap_child(mut child: Child) {
 #[cfg(all(test, feature = "fixture-tests"))]
 mod tests {
     use super::*;
+    use std::env;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -521,10 +540,23 @@ if child:
 "#;
 
     fn make_script(output: &Path, body: &str) {
+        let python = python_executable();
+        let body = body.replacen(
+            "#!/usr/bin/env python3",
+            &format!("#!{}", python.display()),
+            1,
+        );
         fs::write(output, body).unwrap();
-        let _ = std::process::Command::new("chmod")
-            .args(["+x", &output.to_string_lossy()])
-            .output();
+        fs::set_permissions(output, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn python_executable() -> PathBuf {
+        env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| env::split_paths(&path).collect::<Vec<_>>())
+            .map(|directory| directory.join("python3"))
+            .find(|candidate| candidate.is_file())
+            .expect("fixture tests require python3 in PATH")
     }
 
     fn create_echo_module() -> (ExternalModuleDescriptor, PathBuf) {

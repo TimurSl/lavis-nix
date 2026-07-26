@@ -30,37 +30,35 @@ ls examples/external-module-echo/
 ### 4. Enable the module
 
 ```bash
-.lavis modules enable my-echo
+lavis modules enable my-echo
 ```
 
 ### 5. Use the module
 
 ```bash
-.lavis my-echo.echo Hello from Lavis!
+,my-echo.echo Hello from Lavis!
 ```
 
 ## CLI commands
 
-### `modules list`
+These are local terminal commands, not Telegram commands.
 
-Lists all modules (built-in + external).
-
-### `modules enable <id>`
+### `lavis modules enable <id>`
 
 Register an external module by ID. The module must exist in
 `$XDG_DATA_HOME/lavis/modules/<id>/`.
 
-### `modules disable <id>`
+### `lavis modules disable <id>`
 
 Remove a module from the active set. Does not delete its files.
 
-### `modules validate <path>`
+### `lavis modules validate <path>`
 
 Validate a module manifest at the given path without enabling it.
 
-### `modules status <id>`
+### `lavis modules status`
 
-Show detailed status of an external module.
+Show discovered external modules and their locally enabled state.
 
 ## Command resolution order
 
@@ -91,6 +89,8 @@ External commands and modules appear in help output:
 - Write JSON lines to stdout
 - Respond to `initialize`, `execute`, `health`, and `shutdown`
 - Flush stdout after each message
+- Start quickly: enabled modules are launched during Lavis startup, not on
+  their first command
 
 ### Best practices
 
@@ -109,6 +109,11 @@ Lavis sets these environment variables:
 - `CLICOLOR_FORCE=0`
 - `TERM=dumb`
 
+It uses a fixed minimal `PATH` and does **not** inherit the host `PATH` or any
+other arbitrary environment variables. Telegram credentials are never passed
+to a module. Entrypoints must be directly executable; Lavis does not invoke a
+shell.
+
 Secret env vars (`LAVIS_API_ID`, `LAVIS_API_HASH`) are removed from the
 module's environment.
 
@@ -125,7 +130,7 @@ Check that the entrypoint is executable and has a valid shebang. Enable
 debug logging:
 
 ```bash
-LAVIS_LOG=debug .lavis
+RUST_LOG=lavis=debug lavis
 ```
 
 ### Manifest validation fails
@@ -133,10 +138,10 @@ LAVIS_LOG=debug .lavis
 Run:
 
 ```bash
-.lavis modules validate ~/.local/share/lavis/modules/my-module
+lavis modules validate ~/.local/share/lavis/modules/my-module/module.json
 ```
 
 ### Process crashes
 
-Check the Lavis logs for crash information. Module stderr is captured
-and logged at `trace` level.
+Check the Lavis logs for safe crash metadata. stderr is drained and capped to
+avoid blocking the child, but raw stderr is not logged by default.

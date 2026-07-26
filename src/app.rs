@@ -136,129 +136,141 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
         .await
         .context("failed to open the Telegram session")?;
     let mut guard = TelegramClientGuard::new(client);
-
-    // Load settings early (needed for prefix in quick_start)
-    let settings = settings::SettingsStore::load(config.settings_path.clone())
-        .await
-        .context("failed to load persistent settings")?;
-    let prefix = settings.prefix().to_owned();
-
-    let outcome = auth::authorize(guard.inner().client(), &config)
-        .await
-        .context("Telegram authorization failed")
-        .map_err(|error| authorization_failure(error, newly_saved))?;
-
-    if should_show_quick_start(&outcome) {
-        let quick_start = render_quick_start(&prefix);
-        if let Err(error) = guard
-            .inner()
-            .client()
-            .send_message(
-                &grammers_client::tl::types::InputPeerSelf {},
-                grammers_client::message::InputMessage::new().text(quick_start.clone()),
-            )
+    let mut external_handle = None;
+    let application_result = async {
+        // Load settings early (needed for prefix in quick_start).
+        let settings = settings::SettingsStore::load(config.settings_path.clone())
             .await
-        {
-            tracing::warn!(
-                event = "quick_start_send_failed",
-                error = %error,
-                "Failed to send post-auth quick start message"
-            );
-            let fallback = render_quick_start_fallback(&quick_start);
-            let _ = writeln!(io::stdout().lock(), "{fallback}");
+            .context("failed to load persistent settings")?;
+        let prefix = settings.prefix().to_owned();
+
+        let outcome = auth::authorize(guard.inner().client(), &config)
+            .await
+            .context("Telegram authorization failed")
+            .map_err(|error| authorization_failure(error, newly_saved))?;
+
+        if should_show_quick_start(&outcome) {
+            let quick_start = render_quick_start(&prefix);
+            if let Err(error) = guard
+                .inner()
+                .client()
+                .send_message(
+                    &grammers_client::tl::types::InputPeerSelf {},
+                    grammers_client::message::InputMessage::new().text(quick_start.clone()),
+                )
+                .await
+            {
+                tracing::warn!(
+                    event = "quick_start_send_failed",
+                    error = %error,
+                    "Failed to send post-auth quick start message"
+                );
+                let fallback = render_quick_start_fallback(&quick_start);
+                let _ = writeln!(io::stdout().lock(), "{fallback}");
+            }
         }
-    }
 
-    if auth_only {
-        return Ok(());
-    }
+        if auth_only {
+            return Ok(());
+        }
 
-    let self_user_id = outcome.self_user_id();
-    initialize_dialog_cache(guard.inner().client()).await?;
-    let mut stream = {
-        let client_ref = guard.inner();
-        let receiver = client_ref
-            .take_updates()
-            .context("failed to start the Telegram update stream")?;
-        client_ref
-            .client()
-            .stream_updates(
-                receiver,
-                grammers_client::client::UpdatesConfiguration {
-                    catch_up: false,
-                    ..Default::default()
-                },
-            )
+        let self_user_id = outcome.self_user_id();
+        initialize_dialog_cache(guard.inner().client()).await?;
+        let mut stream = {
+            let client_ref = guard.inner();
+            let receiver = client_ref
+                .take_updates()
+                .context("failed to start the Telegram update stream")?;
+            client_ref
+                .client()
+                .stream_updates(
+                    receiver,
+                    grammers_client::client::UpdatesConfiguration {
+                        catch_up: false,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(anyhow::Error::from_boxed)
+                .context("failed to create the Telegram update stream")?
+        };
+
+        let aliases = aliases::AliasStore::load(config.aliases_path.clone())
             .await
-            .map_err(anyhow::Error::from_boxed)
-            .context("failed to create the Telegram update stream")?
-    };
+            .context("failed to load persistent aliases")?;
 
-    let aliases = aliases::AliasStore::load(config.aliases_path.clone())
-        .await
-        .context("failed to load persistent aliases")?;
-
-    // Set up external modules
-    let external_state_path = config::ConfigPaths::external_modules_state_path_with(&environment)
-        .context("failed to determine external modules state path")?;
-    let external_state = external_modules::state::ExternalStateStore::load(external_state_path)
-        .await
-        .unwrap_or_else(|error| {
-            tracing::warn!(
-                event = "external_state_load_failed",
-                error = %error,
-                "External modules state unavailable, continuing without them"
-            );
-            external_modules::state::ExternalStateStore::new_disabled()
-        });
-
-    let module_root = config::ConfigPaths::data_dir_with(&environment)
-        .context("failed to determine data directory")?
-        .join(external_modules::MODULE_DIR_NAME);
-
-    let descriptors =
-        external_modules::manifest::discover_modules(&module_root).unwrap_or_else(|error| {
-            tracing::warn!(
-                event = "external_discovery_failed",
-                error = %error,
-                "External module discovery failed, continuing without modules"
-            );
-            Vec::new()
-        });
-
-    let external_manager = external_modules::manager::ExternalManager::new();
-    let handle = external_modules::manager::ExternalManagerHandle::new(external_manager);
-    {
-        let mut mgr = handle.lock().await;
-        mgr.set_descriptors(descriptors);
-        mgr.startup_enabled(external_state.enabled_ids()).await;
-    }
-    tracing::info!(event = "application_started", "lavis is running");
-
-    let mut runtime = runtime::RuntimeState::new(
-        started_at,
-        aliases,
-        settings,
-        config.fastfetch_profile_path.clone(),
-    );
-    runtime.set_external_manager(handle.clone()).await;
-
-    let run_result = {
-        let client_ref = guard.inner();
-        async { updates::run(&mut stream, self_user_id, client_ref.client(), &mut runtime).await }
+        // Set up external modules.
+        let external_state_path =
+            config::ConfigPaths::external_modules_state_path_with(&environment)
+                .context("failed to determine external modules state path")?;
+        let external_state = external_modules::state::ExternalStateStore::load(external_state_path)
             .await
-    };
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    event = "external_state_load_failed",
+                    error = %error,
+                    "External modules state unavailable, continuing without them"
+                );
+                external_modules::state::ExternalStateStore::new_disabled()
+            });
 
-    drop(stream);
+        let module_root = config::ConfigPaths::data_dir_with(&environment)
+            .context("failed to determine data directory")?
+            .join(external_modules::MODULE_DIR_NAME);
+
+        let descriptors = external_modules::manifest::discover_modules(&module_root)
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    event = "external_discovery_failed",
+                    error = %error,
+                    "External module discovery failed, continuing without modules"
+                );
+                Vec::new()
+            });
+
+        let external_manager = external_modules::manager::ExternalManager::new();
+        let handle = external_modules::manager::ExternalManagerHandle::new(external_manager);
+        external_handle = Some(handle.clone());
+        {
+            let mut mgr = handle.lock().await;
+            mgr.set_descriptors(descriptors);
+            mgr.startup_enabled(external_state.enabled_ids()).await;
+        }
+        tracing::info!(event = "application_started", "lavis is running");
+
+        let mut runtime = runtime::RuntimeState::new(
+            started_at,
+            aliases,
+            settings,
+            config.fastfetch_profile_path.clone(),
+        );
+        runtime.set_external_manager(handle).await;
+
+        let run_result = {
+            let client_ref = guard.inner();
+            updates::run(&mut stream, self_user_id, client_ref.client(), &mut runtime).await
+        };
+
+        drop(stream);
+        run_result
+    }
+    .await;
 
     let shutdown_result = guard.shutdown().await;
+    if let Some(handle) = external_handle {
+        // Telegram disconnects before external modules so no module outlives the
+        // Telegram runner on any application exit path.
+        handle.lock().await.shutdown_all().await;
+    }
 
-    // Shut down external modules after Telegram has disconnected
-    let mut mgr = handle.lock().await;
-    mgr.shutdown_all().await;
-    drop(mgr);
+    combine_application_and_shutdown(application_result, shutdown_result)
+}
 
-    match (run_result, shutdown_result) {
+fn combine_application_and_shutdown(
+    application_result: anyhow::Result<()>,
+    shutdown_result: Result<(), ClientError>,
+) -> anyhow::Result<()> {
+    match (application_result, shutdown_result) {
         (Ok(()), Ok(())) => {
             tracing::info!(event = "application_stopped", "lavis stopped");
             Ok(())
@@ -576,10 +588,10 @@ async fn initialize_dialog_cache(client: &grammers_client::Client) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthorizationOutcome, CliCommand, NONINTERACTIVE_LOGOUT,
-        NONINTERACTIVE_MISSING_CREDENTIALS, authorization_failure, logout_confirmed, parse_cli,
-        remove_session_files, render_quick_start, render_quick_start_fallback,
-        should_show_quick_start,
+        AuthorizationOutcome, CliCommand, ClientError, NONINTERACTIVE_LOGOUT,
+        NONINTERACTIVE_MISSING_CREDENTIALS, authorization_failure,
+        combine_application_and_shutdown, logout_confirmed, parse_cli, remove_session_files,
+        render_quick_start, render_quick_start_fallback, should_show_quick_start,
     };
     use std::{
         ffi::OsString,
@@ -645,6 +657,32 @@ mod tests {
 
         assert!(new.to_string().contains("lavis credentials reset"));
         assert!(!existing.to_string().contains("lavis credentials reset"));
+    }
+
+    #[test]
+    fn shutdown_result_preserves_the_application_error() {
+        let error = combine_application_and_shutdown(
+            Err(anyhow::anyhow!("application failed")),
+            Err(ClientError::RunnerTask),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Telegram runner shutdown also failed")
+        );
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string() == "application failed")
+        );
+    }
+
+    #[test]
+    fn shutdown_error_is_returned_when_application_succeeds() {
+        let error =
+            combine_application_and_shutdown(Ok(()), Err(ClientError::RunnerTask)).unwrap_err();
+        assert!(error.to_string().contains("Telegram runner task failed"));
     }
 
     #[test]

@@ -236,8 +236,12 @@ pub enum ExternalError {
     HandshakeTimeout,
     #[error("wrong request ID")]
     WrongRequestId,
+    #[error("wrong module ID")]
+    WrongModuleId,
     #[error("execution timeout")]
     ExecutionTimeout,
+    #[error("health check timeout")]
+    HealthTimeout,
     #[error("shutdown timeout")]
     ShutdownTimeout,
     #[error("module result is too large")]

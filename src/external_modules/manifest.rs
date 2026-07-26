@@ -16,6 +16,7 @@ const MAX_DESCRIPTION_CHARS: usize = 2000;
 const MAX_NAME_CHARS: usize = 64;
 const MAX_VERSION_CHARS: usize = 32;
 const MAX_AUTHOR_CHARS: usize = 128;
+const MAX_USAGE_CHARS: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalModuleDescriptor {
@@ -138,6 +139,13 @@ pub fn validate_command_name(name: &str) -> Result<(), ExternalError> {
 
 fn validate_single_line(value: &str) -> bool {
     !value.is_empty() && !value.chars().any(|c| c.is_control() || is_bidi_control(c))
+}
+
+fn usage_is_argument_syntax(usage: &str, command_name: &str) -> bool {
+    usage
+        .split_whitespace()
+        .next()
+        .is_none_or(|first| first != command_name)
 }
 
 fn is_bidi_control(c: char) -> bool {
@@ -340,7 +348,10 @@ pub fn validate_manifest_at(
         {
             return Err(ExternalError::InvalidMetadata);
         }
-        if !validate_single_line(&mc.usage) || mc.usage.chars().count() > 256 {
+        if !validate_single_line(&mc.usage)
+            || mc.usage.chars().count() > MAX_USAGE_CHARS
+            || !usage_is_argument_syntax(&mc.usage, &mc.name)
+        {
             return Err(ExternalError::InvalidMetadata);
         }
 
@@ -570,6 +581,48 @@ mod tests {
         assert!(validate_command_name("UPPERCASE").is_err());
         assert!(validate_command_name("has space").is_err());
         assert!(validate_command_name("valid-name").is_ok());
+    }
+
+    #[test]
+    fn usage_must_be_argument_syntax_without_the_command_name() {
+        let base = temp_dir();
+        let dir = create_module_dir(&base, "echo");
+        let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
+        json["commands"][0]["usage"] = serde_json::json!("repeat [text]");
+        let path = write_manifest(&dir, &serde_json::to_vec(&json).unwrap());
+        assert!(matches!(
+            validate_manifest_at(&path, Some("echo")),
+            Err(ExternalError::InvalidMetadata)
+        ));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn metadata_limits_count_unicode_characters_and_reject_unsafe_text() {
+        let base = temp_dir();
+        let dir = create_module_dir(&base, "echo");
+        let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
+        json["name"] = serde_json::json!("🦀".repeat(MAX_NAME_CHARS));
+        json["commands"][0]["usage"] = serde_json::json!("🦀".repeat(MAX_USAGE_CHARS));
+        json["commands"][0]["examples"] = serde_json::json!(["пример"]);
+        let path = write_manifest(&dir, &serde_json::to_vec(&json).unwrap());
+        assert!(validate_manifest_at(&path, Some("echo")).is_ok());
+
+        json["commands"][0]["examples"] = serde_json::json!(["bad\nexample"]);
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(matches!(
+            validate_manifest_at(&path, Some("echo")),
+            Err(ExternalError::InvalidMetadata)
+        ));
+
+        json["commands"][0]["examples"] = serde_json::json!(["good"]);
+        json["commands"][0]["description_ru"] = serde_json::json!("bad\u{202e}description");
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(matches!(
+            validate_manifest_at(&path, Some("echo")),
+            Err(ExternalError::InvalidMetadata)
+        ));
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

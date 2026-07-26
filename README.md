@@ -66,13 +66,13 @@ Module API v2 и runtime внешних модулей позволяют рас
 с Lavis через JSON-строки (stdin/stdout).
 
 ```bash
-# Управление модулями
-,modules list
-,modules validate ./my-module
-,modules enable my-module
-,modules disable my-module
+# Локальная CLI: управление модулями
+lavis modules validate ./my-module/module.json
+lavis modules enable my-module
+lavis modules disable my-module
+lavis modules status
 
-# Использование модуля
+# Команда Telegram с текущим префиксом
 ,my-module.command-name аргументы
 ```
 
@@ -196,9 +196,9 @@ Lavis не добавляет логотип или структуру, если
 ```bash
 nix develop
 cargo fmt --check
-cargo check --all-targets
+cargo check --all-targets --all-features
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
+cargo test --all-targets --all-features
 nix flake check --print-build-logs
 nix build --print-build-logs
 ```

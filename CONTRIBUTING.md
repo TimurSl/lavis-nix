@@ -66,9 +66,9 @@ Help v2 получает русские `summary_ru`, `description_ru` и при
 ```bash
 nix develop
 cargo fmt --check
-cargo check --all-targets
+cargo check --all-targets --all-features
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
+cargo test --all-targets --all-features
 nix flake check
 nix build
 ```
