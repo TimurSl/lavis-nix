@@ -1,5 +1,5 @@
 use anyhow::Context;
-use grammers_client::{client::UpdateStream, update::Update};
+use grammers_client::{client::UpdateStream, message::InputReactions, update::Update};
 use grammers_session::types::PeerId;
 
 use crate::{
@@ -66,6 +66,32 @@ async fn process_update(
         authored_by_self,
         "Received Telegram message update"
     );
+
+    if !edited {
+        for action in runtime
+            .dispatch_created_event(message.text(), outgoing)
+            .await
+        {
+            let reaction = match action.reaction {
+                crate::external_modules::protocol::ReactionSpec::Emoji(emoji) => {
+                    InputReactions::emoticon(emoji)
+                }
+                crate::external_modules::protocol::ReactionSpec::CustomEmoji { document_id } => {
+                    match document_id.parse::<i64>() {
+                        Ok(document_id) => InputReactions::custom_emoji(document_id),
+                        Err(_) => continue,
+                    }
+                }
+            };
+            if let Err(error) = message.react(reaction).await {
+                tracing::warn!(
+                    event = "external_reaction_failed",
+                    error_category = invocation_error_category(&error),
+                    "External reaction action failed"
+                );
+            }
+        }
+    }
 
     let Some(action) = route(authored_by_self, message.text(), runtime) else {
         return;

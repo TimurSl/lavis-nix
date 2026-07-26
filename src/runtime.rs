@@ -13,6 +13,10 @@ use crate::{
     commands::{Action, AliasRequest, ExternalInvocation, ModulesRequest, PrefixRequest, dispatch},
     error::ExternalError,
     external_modules::manager::{ExternalManagerHandle, ExternalRuntimeSnapshot},
+    external_modules::{
+        events::{EventScope, module_can_receive_created_event, validate_reaction_action},
+        protocol::{EventAction, MessageCreatedEvent},
+    },
     fastfetch::{self, FastfetchInputError, FastfetchProfileError, FastfetchResult},
     help::{render_modules_overview_with_external, render_with_external},
     response::Response,
@@ -71,6 +75,54 @@ impl RuntimeState {
         if let Some(handle) = &self.external_manager {
             self.external_snapshot = handle.snapshot().await;
         }
+    }
+
+    pub async fn dispatch_created_event(&mut self, text: &str, outgoing: bool) -> Vec<EventAction> {
+        let Some(handle) = self.external_manager.clone() else {
+            return Vec::new();
+        };
+        let descriptors = self.external_snapshot.descriptors.clone();
+        let mut accepted = Vec::new();
+        for descriptor in descriptors
+            .iter()
+            .filter(|descriptor| module_can_receive_created_event(descriptor))
+        {
+            let event_id = crate::external_modules::protocol::request_id();
+            let message_ref = format!(
+                "mref-{}-{}",
+                descriptor.id,
+                crate::external_modules::protocol::request_id()
+            );
+            let payload = MessageCreatedEvent {
+                event_id,
+                message_ref: message_ref.clone(),
+                text: text.to_owned(),
+                outgoing,
+                entities: Vec::new(),
+            };
+            let mut manager = handle.lock().await;
+            let result = manager
+                .dispatch_created_event(&descriptor.id, payload)
+                .await;
+            drop(manager);
+            match result {
+                Ok((request_id, actions)) => {
+                    let scope = EventScope {
+                        module_id: descriptor.id.clone(),
+                        request_id: request_id.clone(),
+                        message_ref,
+                    };
+                    accepted.extend(actions.into_iter().filter(|action| {
+                        validate_reaction_action(descriptor, &scope, &request_id, action)
+                    }));
+                }
+                Err(error) => {
+                    tracing::warn!(event = "external_event_failed", module_id = %descriptor.id, error = %error, "External event failed")
+                }
+            }
+        }
+        self.refresh_snapshot().await;
+        accepted
     }
 
     pub fn external_command_refs(&self) -> &[crate::external_modules::manager::ExternalCommandRef] {
