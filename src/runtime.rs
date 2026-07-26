@@ -80,7 +80,12 @@ impl RuntimeState {
         }
     }
 
-    pub async fn dispatch_created_event(&mut self, text: &str, outgoing: bool) -> Vec<EventAction> {
+    pub async fn dispatch_created_event(
+        &mut self,
+        text: &str,
+        outgoing: bool,
+        entities: Vec<crate::external_modules::protocol::CustomEmojiEntity>,
+    ) -> Vec<EventAction> {
         let Some(handle) = self.external_manager.clone() else {
             return Vec::new();
         };
@@ -100,7 +105,7 @@ impl RuntimeState {
                 message_ref: message_ref.clone(),
                 text: text.to_owned(),
                 outgoing,
-                entities: Vec::new(),
+                entities: entities.clone(),
             };
             let handle = handle.clone();
             let descriptor = descriptor.clone();

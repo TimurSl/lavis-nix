@@ -68,8 +68,13 @@ async fn process_update(
     );
 
     if !edited {
+        let entities = crate::external_modules::entities::project_custom_emoji_entities(
+            message.fmt_entities(),
+            0,
+            message.text().encode_utf16().count(),
+        );
         for action in runtime
-            .dispatch_created_event(message.text(), outgoing)
+            .dispatch_created_event(message.text(), outgoing, entities)
             .await
         {
             let reaction = match action.reaction {
