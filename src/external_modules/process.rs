@@ -1,6 +1,8 @@
 use super::{
     manifest::ExternalModuleDescriptor,
-    protocol::{self, CoreMessage, MAX_LINE_BYTES, MAX_RESULT_BYTES, ModuleMessage},
+    protocol::{
+        self, CoreMessage, MAX_LINE_BYTES, MAX_RESULT_BYTES, MessageCreatedEvent, ModuleMessage,
+    },
 };
 use crate::error::ExternalError;
 use std::{process::Stdio, time::Duration};
@@ -229,6 +231,44 @@ impl ModuleProcess {
         }
     }
 
+    pub async fn dispatch_created_event(
+        &mut self,
+        payload: MessageCreatedEvent,
+    ) -> Result<(String, Vec<protocol::EventAction>), ExternalError> {
+        if self.descriptor.protocol_version != 3 {
+            return Err(ExternalError::InvalidArgument);
+        }
+        let request_id = protocol::request_id();
+        self.in_flight_request = Some(request_id.clone());
+        let message = CoreMessage::Event {
+            request_id: request_id.clone(),
+            payload,
+        };
+        if let Err(error) = self.send(&message).await {
+            return Err(self.fail_and_terminate(error).await);
+        }
+        let reply = match timeout(EXECUTE_TIMEOUT, self.collect_reply(&request_id)).await {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(error)) => return Err(self.fail_and_terminate(error).await),
+            Err(_) => {
+                return Err(self
+                    .fail_and_terminate(ExternalError::ExecutionTimeout)
+                    .await);
+            }
+        };
+        self.in_flight_request = None;
+        match reply {
+            ModuleMessage::EventResult {
+                request_id: actual,
+                actions,
+            } if actual == request_id => Ok((request_id, actions)),
+            ModuleMessage::EventResult { .. } => {
+                Err(self.fail_and_terminate(ExternalError::WrongRequestId).await)
+            }
+            _ => Err(self.fail_and_terminate(ExternalError::ProtocolDecode).await),
+        }
+    }
+
     async fn collect_reply(&mut self, expected_id: &str) -> Result<ModuleMessage, ExternalError> {
         loop {
             let line = self.read_line().await?;
@@ -240,7 +280,8 @@ impl ModuleProcess {
                 ModuleMessage::Log { .. } => continue,
                 ModuleMessage::Result { ref request_id, .. }
                 | ModuleMessage::Error { ref request_id, .. }
-                | ModuleMessage::Health { ref request_id } => {
+                | ModuleMessage::Health { ref request_id }
+                | ModuleMessage::EventResult { ref request_id, .. } => {
                     if *request_id == *expected_id {
                         return Ok(msg);
                     }

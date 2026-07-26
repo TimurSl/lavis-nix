@@ -224,6 +224,22 @@ impl ExternalManager {
         Ok(result)
     }
 
+    pub async fn dispatch_created_event(
+        &mut self,
+        module_id: &str,
+        payload: super::protocol::MessageCreatedEvent,
+    ) -> Result<(String, Vec<super::protocol::EventAction>), ExternalError> {
+        let process = self
+            .processes
+            .get_mut(module_id)
+            .ok_or(ExternalError::Unavailable)?;
+        if process.status() != ProcessStatus::Running || process.descriptor().protocol_version != 3
+        {
+            return Err(ExternalError::Unavailable);
+        }
+        process.dispatch_created_event(payload).await
+    }
+
     pub async fn shutdown_all(&mut self) {
         tracing::info!(
             event = "external_modules_shutdown",
