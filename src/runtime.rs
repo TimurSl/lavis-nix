@@ -85,7 +85,7 @@ impl RuntimeState {
             return Vec::new();
         };
         let descriptors = self.external_snapshot.descriptors.clone();
-        let mut accepted = Vec::new();
+        let mut tasks = Vec::new();
         for descriptor in descriptors
             .iter()
             .filter(|descriptor| module_can_receive_created_event(descriptor))
@@ -102,7 +102,22 @@ impl RuntimeState {
                 outgoing,
                 entities: Vec::new(),
             };
-            let result = handle.dispatch_created_event(&descriptor.id, payload).await;
+            let handle = handle.clone();
+            let descriptor = descriptor.clone();
+            tasks.push(tokio::spawn(async move {
+                let result = handle.dispatch_created_event(&descriptor.id, payload).await;
+                (descriptor, message_ref, result)
+            }));
+        }
+        let mut accepted = Vec::new();
+        for task in tasks {
+            let Ok((descriptor, message_ref, result)) = task.await else {
+                tracing::warn!(
+                    event = "external_event_task_failed",
+                    "External event task failed"
+                );
+                continue;
+            };
             match result {
                 Ok((request_id, actions)) => {
                     let scope = EventScope {
@@ -112,7 +127,7 @@ impl RuntimeState {
                     };
                     for action in actions {
                         if let Err(category) =
-                            validate_reaction_action(descriptor, &scope, &request_id, &action)
+                            validate_reaction_action(&descriptor, &scope, &request_id, &action)
                         {
                             tracing::warn!(event = "external_reaction_rejected", ?category, module_id = %descriptor.id, "External reaction action rejected");
                             continue;
