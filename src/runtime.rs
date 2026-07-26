@@ -39,6 +39,70 @@ pub struct RuntimeState {
 
 const MAX_EXPECTED_SELF_EDITS: usize = 128;
 
+pub struct CreatedEventDispatch {
+    handle: ExternalManagerHandle,
+    requests: Vec<CreatedEventRequest>,
+}
+
+struct CreatedEventRequest {
+    descriptor: crate::external_modules::manifest::ExternalModuleDescriptor,
+    message_ref: String,
+    payload: MessageCreatedEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedEventDispatchFailure {
+    pub module_id: String,
+    pub category: &'static str,
+}
+
+#[derive(Debug, Default)]
+pub struct CreatedEventDispatchResult {
+    pub actions: Vec<EventAction>,
+    pub failures: Vec<CreatedEventDispatchFailure>,
+}
+
+impl CreatedEventDispatch {
+    pub async fn execute(self) -> CreatedEventDispatchResult {
+        let mut result = CreatedEventDispatchResult::default();
+        for request in self.requests {
+            let module_id = request.descriptor.id.clone();
+            let response = self
+                .handle
+                .dispatch_created_event(&module_id, request.payload)
+                .await;
+            match response {
+                Ok((request_id, actions)) => {
+                    let scope = EventScope {
+                        module_id: module_id.clone(),
+                        request_id: request_id.clone(),
+                        message_ref: request.message_ref,
+                    };
+                    for action in actions {
+                        if let Err(category) = validate_reaction_action(
+                            &request.descriptor,
+                            &scope,
+                            &request_id,
+                            &action,
+                        ) {
+                            tracing::warn!(event = "external_reaction_rejected", ?category, module_id = %module_id, "External reaction action rejected");
+                            continue;
+                        }
+                        result.actions.push(action);
+                    }
+                }
+                Err(error) => {
+                    result.failures.push(CreatedEventDispatchFailure {
+                        module_id,
+                        category: external_event_error_category(&error),
+                    });
+                }
+            }
+        }
+        result
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ExpectedSelfEdit {
     peer_id: PeerId,
@@ -80,21 +144,19 @@ impl RuntimeState {
         }
     }
 
-    pub async fn dispatch_created_event(
-        &mut self,
+    pub fn prepare_created_event_dispatch(
+        &self,
         text: &str,
         outgoing: bool,
         entities: Vec<crate::external_modules::protocol::CustomEmojiEntity>,
-    ) -> Vec<EventAction> {
+    ) -> Option<CreatedEventDispatch> {
         let Some(handle) = self.external_manager.clone() else {
-            return Vec::new();
+            return None;
         };
-        let descriptors = self.external_snapshot.descriptors.clone();
-        // Keep the per-message fan-out structured: this future is itself owned
-        // by the update loop's event task, so dropping it cancels every module
-        // request rather than detaching child tasks.
-        let mut dispatches = Vec::new();
-        for descriptor in descriptors
+        let mut requests = Vec::new();
+        for descriptor in self
+            .external_snapshot
+            .descriptors
             .iter()
             .filter(|descriptor| module_can_receive_created_event(descriptor))
         {
@@ -110,39 +172,13 @@ impl RuntimeState {
                 outgoing,
                 entities: entities.clone(),
             };
-            let handle = handle.clone();
-            let descriptor = descriptor.clone();
-            dispatches.push(async move {
-                let result = handle.dispatch_created_event(&descriptor.id, payload).await;
-                (descriptor, message_ref, result)
+            requests.push(CreatedEventRequest {
+                descriptor: descriptor.clone(),
+                message_ref,
+                payload,
             });
         }
-        let mut accepted = Vec::new();
-        for (descriptor, message_ref, result) in futures_util::future::join_all(dispatches).await {
-            match result {
-                Ok((request_id, actions)) => {
-                    let scope = EventScope {
-                        module_id: descriptor.id.clone(),
-                        request_id: request_id.clone(),
-                        message_ref,
-                    };
-                    for action in actions {
-                        if let Err(category) =
-                            validate_reaction_action(&descriptor, &scope, &request_id, &action)
-                        {
-                            tracing::warn!(event = "external_reaction_rejected", ?category, module_id = %descriptor.id, "External reaction action rejected");
-                            continue;
-                        }
-                        accepted.push(action);
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(event = "external_event_failed", module_id = %descriptor.id, error = %error, "External event failed")
-                }
-            }
-        }
-        self.refresh_snapshot().await;
-        accepted
+        (!requests.is_empty()).then_some(CreatedEventDispatch { handle, requests })
     }
 
     pub fn external_command_refs(&self) -> &[crate::external_modules::manager::ExternalCommandRef] {
@@ -577,6 +613,20 @@ fn log_ping_failure(action: &Action, message_id: i32, error: &grammers_mtsender:
     );
 }
 
+fn external_event_error_category(error: &ExternalError) -> &'static str {
+    match error {
+        ExternalError::Unavailable => "unavailable",
+        ExternalError::ExecutionTimeout => "timeout",
+        ExternalError::ProtocolDecode
+        | ExternalError::LineTooLarge
+        | ExternalError::WrongRequestId
+        | ExternalError::WrongModuleId => "protocol",
+        ExternalError::ResultTooLarge => "result_too_large",
+        ExternalError::ModuleError => "module_error",
+        _ => "other",
+    }
+}
+
 pub(crate) fn invocation_error_category(
     error: &grammers_mtsender::InvocationError,
 ) -> &'static str {
@@ -701,8 +751,8 @@ fn format_stats(
 #[cfg(test)]
 mod tests {
     use super::{
-        ProcStats, fastfetch_response, format_duration, format_latency, format_stats,
-        parse_memory_kib, parse_system_uptime,
+        ProcStats, external_event_error_category, fastfetch_response, format_duration,
+        format_latency, format_stats, parse_memory_kib, parse_system_uptime,
     };
     use crate::response::Response;
     use crate::{
@@ -936,6 +986,30 @@ mod tests {
         assert_eq!(format_latency(Duration::ZERO), "<1 ms");
         assert_eq!(format_latency(Duration::from_micros(999)), "<1 ms");
         assert_eq!(format_latency(Duration::from_millis(12)), "12 ms");
+    }
+
+    #[test]
+    fn categorizes_external_event_failures_without_exposing_error_details() {
+        assert_eq!(
+            external_event_error_category(&crate::error::ExternalError::Unavailable),
+            "unavailable"
+        );
+        assert_eq!(
+            external_event_error_category(&crate::error::ExternalError::ExecutionTimeout),
+            "timeout"
+        );
+        assert_eq!(
+            external_event_error_category(&crate::error::ExternalError::ProtocolDecode),
+            "protocol"
+        );
+        assert_eq!(
+            external_event_error_category(&crate::error::ExternalError::ModuleError),
+            "module_error"
+        );
+        assert_eq!(
+            external_event_error_category(&crate::error::ExternalError::NotReadable),
+            "other"
+        );
     }
 
     #[test]

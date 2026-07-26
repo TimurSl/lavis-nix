@@ -1,12 +1,19 @@
 use anyhow::Context;
-use grammers_client::{client::UpdateStream, message::InputReactions, update::Update};
+use grammers_client::{
+    client::UpdateStream,
+    message::InputReactions,
+    update::{Message, Update},
+};
 use grammers_session::types::PeerId;
+use tokio::task::JoinSet;
 
 use crate::{
     command::parse,
     commands::{Action, dispatch},
-    runtime::{RuntimeState, invocation_error_category},
+    runtime::{CreatedEventDispatchResult, RuntimeState, invocation_error_category},
 };
+
+const MAX_EVENT_DISPATCH_TASKS: usize = 32;
 
 pub async fn run(
     stream: &mut UpdateStream,
@@ -16,11 +23,14 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
+    let mut event_dispatches = JoinSet::new();
 
     loop {
         tokio::select! {
             signal = &mut shutdown => {
                 signal.context("failed to listen for Ctrl-C shutdown signal")?;
+                event_dispatches.abort_all();
+                while event_dispatches.join_next().await.is_some() {}
                 stream
                     .sync_update_state()
                     .await
@@ -28,9 +38,26 @@ pub async fn run(
                     .context("failed to synchronize Telegram update state")?;
                 return Ok(());
             }
+            completed = event_dispatches.join_next(), if !event_dispatches.is_empty() => {
+                match completed {
+                    Some(Ok((message, result))) => handle_event_dispatch(message, result).await,
+                    Some(Err(error)) => tracing::warn!(event = "external_event_task_failed", error = %error, "External event task failed"),
+                    None => {}
+                }
+            }
             update = stream.next() => {
+                if update.is_err() {
+                    event_dispatches.abort_all();
+                    while event_dispatches.join_next().await.is_some() {}
+                }
                 let update = update.context("Telegram update stream ended or failed")?;
-                process_update(update, self_user_id, client, runtime).await;
+                process_update(
+                    update,
+                    self_user_id,
+                    client,
+                    runtime,
+                    &mut event_dispatches,
+                ).await;
             }
         }
     }
@@ -41,6 +68,7 @@ async fn process_update(
     self_user_id: PeerId,
     client: &grammers_client::Client,
     runtime: &mut RuntimeState,
+    event_dispatches: &mut JoinSet<(Message, CreatedEventDispatchResult)>,
 ) {
     let (message, edited) = match update {
         Update::NewMessage(message) => (message, false),
@@ -73,28 +101,17 @@ async fn process_update(
             0,
             message.text().encode_utf16().count(),
         );
-        for action in runtime
-            .dispatch_created_event(message.text(), outgoing, entities)
-            .await
+        if event_dispatches.len() >= MAX_EVENT_DISPATCH_TASKS {
+            tracing::warn!(
+                event = "external_event_task_skipped",
+                capacity = MAX_EVENT_DISPATCH_TASKS,
+                "Skipped external event dispatch because the task queue is full"
+            );
+        } else if let Some(dispatch) =
+            runtime.prepare_created_event_dispatch(message.text(), outgoing, entities)
         {
-            let reaction = match action.reaction {
-                crate::external_modules::protocol::ReactionSpec::Emoji(emoji) => {
-                    InputReactions::emoticon(emoji)
-                }
-                crate::external_modules::protocol::ReactionSpec::CustomEmoji { document_id } => {
-                    match document_id.parse::<i64>() {
-                        Ok(document_id) => InputReactions::custom_emoji(document_id),
-                        Err(_) => continue,
-                    }
-                }
-            };
-            if let Err(error) = message.react(reaction).await {
-                tracing::warn!(
-                    event = "external_reaction_failed",
-                    error_category = invocation_error_category(&error),
-                    "External reaction action failed"
-                );
-            }
+            let reaction_message = message.clone();
+            event_dispatches.spawn(async move { (reaction_message, dispatch.execute().await) });
         }
     }
 
@@ -140,6 +157,37 @@ async fn process_update(
                 error_category = invocation_error_category(&error),
                 error = %error,
                 "Failed to edit outgoing command message"
+            );
+        }
+    }
+}
+
+async fn handle_event_dispatch(message: Message, result: CreatedEventDispatchResult) {
+    for failure in result.failures {
+        tracing::warn!(
+            event = "external_event_failed",
+            module_id = %failure.module_id,
+            error_category = failure.category,
+            "External event failed"
+        );
+    }
+    for action in result.actions {
+        let reaction = match action.reaction {
+            crate::external_modules::protocol::ReactionSpec::Emoji(emoji) => {
+                InputReactions::emoticon(emoji)
+            }
+            crate::external_modules::protocol::ReactionSpec::CustomEmoji { document_id } => {
+                match document_id.parse::<i64>() {
+                    Ok(document_id) => InputReactions::custom_emoji(document_id),
+                    Err(_) => continue,
+                }
+            }
+        };
+        if let Err(error) = message.react(reaction).await {
+            tracing::warn!(
+                event = "external_reaction_failed",
+                error_category = invocation_error_category(&error),
+                "External reaction action failed"
             );
         }
     }
