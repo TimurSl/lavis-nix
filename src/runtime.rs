@@ -165,6 +165,15 @@ impl RuntimeState {
         }))
     }
 
+    pub fn resolve_external_default(&self, name: &str, args: &str) -> Option<Action> {
+        let command_name = self.external_snapshot.active_defaults.get(name)?.clone();
+        Some(Action::External(ExternalInvocation {
+            module_id: name.to_owned(),
+            command_name,
+            arguments: args.to_owned(),
+        }))
+    }
+
     async fn execute_external(&mut self, invocation: &ExternalInvocation) -> Response {
         let handle = match self.external_manager.clone() {
             Some(h) => h,

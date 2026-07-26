@@ -145,6 +145,14 @@ impl ExternalManager {
         Some((module_id.to_owned(), command_name.to_owned()))
     }
 
+    pub fn resolve_default_command(&self, module_id: &str) -> Option<(String, String)> {
+        let process = self.processes.get(module_id)?;
+        (process.status() == ProcessStatus::Running)
+            .then(|| process.descriptor().default_command.as_ref())
+            .flatten()
+            .map(|command| (module_id.to_owned(), command.clone()))
+    }
+
     pub fn command_refs(&self) -> Vec<ExternalCommandRef> {
         let mut refs = Vec::new();
         for process in self.processes.values() {
@@ -263,6 +271,7 @@ pub struct ExternalRuntimeSnapshot {
     pub command_refs: Vec<ExternalCommandRef>,
     pub descriptors: Vec<ExternalModuleDescriptor>,
     pub active_commands: std::collections::HashSet<String>,
+    pub active_defaults: std::collections::HashMap<String, String>,
 }
 
 impl ExternalRuntimeSnapshot {
@@ -277,10 +286,23 @@ impl ExternalRuntimeSnapshot {
             .iter()
             .map(|r| format!("{}.{}", r.module_id, r.command_name))
             .collect();
+        let active_defaults = manager
+            .processes
+            .values()
+            .filter(|process| process.status() == ProcessStatus::Running)
+            .filter_map(|process| {
+                process
+                    .descriptor()
+                    .default_command
+                    .as_ref()
+                    .map(|command| (process.descriptor().id.clone(), command.clone()))
+            })
+            .collect();
         Self {
             command_refs,
             descriptors,
             active_commands,
+            active_defaults,
         }
     }
 

@@ -359,7 +359,7 @@ impl ModuleProcess {
     }
 
     async fn send(&mut self, msg: &CoreMessage) -> Result<(), ExternalError> {
-        let line = msg.serialize()?;
+        let line = msg.serialize_for(self.descriptor.protocol_version)?;
         let mut full = line;
         full.push('\n');
         self.stdin
@@ -404,7 +404,7 @@ impl ModuleProcess {
 
         let trimmed = std::str::from_utf8(&buf).map_err(|_| ExternalError::ProtocolDecode)?;
 
-        protocol::parse_module_line(trimmed)
+        protocol::parse_module_line_for(trimmed, self.descriptor.protocol_version)
     }
 }
 
@@ -573,6 +573,7 @@ if child:
         make_script(&fixture_path, ECHO_MODULE_PY);
 
         let descriptor = ExternalModuleDescriptor {
+            protocol_version: 2,
             id: "echo".to_owned(),
             display_name: "Echo".to_owned(),
             version: "0.1.0".to_owned(),
@@ -580,6 +581,9 @@ if child:
             entrypoint: fixture_path,
             module_dir: dir.clone(),
             capabilities: Vec::new(),
+            default_command: None,
+            subscriptions: Vec::new(),
+            actions: Vec::new(),
             commands: vec![],
         };
         (descriptor, dir)
@@ -599,6 +603,7 @@ if child:
         make_script(&fixture_path, CHILD_SPAWNER_PY);
 
         let descriptor = ExternalModuleDescriptor {
+            protocol_version: 2,
             id: "child-spawner".to_owned(),
             display_name: "ChildSpawner".to_owned(),
             version: "0.1.0".to_owned(),
@@ -606,6 +611,9 @@ if child:
             entrypoint: fixture_path,
             module_dir: dir.clone(),
             capabilities: Vec::new(),
+            default_command: None,
+            subscriptions: Vec::new(),
+            actions: Vec::new(),
             commands: vec![],
         };
         (descriptor, dir)
@@ -625,6 +633,7 @@ if child:
         make_script(&fixture_path, body);
 
         let descriptor = ExternalModuleDescriptor {
+            protocol_version: 2,
             id: id.to_owned(),
             display_name: id.to_owned(),
             version: "0.1.0".to_owned(),
@@ -632,6 +641,9 @@ if child:
             entrypoint: fixture_path,
             module_dir: dir.clone(),
             capabilities: Vec::new(),
+            default_command: None,
+            subscriptions: Vec::new(),
+            actions: Vec::new(),
             commands: vec![],
         };
         (descriptor, dir)

@@ -52,12 +52,16 @@ pub enum ModuleMessage {
 
 impl CoreMessage {
     pub fn serialize(&self) -> Result<String, ExternalError> {
+        self.serialize_for(PROTOCOL_VERSION)
+    }
+
+    pub fn serialize_for(&self, protocol_version: u32) -> Result<String, ExternalError> {
         match self {
             Self::Initialize {
                 request_id,
                 module_id,
             } => serde_json::to_string(&serde_json::json!({
-                "protocol_version": PROTOCOL_VERSION,
+                "protocol_version": protocol_version,
                 "type": "initialize",
                 "request_id": request_id,
                 "module_id": module_id,
@@ -67,19 +71,19 @@ impl CoreMessage {
                 command,
                 arguments,
             } => serde_json::to_string(&serde_json::json!({
-                "protocol_version": PROTOCOL_VERSION,
+                "protocol_version": protocol_version,
                 "type": "execute",
                 "request_id": request_id,
                 "command": command,
                 "arguments": arguments,
             })),
             Self::Health { request_id } => serde_json::to_string(&serde_json::json!({
-                "protocol_version": PROTOCOL_VERSION,
+                "protocol_version": protocol_version,
                 "type": "health",
                 "request_id": request_id,
             })),
             Self::Shutdown { request_id } => serde_json::to_string(&serde_json::json!({
-                "protocol_version": PROTOCOL_VERSION,
+                "protocol_version": protocol_version,
                 "type": "shutdown",
                 "request_id": request_id,
             })),
@@ -109,6 +113,13 @@ fn validate_request_id(value: &serde_json::Value) -> Result<String, ExternalErro
 }
 
 pub fn parse_module_line(line: &str) -> Result<Option<ModuleMessage>, ExternalError> {
+    parse_module_line_for(line, PROTOCOL_VERSION)
+}
+
+pub fn parse_module_line_for(
+    line: &str,
+    expected_protocol_version: u32,
+) -> Result<Option<ModuleMessage>, ExternalError> {
     if line.len() > MAX_LINE_BYTES {
         return Err(ExternalError::LineTooLarge);
     }
@@ -119,7 +130,7 @@ pub fn parse_module_line(line: &str) -> Result<Option<ModuleMessage>, ExternalEr
         .get("protocol_version")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    if proto != PROTOCOL_VERSION as u64 {
+    if proto != expected_protocol_version as u64 {
         return Err(ExternalError::ProtocolVersionMismatch);
     }
 
