@@ -10,6 +10,7 @@ use std::{
 
 pub mod aliases;
 pub mod auth;
+pub mod bot_api;
 pub mod client;
 pub mod command;
 pub mod commands;
@@ -25,6 +26,7 @@ pub mod runtime;
 pub mod settings;
 pub mod setup;
 pub mod setup_store;
+pub mod setup_telegram;
 pub mod updates;
 
 use auth::AuthorizationOutcome;
