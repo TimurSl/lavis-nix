@@ -5,7 +5,7 @@ use std::{
     sync::Mutex,
 };
 
-use grammers_client::{Client, tl};
+use grammers_client::{Client, message::InputMessage, tl};
 
 use crate::{
     setup_provision::{
@@ -186,13 +186,7 @@ impl ProvisionTransport for GrammersTransport<'_> {
                 access_hash: bot.access_hash,
             };
             self.client
-                .invoke(&tl::functions::messages::StartBot {
-                    bot: input_user(bot),
-                    peer: input_peer_user(bot),
-                    random_id: random_id()
-                        .map_err(|_| setup_provision::ProvisionError::StartBot)?,
-                    start_param: String::new(),
-                })
+                .send_message(input_peer_user(bot), InputMessage::new().text("/start"))
                 .await
                 .map_err(|_| setup_provision::ProvisionError::StartBot)?;
             Ok(())
