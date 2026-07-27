@@ -356,6 +356,9 @@ async fn process_update(
     }
     if setup_input.is_some() {
         // BotFather replies are setup-private but are not ours to edit.
+        if let Some(response) = setup_input {
+            send_setup_timeout_notification(client, runtime, response).await;
+        }
         return;
     }
 

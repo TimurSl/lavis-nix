@@ -27,6 +27,8 @@ pub enum ProvisionError {
     CreateGroup,
     CreatedGroupMissing,
     GroupUnavailable,
+    GroupChanged,
+    GeneralTopicLookup,
     ForumTopics,
     CreateTopic,
     InviteBot,
@@ -164,7 +166,7 @@ impl ProvisionTransport for GrammersTransport<'_> {
         Box::pin(async move {
             let bot = resolve_bot(self.client, username)
                 .await
-                .map_err(|_| setup_provision::ProvisionError::Telegram)?;
+                .map_err(|_| setup_provision::ProvisionError::GroupUnavailable)?;
             *self
                 .bot
                 .lock()
@@ -232,7 +234,17 @@ impl ProvisionTransport for GrammersTransport<'_> {
                 })
                 .await
                 .map_err(|_| setup_provision::ProvisionError::Telegram)?;
-            Ok(chats.chats().iter().any(|chat| matches!(chat, tl::enums::Chat::Channel(channel) if channel.id == group.id && channel.megagroup && channel.forum)).then_some(group))
+            let available_chats = chats.chats();
+            let matching = available_chats.iter().find(
+                |chat| matches!(chat, tl::enums::Chat::Channel(channel) if channel.id == group.id),
+            );
+            match matching {
+                Some(tl::enums::Chat::Channel(channel)) if channel.megagroup && channel.forum => {
+                    Ok(Some(group))
+                }
+                Some(_) => Err(setup_provision::ProvisionError::GroupChanged),
+                None => Ok(None),
+            }
         })
     }
 
@@ -494,6 +506,9 @@ async fn persist(
 fn map_provision_error(error: setup_provision::ProvisionError) -> ProvisionError {
     match error {
         setup_provision::ProvisionError::Storage => ProvisionError::Storage,
+        setup_provision::ProvisionError::GroupUnavailable => ProvisionError::GroupUnavailable,
+        setup_provision::ProvisionError::GroupChanged => ProvisionError::GroupChanged,
+        setup_provision::ProvisionError::GeneralTopicLookup => ProvisionError::GeneralTopicLookup,
         setup_provision::ProvisionError::FolderCapacity => ProvisionError::FolderCapacity,
         setup_provision::ProvisionError::FolderNameConflict => ProvisionError::FolderNameConflict,
         setup_provision::ProvisionError::Telegram => ProvisionError::DialogFilters,

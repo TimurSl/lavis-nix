@@ -144,7 +144,11 @@ pub enum SetupTelegramError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BotFatherProgress {
     Pending,
-    Occupied,
+    UsernameOccupied,
+    UsernameInvalid,
+    LimitReached,
+    FloodWait,
+    Unexpected,
     ProvisionReady,
 }
 
@@ -197,24 +201,38 @@ impl CompanionSetup {
                 send_with_timeout(telegram, "/newbot").await?;
             }
             Step::NewBot => {
+                if !is_display_name_prompt(text) {
+                    return Ok(BotFatherProgress::Pending);
+                }
                 self.step = Step::DisplayName;
                 send_with_timeout(telegram, DISPLAY_NAME).await?;
             }
             Step::DisplayName => {
+                if !is_username_prompt(text) {
+                    return Ok(BotFatherProgress::Pending);
+                }
                 self.step = Step::Username;
                 send_with_timeout(telegram, self.username.display()).await?;
             }
             Step::Username => {
                 let response = classify_botfather_response(text);
-                if matches!(
-                    response,
-                    crate::setup::BotFatherResponse::UsernameOccupied
-                        | crate::setup::BotFatherResponse::UsernameInvalid
-                ) {
-                    return Ok(BotFatherProgress::Occupied);
-                }
-                let crate::setup::BotFatherResponse::Success { token } = response else {
-                    return Ok(BotFatherProgress::Pending);
+                let token = match response {
+                    crate::setup::BotFatherResponse::Success { token } => token,
+                    crate::setup::BotFatherResponse::UsernameOccupied => {
+                        return Ok(BotFatherProgress::UsernameOccupied);
+                    }
+                    crate::setup::BotFatherResponse::UsernameInvalid => {
+                        return Ok(BotFatherProgress::UsernameInvalid);
+                    }
+                    crate::setup::BotFatherResponse::LimitReached => {
+                        return Ok(BotFatherProgress::LimitReached);
+                    }
+                    crate::setup::BotFatherResponse::FloodWait => {
+                        return Ok(BotFatherProgress::FloodWait);
+                    }
+                    crate::setup::BotFatherResponse::Unexpected { .. } => {
+                        return Ok(BotFatherProgress::Unexpected);
+                    }
                 };
                 self.validate_and_persist(token, bot_api).await?;
                 self.step = Step::Complete;
@@ -273,6 +291,25 @@ impl CompanionSetup {
         .map_err(|_| SetupTelegramError::Storage)?;
         Ok(())
     }
+}
+
+fn is_display_name_prompt(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    !is_cancel_acknowledgement(&text)
+        && (text.contains("how are we going to call")
+            || text.contains("name for your bot")
+            || text.contains("new bot"))
+}
+
+fn is_username_prompt(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    !is_cancel_acknowledgement(&text) && text.contains("username")
+}
+
+fn is_cancel_acknowledgement(text: &str) -> bool {
+    text.contains("cancelled")
+        || text.contains("canceled")
+        || text.contains("no active conversation")
 }
 
 async fn send_with_timeout(
@@ -347,13 +384,20 @@ mod tests {
             path.join("token"),
         );
         setup.start(&telegram).await.unwrap();
-        for _ in 0..3 {
+        for (prompt, expected) in [
+            ("How are we going to call it?", BotFatherProgress::Pending),
+            (
+                "Good. Now let's choose a username for your bot.",
+                BotFatherProgress::Pending,
+            ),
+            ("ok", BotFatherProgress::Unexpected),
+        ] {
             assert_eq!(
                 setup
-                    .on_botfather_reply("ok", &telegram, &BotApiMock)
+                    .on_botfather_reply(prompt, &telegram, &BotApiMock)
                     .await
                     .unwrap(),
-                BotFatherProgress::Pending
+                expected
             );
         }
         assert_eq!(
@@ -391,5 +435,31 @@ mod tests {
             send_with_timeout_for(&Stuck, "/newbot", Duration::ZERO).await,
             Err(SetupTelegramError::Timeout)
         );
+    }
+
+    #[tokio::test]
+    async fn ignores_delayed_cancel_reply_until_the_expected_prompt_arrives() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let telegram = TelegramMock(sent.clone());
+        let mut setup = CompanionSetup::new(
+            crate::setup::validate_username("lavis_test_bot").unwrap(),
+            PathBuf::new(),
+            PathBuf::new(),
+        );
+        setup.start(&telegram).await.unwrap();
+
+        assert_eq!(
+            setup
+                .on_botfather_reply("No active conversation to cancel.", &telegram, &BotApiMock)
+                .await
+                .unwrap(),
+            BotFatherProgress::Pending
+        );
+        assert_eq!(*sent.lock().unwrap(), ["/cancel", "/newbot"]);
+        setup
+            .on_botfather_reply("How are we going to call it?", &telegram, &BotApiMock)
+            .await
+            .unwrap();
+        assert_eq!(*sent.lock().unwrap(), ["/cancel", "/newbot", DISPLAY_NAME]);
     }
 }

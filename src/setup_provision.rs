@@ -76,6 +76,9 @@ pub enum FolderPlan {
 pub enum ProvisionError {
     Telegram,
     Storage,
+    GroupUnavailable,
+    GroupChanged,
+    GeneralTopicLookup,
     FolderCapacity,
     FolderNameConflict,
 }
@@ -194,8 +197,11 @@ pub async fn provision(
         access_hash: state.identities.companion_chat_access_hash,
     });
     let group = match recorded_group {
-        Some(group) if transport.get_forum_group(group).await?.is_some() => group,
-        Some(_) | None => {
+        Some(group) => transport
+            .get_forum_group(group)
+            .await?
+            .ok_or(ProvisionError::GroupUnavailable)?,
+        None => {
             let group = transport.create_forum_group(COMPANION_GROUP_TITLE).await?;
             state.identities.companion_chat_id = Some(group.id);
             state.identities.companion_chat_access_hash = group.access_hash;
@@ -218,6 +224,7 @@ pub async fn provision(
         for title in COMPANION_TOPIC_TITLES {
             let topic = match transport.get_forum_topic(group, title).await? {
                 Some(topic) => topic,
+                None if title == "General" => return Err(ProvisionError::GeneralTopicLookup),
                 None => transport.create_forum_topic(group, title).await?,
             };
             if title == "General" {
@@ -252,8 +259,14 @@ pub async fn provision(
             state.identities.companion_folder_id,
         ) {
             Ok(plan) => plan,
-            Err(ProvisionError::FolderCapacity | ProvisionError::FolderNameConflict) => {
-                state.status = "completed_without_folder".to_owned();
+            Err(ProvisionError::FolderCapacity) => {
+                state.status = "completed_without_folder_capacity".to_owned();
+                state.stages.companion_configured = true;
+                persist(transport, state).await?;
+                return Ok(());
+            }
+            Err(ProvisionError::FolderNameConflict) => {
+                state.status = "completed_without_folder_name_conflict".to_owned();
                 state.stages.companion_configured = true;
                 persist(transport, state).await?;
                 return Ok(());
@@ -362,11 +375,15 @@ mod tests {
         fn get_forum_topic<'a>(
             &'a self,
             _: ForumGroup,
-            _: &'a str,
+            title: &'a str,
         ) -> ProvisionFuture<'a, Option<ForumTopic>> {
             Box::pin(async move {
                 self.call("get-topic");
-                Ok(self.topic)
+                Ok(if title == "General" {
+                    Some(ForumTopic { id: 1 })
+                } else {
+                    self.topic
+                })
             })
         }
         fn create_forum_topic<'a>(
@@ -437,7 +454,6 @@ mod tests {
                 "config",
                 "group",
                 "get-topic",
-                "topic",
                 "get-topic",
                 "topic",
                 "get-topic",
