@@ -4,7 +4,7 @@
 
 use std::fmt;
 
-const BOT_SUFFIX: &str = "_bot";
+const BOT_SUFFIX: &str = "bot";
 const MAX_DIAGNOSTIC_BYTES: usize = 160;
 const MAX_RESPONSE_BYTES: usize = 4096;
 
@@ -36,7 +36,7 @@ impl UsernameCandidate {
     }
 }
 
-/// Validates an entire username. The `_bot` suffix is case-insensitive, while
+/// Validates an entire username. The `bot` suffix is case-insensitive, while
 /// normalization is always lowercase so comparisons are deterministic.
 pub fn validate_username(input: &str) -> Result<UsernameCandidate, UsernameError> {
     if !input.to_ascii_lowercase().ends_with(BOT_SUFFIX) {
@@ -120,7 +120,7 @@ pub enum Confirmation {
 pub fn parse_confirmation(input: &str) -> Option<Confirmation> {
     match input.trim().to_ascii_lowercase().as_str() {
         "confirm" => Some(Confirmation::Confirmed),
-        "cancel" | "/cancel" => Some(Confirmation::Cancelled),
+        "cancel" => Some(Confirmation::Cancelled),
         _ => None,
     }
 }
@@ -371,7 +371,12 @@ pub fn transition(state: SetupState, event: SetupEvent) -> Transition {
             let SetupState::AwaitingUsername { display_name } = state else {
                 unreachable!("guarded above")
             };
-            match validate_username(&input) {
+            let username = if matches!(input.trim().to_ascii_lowercase().as_str(), "-" | "auto") {
+                generate_candidate().map_err(|_| UsernameError::InvalidCharactersOrLength)
+            } else {
+                validate_username(&input)
+            };
+            match username {
                 Ok(username) => Transition {
                     state: SetupState::AwaitingConfirmation {
                         display_name,
@@ -382,7 +387,7 @@ pub fn transition(state: SetupState, event: SetupEvent) -> Transition {
                 Err(UsernameError::MissingBotSuffix) => Transition {
                     state: SetupState::AwaitingUsername { display_name },
                     effects: vec![SetupEffect::Notify {
-                        message: "Username must end with _bot.",
+                        message: "Username must end with bot.",
                     }],
                 },
                 Err(UsernameError::InvalidCharactersOrLength) => Transition {
@@ -425,7 +430,7 @@ pub fn transition(state: SetupState, event: SetupEvent) -> Transition {
                         username,
                     },
                     effects: vec![SetupEffect::Notify {
-                        message: "Reply exactly YES or /cancel.",
+                        message: "Reply exactly confirm or cancel.",
                     }],
                 },
             }
@@ -495,6 +500,8 @@ mod tests {
         let username = validate_username("Lavis_Test_BOT").unwrap();
         assert_eq!(username.normalized(), "lavis_test_bot");
         assert_eq!(username.display(), "Lavis_Test_BOT");
+        assert!(validate_username("lavis_example_bot").is_ok());
+        assert!(validate_username("LavisExampleBot").is_ok());
         assert_eq!(
             validate_username("lavisname"),
             Err(UsernameError::MissingBotSuffix)
@@ -527,7 +534,11 @@ mod tests {
             Some(Confirmation::Confirmed)
         );
         assert_eq!(parse_confirmation("yes"), None);
-        assert_eq!(parse_confirmation("/cancel"), Some(Confirmation::Cancelled));
+        assert_eq!(
+            parse_confirmation(" Cancel "),
+            Some(Confirmation::Cancelled)
+        );
+        assert_eq!(parse_confirmation("/cancel"), None);
         assert_eq!(safe_log_candidate("a\n$"), "a??");
         assert!(safe_log_candidate(&"x".repeat(33)).ends_with('…'));
     }
@@ -588,6 +599,26 @@ mod tests {
                 .iter()
                 .any(|effect| matches!(effect, SetupEffect::PromptUsername))
         );
+    }
+
+    #[test]
+    fn automatic_username_requires_confirmation_without_botfather_effects() {
+        for input in ["-", "auto", " AUTO "] {
+            let result = transition(
+                SetupState::AwaitingUsername {
+                    display_name: "Lavis helper".into(),
+                },
+                SetupEvent::Username(input.into()),
+            );
+            assert!(matches!(
+                result.state,
+                SetupState::AwaitingConfirmation { .. }
+            ));
+            assert!(matches!(
+                result.effects.as_slice(),
+                [SetupEffect::PromptConfirmation { .. }]
+            ));
+        }
     }
 
     #[test]

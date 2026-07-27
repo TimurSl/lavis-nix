@@ -115,6 +115,9 @@ pub async fn run(
     let mut provision_tasks = ProvisionTasks::new();
 
     loop {
+        let setup_timeout = runtime
+            .setup_timeout_deadline()
+            .map(|deadline| tokio::time::sleep_until(deadline.into()));
         tokio::select! {
             signal = &mut shutdown => {
                 signal.context("failed to listen for Ctrl-C shutdown signal")?;
@@ -134,6 +137,15 @@ pub async fn run(
                     None => {}
                 }
             }
+            _ = async {
+                if let Some(timeout) = setup_timeout {
+                    timeout.await;
+                }
+            }, if setup_timeout.is_some() => {
+                if let Some(response) = runtime.handle_setup_timeout() {
+                    send_setup_timeout_notification(client, runtime, response).await;
+                }
+            }
             next = event_dispatches.next_update_or_event(stream.next()) => {
                 match next {
                     UpdateOrEvent::Event(Some(Ok(()))) => {}
@@ -145,18 +157,81 @@ pub async fn run(
                             provision_tasks.abort_and_drain().await;
                         }
                         let update = update.context("Telegram update stream ended or failed")?;
-                        process_update(
-                            update,
-                            self_user_id,
-                            client,
-                            runtime,
-                            &mut event_dispatches,
-                            &mut provision_tasks,
-                        ).await;
+                        // A BotFather RPC is part of processing this update. Keep it
+                        // structured (rather than detached), but continue to honor
+                        // shutdown and the owned setup deadline while it is pending.
+                        let process_timeout = runtime.setup_timeout_deadline();
+                        enum ProcessingResult {
+                            Completed,
+                            Shutdown(anyhow::Result<()>),
+                            TimedOut,
+                        }
+                        let result = {
+                            let processing = process_update(
+                                update,
+                                self_user_id,
+                                client,
+                                runtime,
+                                &mut event_dispatches,
+                                &mut provision_tasks,
+                            );
+                            tokio::pin!(processing);
+                            tokio::select! {
+                                signal = &mut shutdown => ProcessingResult::Shutdown(signal.context("failed to listen for Ctrl-C shutdown signal")),
+                                _ = &mut processing => ProcessingResult::Completed,
+                                _ = async {
+                                    if let Some(deadline) = process_timeout {
+                                        tokio::time::sleep_until(deadline.into()).await;
+                                    }
+                                }, if process_timeout.is_some() => ProcessingResult::TimedOut,
+                            }
+                        };
+                        match result {
+                            ProcessingResult::Completed => {}
+                            ProcessingResult::TimedOut => {
+                                if let Some(response) = runtime.handle_setup_timeout() {
+                                    send_setup_timeout_notification(client, runtime, response).await;
+                                }
+                            }
+                            ProcessingResult::Shutdown(signal) => {
+                                signal?;
+                                event_dispatches.abort_and_drain().await;
+                                provision_tasks.abort_and_drain().await;
+                                stream
+                                    .sync_update_state()
+                                    .await
+                                    .map_err(anyhow::Error::from_boxed)
+                                    .context("failed to synchronize Telegram update state")?;
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+async fn send_setup_timeout_notification(
+    client: &grammers_client::Client,
+    runtime: &mut RuntimeState,
+    response: crate::response::Response,
+) {
+    match client
+        .send_message(
+            &grammers_client::tl::types::InputPeerSelf {},
+            grammers_client::message::InputMessage::new()
+                .text(response.text)
+                .fmt_entities(response.entities),
+        )
+        .await
+    {
+        Ok(message) => runtime.register_setup_notification(message.peer_id(), message.id()),
+        Err(error) => tracing::warn!(
+            event = "setup_timeout_send_failed",
+            error_category = invocation_error_category(&error),
+            "Failed to notify about setup timeout"
+        ),
     }
 }
 

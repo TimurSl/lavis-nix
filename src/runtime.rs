@@ -48,6 +48,7 @@ pub struct RuntimeState {
 }
 
 const MAX_EXPECTED_SELF_EDITS: usize = 128;
+const SETUP_STAGE_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub struct CreatedEventDispatch {
     handle: ExternalManagerHandle,
@@ -139,17 +140,20 @@ enum SetupPhase {
     Idle,
     AwaitingUsername {
         automatic: bool,
+        deadline: Instant,
     },
     AwaitingConfirmation {
         username: UsernameCandidate,
         automatic: bool,
+        attempts: u8,
+        deadline: Instant,
     },
     Running {
         flow: CompanionSetup,
         transport: GrammersTelegramSetup,
         automatic: bool,
         attempts: u8,
-        started_at: Instant,
+        deadline: Instant,
     },
 }
 
@@ -225,6 +229,37 @@ impl RuntimeState {
             setup.botfather_peer == Some(peer)
                 || (authored_by_self && peer == setup.saved_messages_peer && setup.is_active())
         })
+    }
+
+    /// The update loop owns this deadline, so expiry does not depend on an
+    /// unrelated inbound message arriving.
+    pub(crate) fn setup_timeout_deadline(&self) -> Option<Instant> {
+        match &self.setup.as_ref()?.phase {
+            SetupPhase::AwaitingUsername { deadline, .. }
+            | SetupPhase::AwaitingConfirmation { deadline, .. }
+            | SetupPhase::Running { deadline, .. } => Some(*deadline),
+            SetupPhase::Idle => None,
+        }
+    }
+
+    pub(crate) fn handle_setup_timeout(&mut self) -> Option<Response> {
+        let setup = self.setup.as_mut()?;
+        let expired = matches!(
+            setup.phase,
+            SetupPhase::AwaitingUsername { deadline, .. }
+                | SetupPhase::AwaitingConfirmation { deadline, .. }
+                | SetupPhase::Running { deadline, .. }
+                if deadline <= Instant::now()
+        );
+        if !expired {
+            return None;
+        }
+        // Only the ephemeral conversation ends. Persisted bot data remains
+        // available to the repair path.
+        setup.phase = SetupPhase::Idle;
+        Some(Response::plain(
+            "⌛ Настройка остановлена по таймауту. Постоянные данные сохранены; повторите setup или setup repair.".to_owned(),
+        ))
     }
 
     pub(crate) async fn handle_setup_input(
@@ -763,15 +798,18 @@ impl SetupCoordinator {
                 Response::plain("✅ Настройка отменена.".to_owned())
             }
             SetupRequest::Start => {
-                self.phase = SetupPhase::AwaitingUsername { automatic: false };
+                self.phase = SetupPhase::AwaitingUsername {
+                    automatic: false,
+                    deadline: Instant::now() + SETUP_STAGE_TIMEOUT,
+                };
                 Response::plain("🤖 Введите желаемое имя бота, оканчивающееся на _bot.".to_owned())
             }
             SetupRequest::Auto => match setup::generate_candidate() {
-                Ok(username) => self.confirm_or_start(client, username, true, 1).await,
+                Ok(username) => self.confirm_or_start(username, true, 1).await,
                 Err(_) => Response::plain("⚠️ Не удалось сгенерировать имя бота.".to_owned()),
             },
             SetupRequest::Username(value) => match setup::validate_username(value) {
-                Ok(username) => self.confirm_or_start(client, username, false, 1).await,
+                Ok(username) => self.confirm_or_start(username, false, 1).await,
                 Err(_) => Response::plain(
                     "⚠️ Имя должно содержать 5–32 ASCII-букв, цифр или _ и оканчиваться на _bot."
                         .to_owned(),
@@ -787,22 +825,15 @@ impl SetupCoordinator {
 
     async fn confirm_or_start(
         &mut self,
-        client: &Client,
         username: UsernameCandidate,
         automatic: bool,
         attempts: u8,
     ) -> Response {
-        if self.is_active() {
-            return Response::plain(
-                "⚠️ Настройка уже выполняется. Напишите cancel для отмены.".to_owned(),
-            );
-        }
-        if automatic {
-            return self.start_flow(client, username, true, attempts).await;
-        }
         self.phase = SetupPhase::AwaitingConfirmation {
             username: username.clone(),
             automatic,
+            attempts,
+            deadline: Instant::now() + SETUP_STAGE_TIMEOUT,
         };
         Response::plain(format!(
             "📋 План настройки\n\nБудет создан бот @{} с именем «{}».\n\nНапишите confirm для подтверждения или cancel для отмены.",
@@ -820,29 +851,46 @@ impl SetupCoordinator {
             return Response::plain("✅ Настройка отменена.".to_owned());
         }
         match &self.phase {
-            SetupPhase::AwaitingUsername { automatic } => {
-                match setup::validate_username(text.trim()) {
-                    Ok(username) => self.confirm_or_start(client, username, *automatic, 1).await,
-                    Err(_) => Response::plain(
-                        "⚠️ Некорректное имя. Оно должно оканчиваться на _bot.".to_owned(),
-                    ),
-                }
-            }
+            SetupPhase::AwaitingUsername { .. } => self.handle_username_input(text).await,
             SetupPhase::AwaitingConfirmation {
                 username,
                 automatic,
+                attempts,
+                ..
             } => {
                 if matches!(
                     setup::parse_confirmation(text),
                     Some(setup::Confirmation::Confirmed)
                 ) {
-                    self.start_flow(client, username.clone(), *automatic, 1)
+                    self.start_flow(client, username.clone(), *automatic, *attempts)
                         .await
                 } else {
                     Response::plain("⚠️ Напишите confirm или cancel.".to_owned())
                 }
             }
             _ => Response::plain("ℹ️ Настройка ожидает ответ BotFather.".to_owned()),
+        }
+    }
+
+    async fn handle_username_input(&mut self, text: &str) -> Response {
+        let automatic = match &self.phase {
+            SetupPhase::AwaitingUsername { automatic, .. } => *automatic,
+            _ => return Response::plain("ℹ️ Настройка ожидает ответ BotFather.".to_owned()),
+        };
+        let generated = matches!(text.trim().to_ascii_lowercase().as_str(), "-" | "auto");
+        let username = match generated {
+            true => setup::generate_candidate()
+                .map_err(|_| crate::setup::UsernameError::InvalidCharactersOrLength),
+            false => setup::validate_username(text.trim()),
+        };
+        match username {
+            Ok(username) => {
+                self.confirm_or_start(username, automatic || generated, 1)
+                    .await
+            }
+            Err(_) => {
+                Response::plain("⚠️ Некорректное имя. Оно должно оканчиваться на _bot.".to_owned())
+            }
         }
     }
 
@@ -867,7 +915,7 @@ impl SetupCoordinator {
             transport,
             automatic,
             attempts,
-            started_at: Instant::now(),
+            deadline: Instant::now() + SETUP_STAGE_TIMEOUT,
         };
         Response::plain("⏳ Настройка начата. Ожидается ответ BotFather.".to_owned())
     }
@@ -882,21 +930,20 @@ impl SetupCoordinator {
             transport,
             automatic,
             attempts,
-            started_at,
+            deadline,
         } = &mut self.phase
         else {
             return None;
         };
-        if started_at.elapsed() > Duration::from_secs(10 * 60) {
-            self.phase = SetupPhase::Idle;
-            return None;
-        }
         let api = match HttpBotApi::new() {
             Ok(api) => api,
             Err(_) => return None,
         };
         match flow.on_botfather_reply(text, transport, &api).await {
-            Ok(BotFatherProgress::Pending) => None,
+            Ok(BotFatherProgress::Pending) => {
+                *deadline = Instant::now() + SETUP_STAGE_TIMEOUT;
+                None
+            }
             Ok(BotFatherProgress::ProvisionReady) => {
                 let request = flow.provision_request(client.clone());
                 self.phase = SetupPhase::Idle;
@@ -907,14 +954,17 @@ impl SetupCoordinator {
                 self.phase = SetupPhase::Idle;
                 match setup::generate_candidate() {
                     Ok(username) => {
-                        let _ = self.start_flow(client, username, true, next_attempt).await;
+                        let _ = self.confirm_or_start(username, true, next_attempt).await;
                         None
                     }
                     Err(_) => None,
                 }
             }
             Ok(BotFatherProgress::Occupied) => {
-                self.phase = SetupPhase::AwaitingUsername { automatic: false };
+                self.phase = SetupPhase::AwaitingUsername {
+                    automatic: false,
+                    deadline: Instant::now() + SETUP_STAGE_TIMEOUT,
+                };
                 None
             }
             Err(_) => {
@@ -1230,6 +1280,7 @@ mod tests {
         commands::{Action, AliasRequest},
         fastfetch::{FastfetchInputError, FastfetchProfileError, FastfetchResult},
     };
+    use grammers_session::types::PeerId;
     use std::{
         fs,
         path::PathBuf,
@@ -1271,6 +1322,76 @@ mod tests {
             ),
             directory,
         )
+    }
+
+    #[tokio::test]
+    async fn setup_timeout_ends_flow_without_an_inbound_botfather_update() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        let saved_messages = PeerId::user(1).unwrap();
+        let botfather = PeerId::user(2).unwrap();
+        runtime.configure_setup(
+            directory.join("state.json"),
+            directory.join("token"),
+            saved_messages,
+        );
+        runtime.set_setup_botfather_peer(botfather);
+        runtime.setup.as_mut().unwrap().phase = super::SetupPhase::AwaitingUsername {
+            automatic: false,
+            deadline: Instant::now() + Duration::from_millis(1),
+        };
+
+        let deadline = runtime.setup_timeout_deadline().unwrap();
+        tokio::time::sleep_until(deadline.into()).await;
+        let response = runtime.handle_setup_timeout().unwrap();
+
+        assert!(response.text.contains("таймаут"));
+        assert!(runtime.setup_timeout_deadline().is_none());
+        assert!(runtime.setup_protects_message(botfather, false));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn generated_username_has_no_botfather_side_effect_before_confirmation() {
+        let mut setup = super::SetupCoordinator {
+            state_path: PathBuf::new(),
+            token_path: PathBuf::new(),
+            saved_messages_peer: PeerId::user(1).unwrap(),
+            botfather_peer: None,
+            phase: super::SetupPhase::Idle,
+        };
+
+        let response = setup
+            .confirm_or_start(crate::setup::generate_candidate().unwrap(), true, 1)
+            .await;
+
+        assert!(response.text.contains("confirm"));
+        assert!(matches!(
+            setup.phase,
+            super::SetupPhase::AwaitingConfirmation { .. }
+        ));
+        assert!(setup.botfather_peer.is_none());
+    }
+
+    #[tokio::test]
+    async fn interactive_username_transitions_to_confirmation_while_flow_is_active() {
+        let mut setup = super::SetupCoordinator {
+            state_path: PathBuf::new(),
+            token_path: PathBuf::new(),
+            saved_messages_peer: PeerId::user(1).unwrap(),
+            botfather_peer: None,
+            phase: super::SetupPhase::AwaitingUsername {
+                automatic: false,
+                deadline: Instant::now(),
+            },
+        };
+
+        let response = setup.handle_username_input("lavis_test_bot").await;
+
+        assert!(response.text.contains("confirm"));
+        assert!(matches!(
+            setup.phase,
+            super::SetupPhase::AwaitingConfirmation { .. }
+        ));
     }
 
     #[tokio::test]

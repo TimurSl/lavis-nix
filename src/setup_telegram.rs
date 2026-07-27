@@ -16,6 +16,7 @@ use grammers_session::types::{PeerId, PeerRef};
 
 pub const DISPLAY_NAME: &str = "Lavis — really your userbot";
 pub const PROVISION_TIMEOUT: Duration = Duration::from_secs(90);
+pub const BOTFATHER_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The only data a detached provisioning task may own. It deliberately does
 /// not retain runtime or external-module state.
@@ -90,35 +91,43 @@ pub struct GrammersTelegramSetup {
 
 impl GrammersTelegramSetup {
     pub async fn resolve(client: &Client) -> Result<(Self, PeerId), SetupTelegramError> {
-        let peer = client
-            .resolve_username("BotFather")
-            .await
-            .map_err(|_| SetupTelegramError::Telegram)?
-            .ok_or(SetupTelegramError::Telegram)?;
-        let peer_id = peer.id();
-        let reference = peer
-            .to_ref()
-            .await
-            .map_err(|_| SetupTelegramError::Telegram)?
-            .ok_or(SetupTelegramError::Telegram)?;
-        Ok((
-            Self {
-                client: client.clone(),
-                botfather: reference,
-            },
-            peer_id,
-        ))
+        tokio::time::timeout(BOTFATHER_OPERATION_TIMEOUT, async {
+            let peer = client
+                .resolve_username("BotFather")
+                .await
+                .map_err(|_| SetupTelegramError::Telegram)?
+                .ok_or(SetupTelegramError::Telegram)?;
+            let peer_id = peer.id();
+            let reference = peer
+                .to_ref()
+                .await
+                .map_err(|_| SetupTelegramError::Telegram)?
+                .ok_or(SetupTelegramError::Telegram)?;
+            Ok((
+                Self {
+                    client: client.clone(),
+                    botfather: reference,
+                },
+                peer_id,
+            ))
+        })
+        .await
+        .map_err(|_| SetupTelegramError::Timeout)?
     }
 }
 
 impl TelegramSetup for GrammersTelegramSetup {
     fn send_botfather<'a>(&'a self, text: &'a str) -> SetupFuture<'a> {
         Box::pin(async move {
-            self.client
-                .send_message(self.botfather, InputMessage::new().text(text))
-                .await
-                .map(|_| ())
-                .map_err(|_| SetupTelegramError::Telegram)
+            tokio::time::timeout(BOTFATHER_OPERATION_TIMEOUT, async {
+                self.client
+                    .send_message(self.botfather, InputMessage::new().text(text))
+                    .await
+                    .map(|_| ())
+                    .map_err(|_| SetupTelegramError::Telegram)
+            })
+            .await
+            .map_err(|_| SetupTelegramError::Timeout)?
         })
     }
 }
@@ -168,7 +177,11 @@ impl CompanionSetup {
     }
 
     pub async fn start(&mut self, telegram: &impl TelegramSetup) -> Result<(), SetupTelegramError> {
-        telegram.send_botfather("/cancel").await
+        // Clearing a stale BotFather flow is best effort. Its reply is not a
+        // prerequisite for this new conversation.
+        let _ = send_with_timeout(telegram, "/cancel").await;
+        self.step = Step::NewBot;
+        send_with_timeout(telegram, "/newbot").await
     }
 
     /// Consume only a BotFather reply from the resolved BotFather peer.
@@ -181,15 +194,15 @@ impl CompanionSetup {
         match self.step {
             Step::Cancel => {
                 self.step = Step::NewBot;
-                telegram.send_botfather("/newbot").await?;
+                send_with_timeout(telegram, "/newbot").await?;
             }
             Step::NewBot => {
                 self.step = Step::DisplayName;
-                telegram.send_botfather(DISPLAY_NAME).await?;
+                send_with_timeout(telegram, DISPLAY_NAME).await?;
             }
             Step::DisplayName => {
                 self.step = Step::Username;
-                telegram.send_botfather(self.username.display()).await?;
+                send_with_timeout(telegram, self.username.display()).await?;
             }
             Step::Username => {
                 let response = classify_botfather_response(text);
@@ -262,6 +275,23 @@ impl CompanionSetup {
     }
 }
 
+async fn send_with_timeout(
+    telegram: &impl TelegramSetup,
+    text: &str,
+) -> Result<(), SetupTelegramError> {
+    send_with_timeout_for(telegram, text, BOTFATHER_OPERATION_TIMEOUT).await
+}
+
+async fn send_with_timeout_for(
+    telegram: &impl TelegramSetup,
+    text: &str,
+    timeout: Duration,
+) -> Result<(), SetupTelegramError> {
+    tokio::time::timeout(timeout, telegram.send_botfather(text))
+        .await
+        .map_err(|_| SetupTelegramError::Timeout)?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +315,20 @@ mod tests {
                     id: 1,
                     username: "lavis_test_bot".into(),
                 })
+            })
+        }
+    }
+
+    struct CancelFailsTelegram(Arc<Mutex<Vec<String>>>);
+    impl TelegramSetup for CancelFailsTelegram {
+        fn send_botfather<'a>(&'a self, text: &'a str) -> SetupFuture<'a> {
+            self.0.lock().unwrap().push(text.into());
+            Box::pin(async move {
+                if text == "/cancel" {
+                    Err(SetupTelegramError::Telegram)
+                } else {
+                    Ok(())
+                }
             })
         }
     }
@@ -317,5 +361,35 @@ mod tests {
             vec!["/cancel", "/newbot", DISPLAY_NAME, "lavis_test_bot"]
         );
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn starts_newbot_when_optional_cancel_fails() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let telegram = CancelFailsTelegram(sent.clone());
+        let mut setup = CompanionSetup::new(
+            crate::setup::validate_username("lavis_test_bot").unwrap(),
+            PathBuf::new(),
+            PathBuf::new(),
+        );
+
+        setup.start(&telegram).await.unwrap();
+
+        assert_eq!(*sent.lock().unwrap(), ["/cancel", "/newbot"]);
+    }
+
+    #[tokio::test]
+    async fn stuck_botfather_operation_times_out() {
+        struct Stuck;
+        impl TelegramSetup for Stuck {
+            fn send_botfather<'a>(&'a self, _: &'a str) -> SetupFuture<'a> {
+                Box::pin(std::future::pending())
+            }
+        }
+
+        assert_eq!(
+            send_with_timeout_for(&Stuck, "/newbot", Duration::ZERO).await,
+            Err(SetupTelegramError::Timeout)
+        );
     }
 }

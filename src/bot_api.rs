@@ -24,9 +24,15 @@ pub struct BotIdentity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BotApiError {
     Transport,
+    Timeout,
     Rejected,
+    Oversized,
     Malformed,
+    NotBot,
+    WrongUsername,
 }
+
+const MAX_GET_ME_BODY_BYTES: usize = 64 * 1024;
 
 /// Uses Rustls only (via reqwest's `rustls-tls` feature).  Do not include the
 /// request URL in errors: its path contains the token.
@@ -55,32 +61,70 @@ struct GetMeResponse {
 struct GetMeResult {
     id: i64,
     username: Option<String>,
+    is_bot: bool,
+}
+
+fn parse_get_me_body(body: &[u8]) -> Result<BotIdentity, BotApiError> {
+    let body: GetMeResponse = serde_json::from_slice(body).map_err(|_| BotApiError::Malformed)?;
+    let Some(result) = body.ok.then_some(body.result).flatten() else {
+        return Err(BotApiError::Rejected);
+    };
+    if !result.is_bot {
+        return Err(BotApiError::NotBot);
+    }
+    let Some(username) = result.username.filter(|name| !name.is_empty()) else {
+        return Err(BotApiError::WrongUsername);
+    };
+    if crate::setup::validate_username(&username).is_err() {
+        return Err(BotApiError::WrongUsername);
+    }
+    Ok(BotIdentity {
+        id: result.id,
+        username,
+    })
+}
+
+async fn read_bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>, BotApiError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_GET_ME_BODY_BYTES as u64)
+    {
+        return Err(BotApiError::Oversized);
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(request_error)? {
+        append_body_chunk(&mut body, &chunk)?;
+    }
+    Ok(body)
+}
+
+fn append_body_chunk(body: &mut Vec<u8>, chunk: &[u8]) -> Result<(), BotApiError> {
+    if body.len().saturating_add(chunk.len()) > MAX_GET_ME_BODY_BYTES {
+        return Err(BotApiError::Oversized);
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+fn request_error(error: reqwest::Error) -> BotApiError {
+    if error.is_timeout() {
+        BotApiError::Timeout
+    } else {
+        BotApiError::Transport
+    }
 }
 
 impl BotApi for HttpBotApi {
     fn get_me<'a>(&'a self, token: &'a CompanionToken) -> BotApiFuture<'a> {
         Box::pin(async move {
             let url = format!("https://api.telegram.org/bot{}/getMe", token.as_str());
-            let response = self
-                .client
-                .get(url)
-                .send()
-                .await
-                .map_err(|_| BotApiError::Transport)?;
+            let response = self.client.get(url).send().await.map_err(request_error)?;
             if !response.status().is_success() {
                 return Err(BotApiError::Rejected);
             }
-            let body: GetMeResponse = response.json().await.map_err(|_| BotApiError::Malformed)?;
-            let Some(result) = body.ok.then_some(body.result).flatten() else {
-                return Err(BotApiError::Rejected);
-            };
-            let Some(username) = result.username.filter(|name| !name.is_empty()) else {
-                return Err(BotApiError::Malformed);
-            };
-            Ok(BotIdentity {
-                id: result.id,
-                username,
-            })
+            let body = read_bounded_body(response).await?;
+            parse_get_me_body(&body)
         })
     }
 }
@@ -109,5 +153,42 @@ mod tests {
             "lavis_test_bot"
         );
         assert!(!format!("{token:?}").contains(token.as_str()));
+    }
+
+    #[test]
+    fn get_me_response_categories_are_deterministic() {
+        assert_eq!(
+            parse_get_me_body(
+                br#"{"ok":true,"result":{"id":7,"username":"lavis_test_bot","is_bot":true}}"#
+            )
+            .unwrap(),
+            BotIdentity {
+                id: 7,
+                username: "lavis_test_bot".into(),
+            }
+        );
+        assert_eq!(
+            parse_get_me_body(
+                br#"{"ok":true,"result":{"id":7,"username":"lavis_test_bot","is_bot":false}}"#
+            ),
+            Err(BotApiError::NotBot)
+        );
+        assert_eq!(parse_get_me_body(b"not json"), Err(BotApiError::Malformed));
+        assert_eq!(
+            parse_get_me_body(
+                br#"{"ok":true,"result":{"id":7,"username":"lavis_helper","is_bot":true}}"#
+            ),
+            Err(BotApiError::WrongUsername)
+        );
+    }
+
+    #[test]
+    fn oversized_body_is_rejected_before_json_parsing() {
+        let mut body = Vec::new();
+        assert_eq!(
+            append_body_chunk(&mut body, &vec![b'x'; MAX_GET_ME_BODY_BYTES + 1]),
+            Err(BotApiError::Oversized)
+        );
+        assert!(body.is_empty());
     }
 }

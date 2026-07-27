@@ -6,7 +6,7 @@
 
 use std::{future::Future, pin::Pin};
 
-use crate::setup_store::{PersistedSetupState, SetupStore};
+use crate::setup_store::PersistedSetupState;
 
 pub const COMPANION_GROUP_TITLE: &str = "Lavis";
 pub const COMPANION_TOPIC_TITLES: [&str; 3] = ["General", "Logs", "Backups"];
@@ -18,11 +18,18 @@ pub type ProvisionFuture<'a, T> =
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ForumGroup {
     pub id: i64,
+    pub access_hash: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ForumTopic {
     pub id: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BotIdentity {
+    pub id: i64,
+    pub access_hash: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,7 +51,11 @@ impl AdminRights {
 pub struct DialogFolder {
     pub id: i32,
     pub title: String,
+    /// Only regular filters can be owned and repaired by Lavis. Shared
+    /// chatlists are never rewritten, even when they share the display name.
+    pub regular: bool,
     pub included_chat_ids: Vec<i64>,
+    pub pinned_chat_ids: Vec<i64>,
 }
 
 /// Server-derived dialog filter constraints. This module deliberately does not
@@ -66,7 +77,7 @@ pub enum ProvisionError {
     Telegram,
     Storage,
     FolderCapacity,
-    FolderConflict,
+    FolderNameConflict,
 }
 
 /// The only transport surface the staged provisioner needs. The production
@@ -74,7 +85,11 @@ pub enum ProvisionError {
 /// Get/CreateForumTopic, InviteToChannel/EditAdmin, dialog-filter calls, and
 /// GetAppConfig; raw peers stay out of the state machine.
 pub trait ProvisionTransport: Send + Sync {
-    fn get_app_config<'a>(&'a self) -> ProvisionFuture<'a, ()>;
+    fn save_state<'a>(&'a self, state: &'a PersistedSetupState) -> ProvisionFuture<'a, ()>;
+    fn resolve_bot<'a>(&'a self, username: &'a str) -> ProvisionFuture<'a, BotIdentity>;
+    fn start_bot<'a>(&'a self, bot: BotIdentity) -> ProvisionFuture<'a, ()>;
+    fn get_app_config<'a>(&'a self) -> ProvisionFuture<'a, FolderCapacity>;
+    fn get_forum_group<'a>(&'a self, group: ForumGroup) -> ProvisionFuture<'a, Option<ForumGroup>>;
     fn create_forum_group<'a>(&'a self, title: &'a str) -> ProvisionFuture<'a, ForumGroup>;
     fn get_forum_topic<'a>(
         &'a self,
@@ -102,46 +117,30 @@ pub trait ProvisionTransport: Send + Sync {
     fn update_dialog_filters_order<'a>(&'a self, order: Vec<i32>) -> ProvisionFuture<'a, ()>;
 }
 
-pub trait ProvisionStateStore {
-    fn save(&mut self, state: &PersistedSetupState) -> Result<(), ProvisionError>;
-}
-
-impl ProvisionStateStore for SetupStore {
-    fn save(&mut self, state: &PersistedSetupState) -> Result<(), ProvisionError> {
-        self.save_state(state).map_err(|_| ProvisionError::Storage)
-    }
-}
-
 /// Returns a deterministic folder action without mutating Telegram state.
 pub fn plan_folder(
     filters: &[DialogFolder],
     companion_chat_id: i64,
     capacity: FolderCapacity,
+    recorded_id: Option<i32>,
 ) -> Result<FolderPlan, ProvisionError> {
     if let Some(folder) = filters
         .iter()
-        .find(|folder| folder.included_chat_ids.contains(&companion_chat_id))
+        .find(|folder| folder.title == COMPANION_FOLDER_TITLE)
     {
-        if folder.title != COMPANION_FOLDER_TITLE {
-            return Err(ProvisionError::FolderConflict);
+        if recorded_id != Some(folder.id) || !folder.regular {
+            return Err(ProvisionError::FolderNameConflict);
         }
         return Ok(FolderPlan::Existing {
             id: folder.id,
             folder: folder.clone(),
         });
     }
-    if let Some(folder) = filters
+    if filters
         .iter()
-        .find(|folder| folder.title == COMPANION_FOLDER_TITLE)
+        .any(|folder| folder.included_chat_ids.contains(&companion_chat_id))
     {
-        let mut folder = folder.clone();
-        if !folder.included_chat_ids.contains(&companion_chat_id) {
-            folder.included_chat_ids.push(companion_chat_id);
-        }
-        return Ok(FolderPlan::Existing {
-            id: folder.id,
-            folder,
-        });
+        return Err(ProvisionError::FolderNameConflict);
     }
     if filters.len() >= capacity.maximum {
         return Err(ProvisionError::FolderCapacity);
@@ -154,42 +153,62 @@ pub fn plan_folder(
         folder: DialogFolder {
             id,
             title: COMPANION_FOLDER_TITLE.to_owned(),
+            regular: true,
             included_chat_ids: vec![companion_chat_id],
+            pinned_chat_ids: Vec::new(),
         },
     })
 }
 
 pub async fn provision(
     transport: &impl ProvisionTransport,
-    store: &mut impl ProvisionStateStore,
     state: &mut PersistedSetupState,
     bot_username: &str,
-    folder_capacity: FolderCapacity,
 ) -> Result<(), ProvisionError> {
+    let bot = if let (Some(id), Some(access_hash)) = (
+        state.identities.bot_user_id,
+        state.identities.bot_access_hash,
+    ) {
+        BotIdentity { id, access_hash }
+    } else {
+        let bot = transport.resolve_bot(bot_username).await?;
+        state.identities.bot_username = Some(bot_username.to_owned());
+        state.identities.bot_user_id = Some(bot.id);
+        state.identities.bot_access_hash = Some(bot.access_hash);
+        persist(transport, state).await?;
+        bot
+    };
+    if !state.stages.bot_dialog_initialized {
+        transport.start_bot(bot).await?;
+        state.stages.bot_dialog_initialized = true;
+        persist(transport, state).await?;
+    }
     if !state.stages.app_config_checked {
         transport.get_app_config().await?;
         state.stages.app_config_checked = true;
-        persist(store, state)?;
+        persist(transport, state).await?;
     }
 
-    let group = match state.identities.companion_chat_id {
-        Some(id) => ForumGroup { id },
-        None => {
+    let recorded_group = state.identities.companion_chat_id.map(|id| ForumGroup {
+        id,
+        access_hash: state.identities.companion_chat_access_hash,
+    });
+    let group = match recorded_group {
+        Some(group) if transport.get_forum_group(group).await?.is_some() => group,
+        Some(_) | None => {
             let group = transport.create_forum_group(COMPANION_GROUP_TITLE).await?;
             state.identities.companion_chat_id = Some(group.id);
+            state.identities.companion_chat_access_hash = group.access_hash;
             state.stages.forum_group_created = true;
-            persist(store, state)?;
+            persist(transport, state).await?;
             group
         }
     };
 
     if !state.stages.forum_group_created {
         state.stages.forum_group_created = true;
-        persist(store, state)?;
+        persist(transport, state).await?;
     }
-    if state.identities.companion_topic_id.is_none()
-        || state.identities.companion_logs_topic_id.is_none()
-        || state.identities.companion_backups_topic_id.is_none()
     {
         // General is kept as the durable topic identity. The remaining fixed
         // topics are nevertheless always checked before this stage is saved.
@@ -213,35 +232,41 @@ pub async fn provision(
         state.identities.companion_logs_topic_id = logs;
         state.identities.companion_backups_topic_id = backups;
         state.stages.forum_topic_created = true;
-        persist(store, state)?;
+        persist(transport, state).await?;
     }
-    if !state.stages.bot_invited {
-        transport.invite_to_channel(group, bot_username).await?;
-        state.stages.bot_invited = true;
-        persist(store, state)?;
-    }
-    if !state.stages.bot_rights_configured {
-        transport
-            .edit_admin(group, bot_username, AdminRights::MINIMUM)
-            .await?;
-        state.stages.bot_rights_configured = true;
-        persist(store, state)?;
-    }
-    if !state.stages.folder_configured {
+    transport.invite_to_channel(group, bot_username).await?;
+    state.stages.bot_invited = true;
+    persist(transport, state).await?;
+    transport
+        .edit_admin(group, bot_username, AdminRights::MINIMUM)
+        .await?;
+    state.stages.bot_rights_configured = true;
+    persist(transport, state).await?;
+    {
+        let folder_capacity = transport.get_app_config().await?;
         let filters = transport.get_dialog_filters().await?;
-        let plan = match plan_folder(&filters, group.id, folder_capacity) {
+        let plan = match plan_folder(
+            &filters,
+            group.id,
+            folder_capacity,
+            state.identities.companion_folder_id,
+        ) {
             Ok(plan) => plan,
-            Err(ProvisionError::FolderCapacity | ProvisionError::FolderConflict) => {
+            Err(ProvisionError::FolderCapacity | ProvisionError::FolderNameConflict) => {
                 state.status = "completed_without_folder".to_owned();
                 state.stages.companion_configured = true;
-                persist(store, state)?;
+                persist(transport, state).await?;
                 return Ok(());
             }
             Err(error) => return Err(error),
         };
-        let (folder_id, folder) = match plan {
+        let (folder_id, mut folder) = match plan {
             FolderPlan::Existing { id, folder } | FolderPlan::Create { id, folder } => (id, folder),
         };
+        // This is a dedicated operational folder, not a broad query. Keep its
+        // complete selection deterministic so repairs also remove stale peers.
+        folder.included_chat_ids = vec![group.id, bot.id];
+        folder.pinned_chat_ids = vec![group.id, bot.id];
         transport.update_dialog_filter(folder).await?;
         let mut order = filters
             .iter()
@@ -250,20 +275,33 @@ pub async fn provision(
             .collect::<Vec<_>>();
         order.push(folder_id);
         transport.update_dialog_filters_order(order).await?;
+        let verified = transport
+            .get_dialog_filters()
+            .await?
+            .into_iter()
+            .any(|folder| {
+                folder.id == folder_id
+                    && folder.title == COMPANION_FOLDER_TITLE
+                    && folder.included_chat_ids == [group.id, bot.id]
+                    && folder.pinned_chat_ids == [group.id, bot.id]
+            });
+        if !verified {
+            return Err(ProvisionError::Telegram);
+        }
         state.identities.companion_folder_id = Some(folder_id);
         state.stages.folder_configured = true;
         state.stages.companion_configured = true;
         state.status = "companion_configured".to_owned();
-        persist(store, state)?;
+        persist(transport, state).await?;
     }
     Ok(())
 }
 
-fn persist(
-    store: &mut impl ProvisionStateStore,
+async fn persist(
+    transport: &impl ProvisionTransport,
     state: &PersistedSetupState,
 ) -> Result<(), ProvisionError> {
-    store.save(state)
+    transport.save_state(state).await
 }
 
 #[cfg(test)]
@@ -274,7 +312,7 @@ mod tests {
     #[derive(Default)]
     struct Mock {
         calls: Mutex<Vec<String>>,
-        filters: Vec<DialogFolder>,
+        filters: Mutex<Vec<DialogFolder>>,
         topic: Option<ForumTopic>,
     }
     impl Mock {
@@ -283,16 +321,42 @@ mod tests {
         }
     }
     impl ProvisionTransport for Mock {
-        fn get_app_config<'a>(&'a self) -> ProvisionFuture<'a, ()> {
+        fn save_state<'a>(&'a self, _: &'a PersistedSetupState) -> ProvisionFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn resolve_bot<'a>(&'a self, _: &'a str) -> ProvisionFuture<'a, BotIdentity> {
+            Box::pin(async {
+                Ok(BotIdentity {
+                    id: 99,
+                    access_hash: 1,
+                })
+            })
+        }
+        fn start_bot<'a>(&'a self, _: BotIdentity) -> ProvisionFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn get_app_config<'a>(&'a self) -> ProvisionFuture<'a, FolderCapacity> {
             Box::pin(async move {
                 self.call("config");
-                Ok(())
+                Ok(FolderCapacity {
+                    maximum: 100,
+                    first_valid_id: 1000,
+                })
             })
+        }
+        fn get_forum_group<'a>(
+            &'a self,
+            group: ForumGroup,
+        ) -> ProvisionFuture<'a, Option<ForumGroup>> {
+            Box::pin(async move { Ok(Some(group)) })
         }
         fn create_forum_group<'a>(&'a self, _: &'a str) -> ProvisionFuture<'a, ForumGroup> {
             Box::pin(async move {
                 self.call("group");
-                Ok(ForumGroup { id: 42 })
+                Ok(ForumGroup {
+                    id: 42,
+                    access_hash: Some(1),
+                })
             })
         }
         fn get_forum_topic<'a>(
@@ -336,12 +400,18 @@ mod tests {
         fn get_dialog_filters<'a>(&'a self) -> ProvisionFuture<'a, Vec<DialogFolder>> {
             Box::pin(async move {
                 self.call("filters");
-                Ok(self.filters.clone())
+                Ok(self.filters.lock().unwrap().clone())
             })
         }
         fn update_dialog_filter<'a>(&'a self, folder: DialogFolder) -> ProvisionFuture<'a, ()> {
             Box::pin(async move {
-                assert_eq!(folder.included_chat_ids, vec![42]);
+                assert_eq!(folder.included_chat_ids, vec![42, 99]);
+                assert_eq!(folder.pinned_chat_ids, vec![42, 99]);
+                self.filters
+                    .lock()
+                    .unwrap()
+                    .retain(|current| current.id != folder.id);
+                self.filters.lock().unwrap().push(folder);
                 self.call("filter");
                 Ok(())
             })
@@ -354,32 +424,13 @@ mod tests {
             })
         }
     }
-    #[derive(Default)]
-    struct Store(Vec<PersistedSetupState>);
-    impl ProvisionStateStore for Store {
-        fn save(&mut self, state: &PersistedSetupState) -> Result<(), ProvisionError> {
-            self.0.push(state.clone());
-            Ok(())
-        }
-    }
-
     #[tokio::test]
     async fn progresses_idempotently_and_persists_each_stage() {
         let transport = Mock::default();
-        let mut store = Store::default();
         let mut state = PersistedSetupState::default();
-        provision(
-            &transport,
-            &mut store,
-            &mut state,
-            "lavis_test_bot",
-            FolderCapacity {
-                maximum: 100,
-                first_valid_id: 1000,
-            },
-        )
-        .await
-        .unwrap();
+        provision(&transport, &mut state, "lavis_test_bot")
+            .await
+            .unwrap();
         assert_eq!(
             *transport.calls.lock().unwrap(),
             [
@@ -393,26 +444,20 @@ mod tests {
                 "topic",
                 "invite",
                 "rights",
+                "config",
                 "filters",
                 "filter",
-                "order"
+                "order",
+                "filters"
             ]
         );
-        assert_eq!(store.0.len(), 6);
         transport.calls.lock().unwrap().clear();
-        provision(
-            &transport,
-            &mut store,
-            &mut state,
-            "lavis_test_bot",
-            FolderCapacity {
-                maximum: 100,
-                first_valid_id: 1000,
-            },
-        )
-        .await
-        .unwrap();
-        assert!(transport.calls.lock().unwrap().is_empty());
+        provision(&transport, &mut state, "lavis_test_bot")
+            .await
+            .unwrap();
+        let repair_calls = transport.calls.lock().unwrap().clone();
+        assert!(repair_calls.contains(&"get-topic".to_owned()));
+        assert!(repair_calls.contains(&"filters".to_owned()));
     }
 
     #[test]
@@ -421,7 +466,9 @@ mod tests {
         let filters = vec![DialogFolder {
             id: 4,
             title: "Other".into(),
+            regular: true,
             included_chat_ids: vec![group],
+            pinned_chat_ids: vec![],
         }];
         assert_eq!(
             plan_folder(
@@ -431,15 +478,18 @@ mod tests {
                     maximum: 10,
                     first_valid_id: 50,
                 },
+                None,
             ),
-            Err(ProvisionError::FolderConflict)
+            Err(ProvisionError::FolderNameConflict)
         );
         let full = [50, 51]
             .into_iter()
             .map(|id| DialogFolder {
                 id,
                 title: id.to_string(),
+                regular: true,
                 included_chat_ids: vec![],
+                pinned_chat_ids: vec![],
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -450,6 +500,7 @@ mod tests {
                     maximum: full.len(),
                     first_valid_id: 50,
                 },
+                None,
             ),
             Err(ProvisionError::FolderCapacity)
         );
@@ -457,15 +508,38 @@ mod tests {
             &[DialogFolder {
                 id: 2,
                 title: "Other".into(),
+                regular: true,
                 included_chat_ids: vec![],
+                pinned_chat_ids: vec![],
             }],
             group,
             FolderCapacity {
                 maximum: 100,
                 first_valid_id: 50,
             },
+            None,
         )
         .unwrap();
         assert!(matches!(plan, FolderPlan::Create { id: 50, .. }));
+
+        let named_chatlist = DialogFolder {
+            id: 9,
+            title: COMPANION_FOLDER_TITLE.to_owned(),
+            regular: false,
+            included_chat_ids: vec![],
+            pinned_chat_ids: vec![],
+        };
+        assert_eq!(
+            plan_folder(
+                &[named_chatlist],
+                group,
+                FolderCapacity {
+                    maximum: 10,
+                    first_valid_id: 2
+                },
+                Some(9),
+            ),
+            Err(ProvisionError::FolderNameConflict)
+        );
     }
 }
