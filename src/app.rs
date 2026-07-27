@@ -25,6 +25,8 @@ pub mod response;
 pub mod runtime;
 pub mod settings;
 pub mod setup;
+pub mod setup_grammers;
+pub mod setup_provision;
 pub mod setup_store;
 pub mod setup_telegram;
 pub mod updates;

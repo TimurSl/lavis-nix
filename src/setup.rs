@@ -115,11 +115,12 @@ pub enum Confirmation {
     Cancelled,
 }
 
-/// Parses only exact confirmation controls; whitespace and case are significant.
+/// Parses the documented confirmation controls after Unicode whitespace and
+/// ASCII case normalization.
 pub fn parse_confirmation(input: &str) -> Option<Confirmation> {
-    match input {
-        "YES" => Some(Confirmation::Confirmed),
-        "/cancel" => Some(Confirmation::Cancelled),
+    match input.trim().to_ascii_lowercase().as_str() {
+        "confirm" => Some(Confirmation::Confirmed),
+        "cancel" | "/cancel" => Some(Confirmation::Cancelled),
         _ => None,
     }
 }
@@ -521,7 +522,10 @@ mod tests {
 
     #[test]
     fn confirmation_is_exact_and_logging_is_bounded() {
-        assert_eq!(parse_confirmation("YES"), Some(Confirmation::Confirmed));
+        assert_eq!(
+            parse_confirmation(" Confirm "),
+            Some(Confirmation::Confirmed)
+        );
         assert_eq!(parse_confirmation("yes"), None);
         assert_eq!(parse_confirmation("/cancel"), Some(Confirmation::Cancelled));
         assert_eq!(safe_log_candidate("a\n$"), "a??");
@@ -561,7 +565,7 @@ mod tests {
             SetupEvent::DisplayName("Lavis helper".into()),
         );
         let chosen = transition(named.state, SetupEvent::Username("Lavis_Helper_BOT".into()));
-        let sent = transition(chosen.state, SetupEvent::Confirmation("YES".into()));
+        let sent = transition(chosen.state, SetupEvent::Confirmation("confirm".into()));
         let done = transition(
             sent.state,
             SetupEvent::BotFather(classify_botfather_response(

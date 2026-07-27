@@ -1,6 +1,6 @@
 //! Minimal, token-redacting Telegram Bot API validation client.
 
-use std::{future::Future, pin::Pin};
+use std::{future::Future, pin::Pin, time::Duration};
 
 use serde::Deserialize;
 
@@ -38,6 +38,7 @@ impl HttpBotApi {
     pub fn new() -> Result<Self, BotApiError> {
         reqwest::Client::builder()
             .https_only(true)
+            .timeout(Duration::from_secs(20))
             .build()
             .map(|client| Self { client })
             .map_err(|_| BotApiError::Transport)

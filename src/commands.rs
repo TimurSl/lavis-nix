@@ -88,12 +88,12 @@ const COMMAND_SPECS: [CommandDefinition; 8] = [
     CommandDefinition {
         kind: CommandKind::Setup,
         name: "setup",
-        usage: "setup [<username>|auto|status|repair|cancel]",
+        usage: "setup [<username_bot>|auto|status|repair|cancel]",
         summary_ru: "Настроить companion",
         description_ru: "Запускает или управляет настройкой companion для указанного пользователя.",
         examples: &[
             "setup",
-            "setup username",
+            "setup lavis_example_bot",
             "setup auto",
             "setup status",
             "setup repair",

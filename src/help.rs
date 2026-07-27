@@ -786,7 +786,7 @@ mod tests {
         )
         .response;
         assert!(response.text.starts_with("🛠 🦀setup"));
-        assert!(response.text.contains("🦀setup username"));
+        assert!(response.text.contains("🦀setup lavis_example_bot"));
         assert!(response.text.contains("Риск: привилегированная операция"));
     }
 

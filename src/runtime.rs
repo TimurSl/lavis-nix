@@ -10,6 +10,7 @@ use grammers_session::types::PeerId;
 
 use crate::{
     aliases::{Alias, AliasStore, DeleteResult},
+    bot_api::HttpBotApi,
     command::Command,
     commands::{
         Action, AliasRequest, ExternalInvocation, ModulesRequest, PrefixRequest, SetupRequest,
@@ -28,8 +29,9 @@ use crate::{
     help::{render_modules_overview_with_external, render_with_external},
     response::Response,
     settings::{DEFAULT_PREFIX, SettingsStore},
-    setup::{self, SetupState, UsernameCandidate},
-    setup_store::{PersistedSetupState, SetupStore},
+    setup::{self, UsernameCandidate},
+    setup_store::SetupStore,
+    setup_telegram::{BotFatherProgress, CompanionSetup, GrammersTelegramSetup, ProvisionRequest},
 };
 
 pub struct RuntimeState {
@@ -41,6 +43,7 @@ pub struct RuntimeState {
     external_manager: Option<ExternalManagerHandle>,
     external_snapshot: ExternalRuntimeSnapshot,
     expected_self_edits: VecDeque<ExpectedSelfEdit>,
+    setup_notification_ids: VecDeque<(PeerId, i32)>,
     setup: Option<SetupCoordinator>,
 }
 
@@ -125,16 +128,51 @@ struct ExpectedSelfEdit {
 }
 
 struct SetupCoordinator {
-    state: SetupState,
     state_path: PathBuf,
     token_path: PathBuf,
     saved_messages_peer: PeerId,
     botfather_peer: Option<PeerId>,
+    phase: SetupPhase,
+}
+
+enum SetupPhase {
+    Idle,
+    AwaitingUsername {
+        automatic: bool,
+    },
+    AwaitingConfirmation {
+        username: UsernameCandidate,
+        automatic: bool,
+    },
+    Running {
+        flow: CompanionSetup,
+        transport: GrammersTelegramSetup,
+        automatic: bool,
+        attempts: u8,
+        started_at: Instant,
+    },
 }
 
 pub(crate) enum SetupInput {
     Ignored,
-    Consumed(Option<Response>),
+    Consumed {
+        response: Option<Response>,
+        provision: Option<ProvisionRequest>,
+    },
+}
+
+pub(crate) struct RuntimeExecution {
+    pub response: Response,
+    pub provision: Option<ProvisionRequest>,
+}
+
+impl From<Response> for RuntimeExecution {
+    fn from(response: Response) -> Self {
+        Self {
+            response,
+            provision: None,
+        }
+    }
 }
 
 impl RuntimeState {
@@ -153,6 +191,7 @@ impl RuntimeState {
             external_manager: None,
             external_snapshot: ExternalRuntimeSnapshot::new(),
             expected_self_edits: VecDeque::new(),
+            setup_notification_ids: VecDeque::new(),
             setup: None,
         }
     }
@@ -164,11 +203,11 @@ impl RuntimeState {
         saved_messages_peer: PeerId,
     ) {
         self.setup = Some(SetupCoordinator {
-            state: SetupState::Idle,
             state_path,
             token_path,
             saved_messages_peer,
             botfather_peer: None,
+            phase: SetupPhase::Idle,
         });
     }
 
@@ -190,23 +229,35 @@ impl RuntimeState {
 
     pub(crate) async fn handle_setup_input(
         &mut self,
+        client: &Client,
         peer: PeerId,
         authored_by_self: bool,
+        outgoing: bool,
+        edited: bool,
         text: &str,
     ) -> SetupInput {
         let Some(setup) = &mut self.setup else {
             return SetupInput::Ignored;
         };
         if setup.botfather_peer == Some(peer) {
-            // Provisioning is intentionally not implemented until the exact
-            // grammers peer-resolution APIs are verified. Still keep every
-            // resolved BotFather message away from external modules.
-            return SetupInput::Consumed(None);
+            if authored_by_self || outgoing || edited {
+                return SetupInput::Consumed {
+                    response: None,
+                    provision: None,
+                };
+            }
+            return SetupInput::Consumed {
+                response: None,
+                provision: setup.handle_botfather_reply(client, text).await,
+            };
         }
         if !authored_by_self || peer != setup.saved_messages_peer || !setup.is_active() {
             return SetupInput::Ignored;
         }
-        SetupInput::Consumed(Some(setup.handle_input(text).await))
+        SetupInput::Consumed {
+            response: Some(setup.handle_input(client, text).await),
+            provision: None,
+        }
     }
 
     pub async fn set_external_manager(&mut self, handle: ExternalManagerHandle) {
@@ -314,6 +365,25 @@ impl RuntimeState {
 
     pub fn remove_expected_self_edit(&mut self, peer_id: PeerId, message_id: i32, text: &str) {
         self.consume_expected_self_edit(peer_id, message_id, text);
+    }
+
+    pub fn register_setup_notification(&mut self, peer_id: PeerId, message_id: i32) {
+        if self.setup_notification_ids.len() == MAX_EXPECTED_SELF_EDITS {
+            self.setup_notification_ids.pop_front();
+        }
+        self.setup_notification_ids.push_back((peer_id, message_id));
+    }
+
+    pub fn consume_setup_notification(&mut self, peer_id: PeerId, message_id: i32) -> bool {
+        let Some(index) = self
+            .setup_notification_ids
+            .iter()
+            .position(|notification| *notification == (peer_id, message_id))
+        else {
+            return false;
+        };
+        self.setup_notification_ids.remove(index);
+        true
     }
 
     pub fn resolve_alias(&self, name: &str, args: &str) -> Option<Action> {
@@ -448,15 +518,18 @@ impl RuntimeState {
         response
     }
 
-    pub async fn execute(
+    pub(crate) async fn execute(
         &mut self,
         client: &Client,
         action: &Action,
         message_id: i32,
         peer_id: PeerId,
-    ) -> Response {
+    ) -> RuntimeExecution {
         self.recognized_commands = self.recognized_commands.saturating_add(1);
         let prefix = self.prefix().to_owned();
+        if let Action::Setup(request) = action {
+            return self.execute_setup(client, request, peer_id).await;
+        }
         match action {
             Action::Ping => match telegram_ping(client, message_id).await {
                 Ok(latency) => Response::plain(format!("🏓 Pong: {}", format_latency(latency))),
@@ -506,22 +579,28 @@ impl RuntimeState {
             Action::Alias(request) => self.execute_alias(request, &prefix).await,
             Action::Prefix(request) => self.execute_prefix(request).await,
             Action::Modules(request) => self.execute_modules(request, &prefix),
-            Action::Setup(request) => self.execute_setup(request, peer_id).await,
+            Action::Setup(_) => unreachable!("setup actions return before response dispatch"),
             Action::External(invocation) => self.execute_external(invocation).await,
         }
+        .into()
     }
 
-    async fn execute_setup(&mut self, request: &SetupRequest, peer: PeerId) -> Response {
+    async fn execute_setup(
+        &mut self,
+        client: &Client,
+        request: &SetupRequest,
+        peer: PeerId,
+    ) -> RuntimeExecution {
         let Some(setup) = &mut self.setup else {
-            return Response::plain("⚠️ Setup storage is unavailable.".to_owned());
+            return Response::plain("⚠️ Setup storage is unavailable.".to_owned()).into();
         };
         if peer != setup.saved_messages_peer {
             return Response::plain(
                 "⚠️ Setup is available only in Saved Messages. Start it there with the active prefix."
                     .to_owned(),
-            );
+            ).into();
         }
-        setup.handle_command(request).await
+        setup.handle_command(client, request).await
     }
 
     fn execute_modules(&self, request: &ModulesRequest, prefix: &str) -> Response {
@@ -644,95 +723,204 @@ impl RuntimeState {
 
 impl SetupCoordinator {
     fn is_active(&self) -> bool {
-        matches!(
-            self.state,
-            SetupState::AwaitingDisplayName
-                | SetupState::AwaitingUsername { .. }
-                | SetupState::AwaitingConfirmation { .. }
-                | SetupState::AwaitingBotFather { .. }
-        )
+        !matches!(self.phase, SetupPhase::Idle)
     }
 
-    async fn handle_command(&mut self, request: &SetupRequest) -> Response {
+    async fn handle_command(
+        &mut self,
+        client: &Client,
+        request: &SetupRequest,
+    ) -> RuntimeExecution {
+        if matches!(
+            request,
+            SetupRequest::Start | SetupRequest::Auto | SetupRequest::Username(_)
+        ) {
+            if self.is_active() {
+                return Response::plain(
+                    "⚠️ Настройка уже выполняется. Напишите cancel для отмены.".to_owned(),
+                )
+                .into();
+            }
+            if self.has_created_bot().await {
+                return Response::plain(
+                    "ℹ️ Бот уже создан. Используйте setup repair для восстановления workspace."
+                        .to_owned(),
+                )
+                .into();
+            }
+        }
+        if matches!(request, SetupRequest::Repair) {
+            return self.repair(client).await;
+        }
         match request {
             SetupRequest::Status => self.status().await,
             SetupRequest::Cancel => {
                 if !self.is_active() {
-                    return Response::plain("ℹ️ No active setup interaction to cancel.".to_owned());
+                    return Response::plain("ℹ️ Нет активной настройки для отмены.".to_owned())
+                        .into();
                 }
-                self.state = SetupState::Cancelled;
-                Response::plain("✅ Setup cancelled.".to_owned())
+                self.phase = SetupPhase::Idle;
+                Response::plain("✅ Настройка отменена.".to_owned())
             }
-            SetupRequest::Start | SetupRequest::Auto => match setup::generate_candidate() {
-                Ok(username) => self.plan(username),
-                Err(_) => Response::plain("⚠️ Could not generate a setup username.".to_owned()),
+            SetupRequest::Start => {
+                self.phase = SetupPhase::AwaitingUsername { automatic: false };
+                Response::plain("🤖 Введите желаемое имя бота, оканчивающееся на _bot.".to_owned())
+            }
+            SetupRequest::Auto => match setup::generate_candidate() {
+                Ok(username) => self.confirm_or_start(client, username, true, 1).await,
+                Err(_) => Response::plain("⚠️ Не удалось сгенерировать имя бота.".to_owned()),
             },
             SetupRequest::Username(value) => match setup::validate_username(value) {
-                Ok(username) => self.plan(username),
+                Ok(username) => self.confirm_or_start(client, username, false, 1).await,
                 Err(_) => Response::plain(
-                    "⚠️ Username must be 5-32 ASCII letters, digits, or underscores and end with _bot."
+                    "⚠️ Имя должно содержать 5–32 ASCII-букв, цифр или _ и оканчиваться на _bot."
                         .to_owned(),
                 ),
             },
-            SetupRequest::Repair => Response::plain(
-                "ℹ️ Repair is not available until companion provisioning is implemented.".to_owned(),
-            ),
+            SetupRequest::Repair => unreachable!("repair returns a provisioning request"),
             SetupRequest::Invalid => Response::plain(
-                "⚠️ Usage: setup [start|auto|<username_bot>|status|repair|cancel]".to_owned(),
+                "⚠️ Использование: setup [auto|<username_bot>|status|repair|cancel]".to_owned(),
             ),
         }
+        .into()
     }
 
-    fn plan(&mut self, username: UsernameCandidate) -> Response {
+    async fn confirm_or_start(
+        &mut self,
+        client: &Client,
+        username: UsernameCandidate,
+        automatic: bool,
+        attempts: u8,
+    ) -> Response {
         if self.is_active() {
             return Response::plain(
-                "⚠️ A setup interaction is already active. Reply YES or /cancel.".to_owned(),
+                "⚠️ Настройка уже выполняется. Напишите cancel для отмены.".to_owned(),
             );
         }
-        self.state = SetupState::AwaitingConfirmation {
-            display_name: "Lavis companion".to_owned(),
+        if automatic {
+            return self.start_flow(client, username, true, attempts).await;
+        }
+        self.phase = SetupPhase::AwaitingConfirmation {
             username: username.clone(),
+            automatic,
         };
         Response::plain(format!(
-            "📋 Setup plan\n\nA BotFather request would create @{} after confirmation. No request has been sent.\n\nReply exactly YES to confirm, or /cancel.",
-            username.display()
+            "📋 План настройки\n\nБудет создан бот @{} с именем «{}».\n\nНапишите confirm для подтверждения или cancel для отмены.",
+            username.display(),
+            crate::setup_telegram::DISPLAY_NAME
         ))
     }
 
-    async fn handle_input(&mut self, text: &str) -> Response {
-        if text == "/cancel" {
-            self.state = SetupState::Cancelled;
-            return Response::plain("✅ Setup cancelled.".to_owned());
+    async fn handle_input(&mut self, client: &Client, text: &str) -> Response {
+        if matches!(
+            setup::parse_confirmation(text),
+            Some(setup::Confirmation::Cancelled)
+        ) {
+            self.phase = SetupPhase::Idle;
+            return Response::plain("✅ Настройка отменена.".to_owned());
         }
-        let SetupState::AwaitingConfirmation { username, .. } = &self.state else {
-            return Response::plain("ℹ️ Setup is waiting for its next supported input.".to_owned());
+        match &self.phase {
+            SetupPhase::AwaitingUsername { automatic } => {
+                match setup::validate_username(text.trim()) {
+                    Ok(username) => self.confirm_or_start(client, username, *automatic, 1).await,
+                    Err(_) => Response::plain(
+                        "⚠️ Некорректное имя. Оно должно оканчиваться на _bot.".to_owned(),
+                    ),
+                }
+            }
+            SetupPhase::AwaitingConfirmation {
+                username,
+                automatic,
+            } => {
+                if matches!(
+                    setup::parse_confirmation(text),
+                    Some(setup::Confirmation::Confirmed)
+                ) {
+                    self.start_flow(client, username.clone(), *automatic, 1)
+                        .await
+                } else {
+                    Response::plain("⚠️ Напишите confirm или cancel.".to_owned())
+                }
+            }
+            _ => Response::plain("ℹ️ Настройка ожидает ответ BotFather.".to_owned()),
+        }
+    }
+
+    async fn start_flow(
+        &mut self,
+        client: &Client,
+        username: UsernameCandidate,
+        automatic: bool,
+        attempts: u8,
+    ) -> Response {
+        let Ok((transport, peer)) = GrammersTelegramSetup::resolve(client).await else {
+            return Response::plain("⚠️ Не удалось связаться с BotFather.".to_owned());
         };
-        if text != "YES" {
-            return Response::plain("⚠️ Reply exactly YES or /cancel.".to_owned());
+        let mut flow =
+            CompanionSetup::new(username, self.state_path.clone(), self.token_path.clone());
+        if flow.start(&transport).await.is_err() {
+            return Response::plain("⚠️ Не удалось начать диалог с BotFather.".to_owned());
         }
-        let username = username.clone();
-        // Do not send to BotFather: the exact client resolution/send APIs have
-        // not been verified. Persist only a non-secret post-confirmation marker.
-        self.state = SetupState::Failed;
-        let state_path = self.state_path.clone();
-        let token_path = self.token_path.clone();
-        match tokio::task::spawn_blocking(move || {
-            let mut store = SetupStore::new(state_path, token_path);
-            let mut state = PersistedSetupState::default();
-            state.status = "confirmed".to_owned();
-            state.identities.bot_username = Some(username.normalized().to_owned());
-            store.save_state(&state)
-        })
-        .await
-        {
-            Ok(Ok(())) => Response::plain(
-                "ℹ️ Setup was confirmed, but BotFather provisioning is not available in this build. No BotFather request was sent."
-                    .to_owned(),
-            ),
-            Ok(Err(_)) | Err(_) => Response::plain(
-                "⚠️ Setup was confirmed, but local status could not be saved safely. No BotFather request was sent."
-                    .to_owned(),
-            ),
+        self.botfather_peer = Some(peer);
+        self.phase = SetupPhase::Running {
+            flow,
+            transport,
+            automatic,
+            attempts,
+            started_at: Instant::now(),
+        };
+        Response::plain("⏳ Настройка начата. Ожидается ответ BotFather.".to_owned())
+    }
+
+    async fn handle_botfather_reply(
+        &mut self,
+        client: &Client,
+        text: &str,
+    ) -> Option<ProvisionRequest> {
+        let SetupPhase::Running {
+            flow,
+            transport,
+            automatic,
+            attempts,
+            started_at,
+        } = &mut self.phase
+        else {
+            return None;
+        };
+        if started_at.elapsed() > Duration::from_secs(10 * 60) {
+            self.phase = SetupPhase::Idle;
+            return None;
+        }
+        let api = match HttpBotApi::new() {
+            Ok(api) => api,
+            Err(_) => return None,
+        };
+        match flow.on_botfather_reply(text, transport, &api).await {
+            Ok(BotFatherProgress::Pending) => None,
+            Ok(BotFatherProgress::ProvisionReady) => {
+                let request = flow.provision_request(client.clone());
+                self.phase = SetupPhase::Idle;
+                Some(request)
+            }
+            Ok(BotFatherProgress::Occupied) if *automatic && *attempts < 10 => {
+                let next_attempt = *attempts + 1;
+                self.phase = SetupPhase::Idle;
+                match setup::generate_candidate() {
+                    Ok(username) => {
+                        let _ = self.start_flow(client, username, true, next_attempt).await;
+                        None
+                    }
+                    Err(_) => None,
+                }
+            }
+            Ok(BotFatherProgress::Occupied) => {
+                self.phase = SetupPhase::AwaitingUsername { automatic: false };
+                None
+            }
+            Err(_) => {
+                self.phase = SetupPhase::Idle;
+                None
+            }
         }
     }
 
@@ -760,6 +948,56 @@ impl SetupCoordinator {
                 "⚠️ Setup status is unavailable because local state could not be read safely."
                     .to_owned(),
             ),
+        }
+    }
+
+    async fn has_created_bot(&self) -> bool {
+        let state_path = self.state_path.clone();
+        let token_path = self.token_path.clone();
+        matches!(
+            tokio::task::spawn_blocking(move || SetupStore::new(state_path, token_path).load_state()).await,
+            Ok(Ok(state)) if state.stages.bot_created && state.identities.bot_username.is_some()
+        )
+    }
+
+    async fn repair(&self, client: &Client) -> RuntimeExecution {
+        let state_path = self.state_path.clone();
+        let token_path = self.token_path.clone();
+        let loaded = tokio::task::spawn_blocking({
+            let state_path = state_path.clone();
+            let token_path = token_path.clone();
+            move || SetupStore::new(state_path, token_path).load_state()
+        })
+        .await;
+        let username = match loaded {
+            Ok(Ok(state)) => match state.identities.bot_username {
+                Some(username) => username,
+                None => {
+                    return Response::plain(
+                        "⚠️ Для восстановления не найдено имя бота.".to_owned(),
+                    )
+                    .into();
+                }
+            },
+            Ok(Err(crate::error::SetupStoreError::NotFound)) => {
+                return Response::plain("⚠️ Нет сохранённого состояния настройки.".to_owned())
+                    .into();
+            }
+            Ok(Err(_)) | Err(_) => {
+                return Response::plain(
+                    "⚠️ Состояние настройки нельзя безопасно прочитать.".to_owned(),
+                )
+                .into();
+            }
+        };
+        RuntimeExecution {
+            response: Response::plain("⏳ Восстановление companion workspace начато.".to_owned()),
+            provision: Some(ProvisionRequest::new(
+                client.clone(),
+                state_path,
+                token_path,
+                username,
+            )),
         }
     }
 }

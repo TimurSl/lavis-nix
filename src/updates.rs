@@ -5,16 +5,18 @@ use grammers_client::{
     update::{Message, Update},
 };
 use grammers_session::types::PeerId;
-use std::future::Future;
+use std::{future::Future, time::Duration};
 use tokio::task::JoinSet;
 
 use crate::{
     command::parse,
     commands::{Action, dispatch},
     runtime::{CreatedEventDispatchResult, RuntimeState, invocation_error_category},
+    setup_telegram::{ProvisionOutcome, ProvisionRequest},
 };
 
 const MAX_EVENT_DISPATCH_TASKS: usize = 32;
+const PROVISION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct EventDispatches {
     tasks: JoinSet<()>,
@@ -23,6 +25,40 @@ struct EventDispatches {
 enum UpdateOrEvent<U> {
     Update(U),
     Event(Option<Result<(), tokio::task::JoinError>>),
+}
+
+struct ProvisionTasks {
+    tasks: JoinSet<ProvisionOutcome>,
+}
+
+impl ProvisionTasks {
+    fn new() -> Self {
+        Self {
+            tasks: JoinSet::new(),
+        }
+    }
+    fn try_spawn(&mut self, request: ProvisionRequest) -> bool {
+        self.try_spawn_task(request.run())
+    }
+
+    fn try_spawn_task(
+        &mut self,
+        task: impl Future<Output = ProvisionOutcome> + Send + 'static,
+    ) -> bool {
+        if !self.tasks.is_empty() {
+            return false;
+        }
+        self.tasks.spawn(task);
+        true
+    }
+    async fn abort_and_drain(&mut self) {
+        self.tasks.abort_all();
+        let _ = tokio::time::timeout(PROVISION_SHUTDOWN_TIMEOUT, async {
+            while let Some(result) = self.tasks.join_next().await {
+                if let Err(error) = result { tracing::debug!(event = "provision_task_join_failed", error = %error, "Provision task stopped"); }
+            }
+        }).await;
+    }
 }
 
 impl EventDispatches {
@@ -76,18 +112,27 @@ pub async fn run(
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
     let mut event_dispatches = EventDispatches::new();
+    let mut provision_tasks = ProvisionTasks::new();
 
     loop {
         tokio::select! {
             signal = &mut shutdown => {
                 signal.context("failed to listen for Ctrl-C shutdown signal")?;
                 event_dispatches.abort_and_drain().await;
+                provision_tasks.abort_and_drain().await;
                 stream
                     .sync_update_state()
                     .await
                     .map_err(anyhow::Error::from_boxed)
                     .context("failed to synchronize Telegram update state")?;
                 return Ok(());
+            }
+            provision = provision_tasks.tasks.join_next(), if !provision_tasks.tasks.is_empty() => {
+                match provision {
+                    Some(Ok(outcome)) => send_provision_completion(client, runtime, outcome).await,
+                    Some(Err(error)) => tracing::warn!(event = "provision_task_join_failed", error = %error, "Provision task failed"),
+                    None => {}
+                }
             }
             next = event_dispatches.next_update_or_event(stream.next()) => {
                 match next {
@@ -97,6 +142,7 @@ pub async fn run(
                     UpdateOrEvent::Update(update) => {
                         if update.is_err() {
                             event_dispatches.abort_and_drain().await;
+                            provision_tasks.abort_and_drain().await;
                         }
                         let update = update.context("Telegram update stream ended or failed")?;
                         process_update(
@@ -105,6 +151,7 @@ pub async fn run(
                             client,
                             runtime,
                             &mut event_dispatches,
+                            &mut provision_tasks,
                         ).await;
                     }
                 }
@@ -119,6 +166,7 @@ async fn process_update(
     client: &grammers_client::Client,
     runtime: &mut RuntimeState,
     event_dispatches: &mut EventDispatches,
+    provision_tasks: &mut ProvisionTasks,
 ) {
     let (message, edited) = match update {
         Update::NewMessage(message) => (message, false),
@@ -127,6 +175,9 @@ async fn process_update(
     };
     let message_id = message.id();
     let peer_id = message.peer_id();
+    if runtime.consume_setup_notification(peer_id, message_id) {
+        return;
+    }
     if edited && runtime.consume_expected_self_edit(peer_id, message_id, message.text()) {
         tracing::debug!(
             event = "command_self_edit_suppressed",
@@ -153,11 +204,31 @@ async fn process_update(
         None
     } else {
         match runtime
-            .handle_setup_input(peer_id, authored_by_self, message.text())
+            .handle_setup_input(
+                client,
+                peer_id,
+                authored_by_self,
+                outgoing,
+                edited,
+                message.text(),
+            )
             .await
         {
             crate::runtime::SetupInput::Ignored => None,
-            crate::runtime::SetupInput::Consumed(response) => Some(response),
+            crate::runtime::SetupInput::Consumed {
+                response,
+                provision,
+            } => {
+                if let Some(request) = provision
+                    && !provision_tasks.try_spawn(request)
+                {
+                    tracing::warn!(
+                        event = "provision_task_skipped",
+                        "Provisioning already runs"
+                    );
+                }
+                response
+            }
         }
     };
     let setup_protected = matches!(&action, Some(Action::Setup(_)))
@@ -191,11 +262,11 @@ async fn process_update(
         }
     }
 
-    if let Some(Some(response)) = setup_input {
-        let rendered_text = response.text;
+    if let Some(response) = setup_input.as_ref().filter(|_| authored_by_self) {
+        let rendered_text = response.text.clone();
         let input = grammers_client::message::InputMessage::new()
             .text(rendered_text.clone())
-            .fmt_entities(response.entities);
+            .fmt_entities(response.entities.clone());
         runtime.register_expected_self_edit(peer_id, message_id, rendered_text.clone());
         if let Err(error) = message.edit(input).await {
             runtime.remove_expected_self_edit(peer_id, message_id, &rendered_text);
@@ -206,6 +277,10 @@ async fn process_update(
                 "Failed to edit setup input"
             );
         }
+        return;
+    }
+    if setup_input.is_some() {
+        // BotFather replies are setup-private but are not ours to edit.
         return;
     }
 
@@ -227,11 +302,19 @@ async fn process_update(
         "Matched authenticated command"
     );
 
-    let response = runtime.execute(client, &action, message_id, peer_id).await;
-    let rendered_text = response.text;
+    let execution = runtime.execute(client, &action, message_id, peer_id).await;
+    if let Some(request) = execution.provision
+        && !provision_tasks.try_spawn(request)
+    {
+        tracing::warn!(
+            event = "provision_task_skipped",
+            "Provisioning already runs"
+        );
+    }
+    let rendered_text = execution.response.text;
     let input = grammers_client::message::InputMessage::new()
         .text(rendered_text.clone())
-        .fmt_entities(response.entities);
+        .fmt_entities(execution.response.entities);
     runtime.register_expected_self_edit(peer_id, message_id, rendered_text.clone());
     match message.edit(input).await {
         Ok(()) => {
@@ -287,6 +370,37 @@ async fn handle_event_dispatch(message: Message, result: CreatedEventDispatchRes
                 error_category = invocation_error_category(&error),
                 "External reaction action failed"
             );
+        }
+    }
+}
+
+async fn send_provision_completion(
+    client: &grammers_client::Client,
+    runtime: &mut RuntimeState,
+    outcome: ProvisionOutcome,
+) {
+    let text = provision_completion_text(outcome);
+    match client
+        .send_message(
+            &grammers_client::tl::types::InputPeerSelf {},
+            grammers_client::message::InputMessage::new().text(text),
+        )
+        .await
+    {
+        Ok(message) => runtime.register_setup_notification(message.peer_id(), message.id()),
+        Err(error) => tracing::warn!(
+            event = "provision_completion_send_failed",
+            error_category = invocation_error_category(&error),
+            "Failed to send provisioning completion"
+        ),
+    }
+}
+
+fn provision_completion_text(outcome: ProvisionOutcome) -> &'static str {
+    match outcome {
+        ProvisionOutcome::Completed => "✅ Companion workspace настроен.",
+        ProvisionOutcome::Failed => {
+            "⚠️ Восстановление companion workspace не завершено. Повторите позже."
         }
     }
 }
@@ -350,8 +464,8 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::{
-        EventDispatches, MAX_EVENT_DISPATCH_TASKS, UpdateOrEvent, is_self_authored, route,
-        should_prepare_created_event,
+        EventDispatches, MAX_EVENT_DISPATCH_TASKS, ProvisionTasks, UpdateOrEvent, is_self_authored,
+        provision_completion_text, route, should_prepare_created_event,
     };
     use crate::commands::{Action, ExternalInvocation, PrefixRequest};
     use crate::{
@@ -432,6 +546,70 @@ mod tests {
         dispatches.abort_and_drain().await;
         assert!(dispatches.is_empty());
         assert_eq!(received_drop.await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn provisioning_has_capacity_one() {
+        let mut tasks = ProvisionTasks::new();
+        assert!(tasks.try_spawn_task(std::future::pending()));
+        assert!(!tasks.try_spawn_task(std::future::pending()));
+        tasks.abort_and_drain().await;
+        assert!(tasks.tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn updates_continue_while_provisioning_is_pending() {
+        let mut tasks = ProvisionTasks::new();
+        assert!(tasks.try_spawn_task(std::future::pending()));
+        let received = tokio::select! {
+            update = async { "update" } => update,
+            _ = tasks.tasks.join_next() => "provision",
+        };
+        assert_eq!(received, "update");
+        tasks.abort_and_drain().await;
+    }
+
+    #[test]
+    fn provisioning_completion_uses_only_safe_status_text() {
+        assert_eq!(
+            provision_completion_text(crate::setup_telegram::ProvisionOutcome::Completed),
+            "✅ Companion workspace настроен."
+        );
+        assert_eq!(
+            provision_completion_text(crate::setup_telegram::ProvisionOutcome::Failed),
+            "⚠️ Восстановление companion workspace не завершено. Повторите позже."
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_and_drains_provisioning() {
+        struct DropSignal(Option<oneshot::Sender<()>>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        let mut tasks = ProvisionTasks::new();
+        let (dropped, received_drop) = oneshot::channel();
+        assert!(tasks.try_spawn_task(async move {
+            let _signal = DropSignal(Some(dropped));
+            std::future::pending::<crate::setup_telegram::ProvisionOutcome>().await
+        }));
+        tokio::task::yield_now().await;
+        tasks.abort_and_drain().await;
+        assert!(tasks.tasks.is_empty());
+        assert_eq!(received_drop.await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn provisioning_notification_ids_are_not_routed_to_external_modules() {
+        let mut runtime = runtime().await;
+        let peer = PeerId::user(1).unwrap();
+        runtime.register_setup_notification(peer, 42);
+        assert!(runtime.consume_setup_notification(peer, 42));
+        assert!(!runtime.consume_setup_notification(peer, 42));
     }
 
     async fn runtime() -> RuntimeState {

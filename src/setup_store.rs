@@ -45,6 +45,20 @@ impl fmt::Debug for CompanionToken {
 #[serde(deny_unknown_fields)]
 pub struct SetupStages {
     pub bot_created: bool,
+    #[serde(default)]
+    pub bot_dialog_initialized: bool,
+    #[serde(default)]
+    pub app_config_checked: bool,
+    #[serde(default)]
+    pub forum_group_created: bool,
+    #[serde(default)]
+    pub forum_topic_created: bool,
+    #[serde(default)]
+    pub bot_invited: bool,
+    #[serde(default)]
+    pub bot_rights_configured: bool,
+    #[serde(default)]
+    pub folder_configured: bool,
     pub companion_configured: bool,
 }
 
@@ -52,8 +66,22 @@ pub struct SetupStages {
 #[serde(deny_unknown_fields)]
 pub struct SetupIdentities {
     pub bot_username: Option<String>,
+    #[serde(default)]
+    pub bot_user_id: Option<i64>,
+    #[serde(default)]
+    pub bot_access_hash: Option<i64>,
     pub owner_user_id: Option<i64>,
     pub companion_chat_id: Option<i64>,
+    #[serde(default)]
+    pub companion_chat_access_hash: Option<i64>,
+    #[serde(default)]
+    pub companion_topic_id: Option<i32>,
+    #[serde(default)]
+    pub companion_logs_topic_id: Option<i32>,
+    #[serde(default)]
+    pub companion_backups_topic_id: Option<i32>,
+    #[serde(default)]
+    pub companion_folder_id: Option<i32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
