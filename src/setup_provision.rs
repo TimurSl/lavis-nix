@@ -350,6 +350,7 @@ mod tests {
         calls: Mutex<Vec<String>>,
         filters: Mutex<Vec<DialogFolder>>,
         topic: Option<ForumTopic>,
+        start_fails: bool,
     }
     impl Mock {
         fn call(&self, call: &str) {
@@ -361,7 +362,8 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
         fn resolve_bot<'a>(&'a self, _: &'a str) -> ProvisionFuture<'a, BotIdentity> {
-            Box::pin(async {
+            Box::pin(async move {
+                self.call("resolve");
                 Ok(BotIdentity {
                     id: 99,
                     access_hash: 1,
@@ -369,7 +371,13 @@ mod tests {
             })
         }
         fn start_bot<'a>(&'a self, _: BotIdentity) -> ProvisionFuture<'a, ()> {
-            Box::pin(async { Ok(()) })
+            Box::pin(async move {
+                self.call("start");
+                if self.start_fails {
+                    return Err(ProvisionError::StartBot);
+                }
+                Ok(())
+            })
         }
         fn get_app_config<'a>(&'a self) -> ProvisionFuture<'a, FolderCapacity> {
             Box::pin(async move {
@@ -474,6 +482,8 @@ mod tests {
         assert_eq!(
             *transport.calls.lock().unwrap(),
             [
+                "resolve",
+                "start",
                 "config",
                 "group",
                 "get-topic",
@@ -495,8 +505,26 @@ mod tests {
             .await
             .unwrap();
         let repair_calls = transport.calls.lock().unwrap().clone();
+        assert!(!repair_calls.contains(&"resolve".to_owned()));
+        assert!(!repair_calls.contains(&"start".to_owned()));
         assert!(repair_calls.contains(&"get-topic".to_owned()));
         assert!(repair_calls.contains(&"filters".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn start_failure_does_not_stage_bot_dialog_initialization() {
+        let transport = Mock {
+            start_fails: true,
+            ..Mock::default()
+        };
+        let mut state = PersistedSetupState::default();
+
+        assert_eq!(
+            provision(&transport, &mut state, "lavis_test_bot").await,
+            Err(ProvisionError::StartBot)
+        );
+        assert!(!state.stages.bot_dialog_initialized);
+        assert_eq!(*transport.calls.lock().unwrap(), ["resolve", "start"]);
     }
 
     #[test]

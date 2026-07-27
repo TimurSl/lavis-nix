@@ -44,6 +44,7 @@ pub struct RuntimeState {
     external_snapshot: ExternalRuntimeSnapshot,
     expected_self_edits: VecDeque<ExpectedSelfEdit>,
     setup_notification_ids: VecDeque<(PeerId, i32)>,
+    setup_edit_fallback_sources: VecDeque<(PeerId, i32)>,
     setup: Option<SetupCoordinator>,
 }
 
@@ -201,6 +202,7 @@ impl RuntimeState {
             external_snapshot: ExternalRuntimeSnapshot::new(),
             expected_self_edits: VecDeque::new(),
             setup_notification_ids: VecDeque::new(),
+            setup_edit_fallback_sources: VecDeque::new(),
             setup: None,
         }
     }
@@ -424,6 +426,23 @@ impl RuntimeState {
             return false;
         };
         self.setup_notification_ids.remove(index);
+        true
+    }
+
+    /// Claims the one Saved Messages fallback allowed for a setup input source.
+    pub fn claim_setup_edit_fallback(&mut self, peer_id: PeerId, message_id: i32) -> bool {
+        if self
+            .setup_edit_fallback_sources
+            .iter()
+            .any(|source| *source == (peer_id, message_id))
+        {
+            return false;
+        }
+        if self.setup_edit_fallback_sources.len() == MAX_EXPECTED_SELF_EDITS {
+            self.setup_edit_fallback_sources.pop_front();
+        }
+        self.setup_edit_fallback_sources
+            .push_back((peer_id, message_id));
         true
     }
 
@@ -1808,6 +1827,19 @@ mod tests {
         runtime.register_expected_self_edit(peer, 43, "failed response".to_owned());
         runtime.remove_expected_self_edit(peer, 43, "failed response");
         assert!(!runtime.consume_expected_self_edit(peer, 43, "failed response"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn setup_edit_fallback_is_deduplicated_per_source() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        let first_peer = PeerId::user(1).unwrap();
+        let second_peer = PeerId::user(2).unwrap();
+
+        assert!(runtime.claim_setup_edit_fallback(first_peer, 7));
+        assert!(!runtime.claim_setup_edit_fallback(first_peer, 7));
+        assert!(runtime.claim_setup_edit_fallback(first_peer, 8));
+        assert!(runtime.claim_setup_edit_fallback(second_peer, 7));
         fs::remove_dir_all(directory).unwrap();
     }
 

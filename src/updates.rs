@@ -143,7 +143,7 @@ pub async fn run(
                 }
             }, if setup_timeout.is_some() => {
                 if let Some(response) = runtime.handle_setup_timeout() {
-                    send_setup_timeout_notification(client, runtime, response).await;
+                    send_setup_notification(client, runtime, response).await;
                 }
             }
             next = event_dispatches.next_update_or_event(stream.next()) => {
@@ -190,7 +190,7 @@ pub async fn run(
                             ProcessingResult::Completed => {}
                             ProcessingResult::TimedOut => {
                                 if let Some(response) = runtime.handle_setup_timeout() {
-                                    send_setup_timeout_notification(client, runtime, response).await;
+                                    send_setup_notification(client, runtime, response).await;
                                 }
                             }
                             ProcessingResult::Shutdown(signal) => {
@@ -212,7 +212,7 @@ pub async fn run(
     }
 }
 
-async fn send_setup_timeout_notification(
+async fn send_setup_notification(
     client: &grammers_client::Client,
     runtime: &mut RuntimeState,
     response: crate::response::Response,
@@ -228,9 +228,9 @@ async fn send_setup_timeout_notification(
     {
         Ok(message) => runtime.register_setup_notification(message.peer_id(), message.id()),
         Err(error) => tracing::warn!(
-            event = "setup_timeout_send_failed",
+            event = "setup_notification_send_failed",
             error_category = invocation_error_category(&error),
-            "Failed to notify about setup timeout"
+            "Failed to send setup notification"
         ),
     }
 }
@@ -345,19 +345,30 @@ async fn process_update(
         runtime.register_expected_self_edit(peer_id, message_id, rendered_text.clone());
         if let Err(error) = message.edit(input).await {
             runtime.remove_expected_self_edit(peer_id, message_id, &rendered_text);
-            tracing::warn!(
-                event = "setup_input_edit_failed",
-                message_id,
-                error_category = invocation_error_category(&error),
-                "Failed to edit setup input"
-            );
+            if error.is("MESSAGE_NOT_MODIFIED") {
+                tracing::debug!(
+                    event = "setup_input_edit_not_modified",
+                    message_id,
+                    "Setup input already has the requested response"
+                );
+            } else {
+                tracing::warn!(
+                    event = "setup_input_edit_failed",
+                    message_id,
+                    error_category = invocation_error_category(&error),
+                    "Failed to edit setup input"
+                );
+                if runtime.claim_setup_edit_fallback(peer_id, message_id) {
+                    send_setup_notification(client, runtime, response.clone()).await;
+                }
+            }
         }
         return;
     }
     if setup_input.is_some() {
         // BotFather replies are setup-private but are not ours to edit.
         if let Some(response) = setup_input {
-            send_setup_timeout_notification(client, runtime, response).await;
+            send_setup_notification(client, runtime, response).await;
         }
         return;
     }
