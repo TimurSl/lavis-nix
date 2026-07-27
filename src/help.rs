@@ -509,7 +509,7 @@ mod tests {
         assert!(
             response
                 .text
-                .starts_with("🛠 Справка Lavis: 3 модулей, 7 команд")
+                .starts_with("🛠 Справка Lavis: 3 модулей, 8 команд")
         );
         assert!(response.text.find("🧩 core").unwrap() < response.text.find("🖥 system").unwrap());
         assert!(response.text.contains("🦀fastfetch"));
@@ -670,7 +670,7 @@ mod tests {
     async fn modules_overview_matches_help_registry_counts() {
         let rendered = render_modules_overview(".");
         assert!(rendered.response.text.contains("Модули: "));
-        assert!(rendered.response.text.contains("Команды (7)"));
+        assert!(rendered.response.text.contains("Команды (8)"));
         assert!(rendered.response.text.contains(".modules"));
         assert_eq!(rendered.response.entities.len(), 2);
         let grammers_client::tl::enums::MessageEntity::Blockquote(primary) =
@@ -775,6 +775,19 @@ mod tests {
             String::from_utf16(&units[provenance_start..provenance_end]).unwrap(),
             "Это встроенный модуль Lavis. Его нельзя выгрузить или заменить."
         );
+    }
+
+    #[tokio::test]
+    async fn setup_help_uses_the_active_prefix() {
+        let response = render(
+            &HelpRequest::Topic("setup".to_owned()),
+            "🦀",
+            &aliases().await,
+        )
+        .response;
+        assert!(response.text.starts_with("🛠 🦀setup"));
+        assert!(response.text.contains("🦀setup username"));
+        assert!(response.text.contains("Риск: привилегированная операция"));
     }
 
     #[tokio::test]

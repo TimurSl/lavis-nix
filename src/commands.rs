@@ -10,6 +10,7 @@ pub enum CommandKind {
     Alias,
     Prefix,
     Modules,
+    Setup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,7 +36,7 @@ pub struct CommandDefinition {
     pub module: ModuleId,
 }
 
-const COMMAND_SPECS: [CommandDefinition; 7] = [
+const COMMAND_SPECS: [CommandDefinition; 8] = [
     CommandDefinition {
         kind: CommandKind::Help,
         name: "help",
@@ -81,6 +82,25 @@ const COMMAND_SPECS: [CommandDefinition; 7] = [
         examples: &["prefix", "prefix .", "prefix reset"],
         risk: CommandRisk::PersistentStateChange,
         icon: "⚙️",
+        aliasable: false,
+        module: ModuleId::Core,
+    },
+    CommandDefinition {
+        kind: CommandKind::Setup,
+        name: "setup",
+        usage: "setup [<username>|auto|status|repair|cancel]",
+        summary_ru: "Настроить companion",
+        description_ru: "Запускает или управляет настройкой companion для указанного пользователя.",
+        examples: &[
+            "setup",
+            "setup username",
+            "setup auto",
+            "setup status",
+            "setup repair",
+            "setup cancel",
+        ],
+        risk: CommandRisk::Privileged,
+        icon: "🛠",
         aliasable: false,
         module: ModuleId::Core,
     },
@@ -170,6 +190,7 @@ pub enum Action {
     Alias(AliasRequest),
     Prefix(PrefixRequest),
     Modules(ModulesRequest),
+    Setup(SetupRequest),
     External(ExternalInvocation),
 }
 
@@ -208,6 +229,7 @@ impl Action {
             Self::Alias(_) => "alias",
             Self::Prefix(_) => "prefix",
             Self::Modules(_) => "modules",
+            Self::Setup(_) => "setup",
             Self::External(_invocation) => {
                 // Safe bounded string: module_id and command_name are validated ASCII
                 // This is never user-controlled free text
@@ -228,6 +250,7 @@ pub fn dispatch(command: &Command) -> Option<Action> {
         CommandKind::Alias => Some(Action::Alias(parse_alias_request(&command.args))),
         CommandKind::Prefix => Some(Action::Prefix(parse_prefix_request(&command.args))),
         CommandKind::Modules => Some(Action::Modules(parse_modules_request(&command.args))),
+        CommandKind::Setup => Some(Action::Setup(parse_setup_request(&command.args))),
     }
 }
 
@@ -241,11 +264,39 @@ pub enum ModulesRequest {
     Invalid,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetupRequest {
+    Start,
+    Username(String),
+    Auto,
+    Status,
+    Repair,
+    Cancel,
+    Invalid,
+}
+
 fn parse_modules_request(args: &str) -> ModulesRequest {
     if args.trim().is_empty() {
         ModulesRequest::Overview
     } else {
         ModulesRequest::Invalid
+    }
+}
+
+fn parse_setup_request(args: &str) -> SetupRequest {
+    let mut tokens = args.split_whitespace();
+    let Some(token) = tokens.next() else {
+        return SetupRequest::Start;
+    };
+    if tokens.next().is_some() {
+        return SetupRequest::Invalid;
+    }
+    match token {
+        "auto" => SetupRequest::Auto,
+        "status" => SetupRequest::Status,
+        "repair" => SetupRequest::Repair,
+        "cancel" => SetupRequest::Cancel,
+        username => SetupRequest::Username(username.to_owned()),
     }
 }
 
@@ -302,7 +353,7 @@ fn parse_help_request(args: &str) -> HelpRequest {
 #[cfg(test)]
 mod tests {
     use super::{
-        Action, AliasRequest, CommandKind, CommandRisk, HelpRequest, ModulesRequest,
+        Action, AliasRequest, CommandKind, CommandRisk, HelpRequest, ModulesRequest, SetupRequest,
         command_by_kind, command_by_name, commands, dispatch, module_for_command,
     };
     use crate::command::Command;
@@ -398,6 +449,7 @@ mod tests {
                 "modules",
                 "ping",
                 "prefix",
+                "setup",
                 "stats",
                 "fastfetch",
                 "alias"
@@ -458,7 +510,7 @@ mod tests {
                     .iter()
                     .any(|module| module.id == definition.module)
             );
-            if matches!(definition.name, "alias" | "prefix") {
+            if matches!(definition.name, "alias" | "prefix" | "setup") {
                 assert!(!definition.aliasable);
                 continue;
             }
@@ -472,7 +524,7 @@ mod tests {
             commands_for_module(ModuleId::Core)
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
-            ["help", "modules", "ping", "prefix", "stats"]
+            ["help", "modules", "ping", "prefix", "setup", "stats"]
         );
         assert_eq!(
             commands_for_module(ModuleId::System)
@@ -531,10 +583,7 @@ mod tests {
                     && example.split_whitespace().next() == Some(command.name)
             }));
             assert!(module_for_command(command).is_some());
-            assert!(!matches!(
-                command.risk,
-                CommandRisk::ArbitraryProcess | CommandRisk::Privileged
-            ));
+            assert!(!matches!(command.risk, CommandRisk::ArbitraryProcess));
         }
         assert_eq!(
             crate::modules::modules()
@@ -561,6 +610,10 @@ mod tests {
                 CommandRisk::PersistentStateChange
             );
         }
+        let setup = command_by_kind(CommandKind::Setup).unwrap();
+        assert_eq!(setup.risk, CommandRisk::Privileged);
+        assert_eq!(setup.module, ModuleId::Core);
+        assert!(!setup.aliasable);
     }
 
     #[test]
@@ -601,6 +654,36 @@ mod tests {
         assert_eq!(
             prefix("' .'"),
             Some(Action::Prefix(super::PrefixRequest::Invalid))
+        );
+    }
+
+    #[test]
+    fn parses_setup_requests_with_exact_forms() {
+        let setup = |args: &str| {
+            dispatch(&Command {
+                name: "setup".to_owned(),
+                args: args.to_owned(),
+            })
+        };
+
+        assert_eq!(setup("  \t"), Some(Action::Setup(SetupRequest::Start)));
+        assert_eq!(
+            setup("start"),
+            Some(Action::Setup(SetupRequest::Username("start".to_owned())))
+        );
+        assert_eq!(
+            setup("candidate"),
+            Some(Action::Setup(SetupRequest::Username(
+                "candidate".to_owned()
+            )))
+        );
+        assert_eq!(setup("auto"), Some(Action::Setup(SetupRequest::Auto)));
+        assert_eq!(setup("status"), Some(Action::Setup(SetupRequest::Status)));
+        assert_eq!(setup("repair"), Some(Action::Setup(SetupRequest::Repair)));
+        assert_eq!(setup("cancel"), Some(Action::Setup(SetupRequest::Cancel)));
+        assert_eq!(
+            setup("candidate extra"),
+            Some(Action::Setup(SetupRequest::Invalid))
         );
     }
 

@@ -145,7 +145,26 @@ async fn process_update(
         "Received Telegram message update"
     );
 
-    if !edited {
+    // Setup is an exclusive interaction. Determine its routing before the
+    // external message.created projection so neither setup replies nor a
+    // resolved BotFather conversation can reach external modules.
+    let action = route(authored_by_self, message.text(), runtime);
+    let setup_input = if matches!(&action, Some(Action::Setup(_))) {
+        None
+    } else {
+        match runtime
+            .handle_setup_input(peer_id, authored_by_self, message.text())
+            .await
+        {
+            crate::runtime::SetupInput::Ignored => None,
+            crate::runtime::SetupInput::Consumed(response) => Some(response),
+        }
+    };
+    let setup_protected = matches!(&action, Some(Action::Setup(_)))
+        || setup_input.is_some()
+        || runtime.setup_protects_message(peer_id, authored_by_self);
+
+    if should_prepare_created_event(edited, setup_protected) {
         let entities = crate::external_modules::entities::project_custom_emoji_entities(
             message.fmt_entities(),
             0,
@@ -172,7 +191,25 @@ async fn process_update(
         }
     }
 
-    let Some(mut action) = route(authored_by_self, message.text(), runtime) else {
+    if let Some(Some(response)) = setup_input {
+        let rendered_text = response.text;
+        let input = grammers_client::message::InputMessage::new()
+            .text(rendered_text.clone())
+            .fmt_entities(response.entities);
+        runtime.register_expected_self_edit(peer_id, message_id, rendered_text.clone());
+        if let Err(error) = message.edit(input).await {
+            runtime.remove_expected_self_edit(peer_id, message_id, &rendered_text);
+            tracing::warn!(
+                event = "setup_input_edit_failed",
+                message_id,
+                error_category = invocation_error_category(&error),
+                "Failed to edit setup input"
+            );
+        }
+        return;
+    }
+
+    let Some(mut action) = action else {
         return;
     };
     if let Action::External(invocation) = &mut action {
@@ -190,7 +227,7 @@ async fn process_update(
         "Matched authenticated command"
     );
 
-    let response = runtime.execute(client, &action, message_id).await;
+    let response = runtime.execute(client, &action, message_id, peer_id).await;
     let rendered_text = response.text;
     let input = grammers_client::message::InputMessage::new()
         .text(rendered_text.clone())
@@ -217,6 +254,10 @@ async fn process_update(
             );
         }
     }
+}
+
+fn should_prepare_created_event(edited: bool, setup_protected: bool) -> bool {
+    !edited && !setup_protected
 }
 
 async fn handle_event_dispatch(message: Message, result: CreatedEventDispatchResult) {
@@ -310,6 +351,7 @@ mod tests {
 
     use super::{
         EventDispatches, MAX_EVENT_DISPATCH_TASKS, UpdateOrEvent, is_self_authored, route,
+        should_prepare_created_event,
     };
     use crate::commands::{Action, ExternalInvocation, PrefixRequest};
     use crate::{
@@ -415,6 +457,15 @@ mod tests {
             route(authored_by_self, ",ping", &runtime().await),
             Some(Action::Ping)
         );
+    }
+
+    #[test]
+    fn setup_protected_messages_are_not_projected_to_external_created_events() {
+        let action = Action::Setup(crate::commands::SetupRequest::Auto);
+        let setup_protected = matches!(action, Action::Setup(_));
+        assert!(!should_prepare_created_event(false, setup_protected));
+        assert!(!should_prepare_created_event(true, false));
+        assert!(should_prepare_created_event(false, false));
     }
 
     #[tokio::test]

@@ -120,6 +120,23 @@ impl ConfigPaths {
         valid_root(&state_directory)?;
         Ok(state_directory.join("lavis/external-modules.json"))
     }
+
+    pub fn setup_state_path_with<F>(environment: &F) -> Result<PathBuf, ConfigError>
+    where
+        F: Fn(&str) -> Option<OsString>,
+    {
+        Ok(Self::state_session_path_with(environment)?
+            .parent()
+            .ok_or(ConfigError::MissingStateDirectory)?
+            .join("setup.json"))
+    }
+
+    pub fn companion_token_path_with<F>(environment: &F) -> Result<PathBuf, ConfigError>
+    where
+        F: Fn(&str) -> Option<OsString>,
+    {
+        Ok(Self::config_dir_with(environment)?.join("companion-bot.token"))
+    }
 }
 
 impl Config {
@@ -321,6 +338,14 @@ mod tests {
         assert_eq!(
             ConfigPaths::config_dir_with(&home).unwrap(),
             PathBuf::from("/tmp/home/.config/lavis")
+        );
+        assert_eq!(
+            ConfigPaths::setup_state_path_with(&xdg).unwrap(),
+            PathBuf::from("/tmp/state/lavis/setup.json")
+        );
+        assert_eq!(
+            ConfigPaths::companion_token_path_with(&xdg).unwrap(),
+            PathBuf::from("/tmp/config/lavis/companion-bot.token")
         );
     }
 
