@@ -9,6 +9,7 @@ use std::{future::Future, path::PathBuf, pin::Pin, time::Duration};
 use crate::{
     bot_api::{BotApi, BotApiError},
     setup::{BotToken, UsernameCandidate, classify_botfather_response},
+    setup_provision::{CompletedWithoutFolder, ProvisionResult},
     setup_store::{CompanionToken, PersistedSetupState, SetupStore},
 };
 use grammers_client::{Client, message::InputMessage};
@@ -31,7 +32,8 @@ pub struct ProvisionRequest {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProvisionOutcome {
     Completed,
-    Failed,
+    CompletedWithoutFolder(CompletedWithoutFolder),
+    Failed(crate::setup_grammers::ProvisionError),
 }
 
 impl ProvisionRequest {
@@ -61,12 +63,24 @@ impl ProvisionRequest {
         )
         .await
         {
-            Ok(Ok(())) => ProvisionOutcome::Completed,
+            Ok(Ok(result)) => provision_outcome(result),
             Ok(Err(error)) => {
                 tracing::warn!(event = "companion_provision_failed", error_category = ?error, "Companion provisioning failed");
-                ProvisionOutcome::Failed
+                ProvisionOutcome::Failed(error)
             }
-            Err(_) => ProvisionOutcome::Failed,
+            Err(_) => {
+                tracing::warn!(event = "companion_provision_failed", error_category = ?crate::setup_grammers::ProvisionError::Timeout, "Companion provisioning timed out");
+                ProvisionOutcome::Failed(crate::setup_grammers::ProvisionError::Timeout)
+            }
+        }
+    }
+}
+
+fn provision_outcome(result: ProvisionResult) -> ProvisionOutcome {
+    match result {
+        ProvisionResult::Completed => ProvisionOutcome::Completed,
+        ProvisionResult::CompletedWithoutFolder(reason) => {
+            ProvisionOutcome::CompletedWithoutFolder(reason)
         }
     }
 }
@@ -195,6 +209,17 @@ impl CompanionSetup {
         telegram: &impl TelegramSetup,
         bot_api: &impl BotApi,
     ) -> Result<BotFatherProgress, SetupTelegramError> {
+        // These are terminal regardless of which prompt we were waiting for.
+        // BotFather can send them late, including after a delayed `/cancel`.
+        match classify_botfather_response(text) {
+            crate::setup::BotFatherResponse::LimitReached => {
+                return Ok(BotFatherProgress::LimitReached);
+            }
+            crate::setup::BotFatherResponse::FloodWait => {
+                return Ok(BotFatherProgress::FloodWait);
+            }
+            _ => {}
+        }
         match self.step {
             Step::Cancel => {
                 self.step = Step::NewBot;
@@ -272,6 +297,7 @@ impl CompanionSetup {
         let state_path = self.state_path.clone();
         let token_path = self.token_path.clone();
         let username = identity.username;
+        let bot_id = identity.id;
         tokio::task::spawn_blocking(move || {
             let mut store = SetupStore::new(state_path, token_path);
             let mut state = match store.load_state() {
@@ -279,12 +305,16 @@ impl CompanionSetup {
                 Err(crate::error::SetupStoreError::NotFound) => PersistedSetupState::default(),
                 Err(error) => return Err(error),
             };
+            // Persist a verified identity before the credential. A crash can
+            // therefore leave only a repairable, unvalidated identity; it can
+            // never mark a bot validated without its token being durable.
+            state.identities.bot_username = Some(username);
+            state.identities.bot_user_id = Some(bot_id);
+            store.save_state(&state)?;
+            store.save_token(&token)?;
             state.status = "bot_validated".into();
             state.stages.bot_created = true;
-            state.identities.bot_username = Some(username);
-            store
-                .save_token(&token)
-                .and_then(|_| store.save_state(&state))
+            store.save_state(&state)
         })
         .await
         .map_err(|_| SetupTelegramError::Storage)?
@@ -461,5 +491,91 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(*sent.lock().unwrap(), ["/cancel", "/newbot", DISPLAY_NAME]);
+    }
+
+    #[tokio::test]
+    async fn limit_and_flood_are_terminal_before_any_expected_prompt() {
+        let telegram = TelegramMock(Arc::new(Mutex::new(Vec::new())));
+        for step in [Step::NewBot, Step::DisplayName, Step::Username] {
+            for (reply, expected) in [
+                ("Too many bots", BotFatherProgress::LimitReached),
+                ("Try again later", BotFatherProgress::FloodWait),
+            ] {
+                let mut setup = CompanionSetup::new(
+                    crate::setup::validate_username("lavis_test_bot").unwrap(),
+                    PathBuf::new(),
+                    PathBuf::new(),
+                );
+                setup.step = step;
+                assert_eq!(
+                    setup
+                        .on_botfather_reply(reply, &telegram, &BotApiMock)
+                        .await
+                        .unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn validated_identity_is_durable_before_the_validated_stage() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let telegram = TelegramMock(sent);
+        let path =
+            std::env::temp_dir().join(format!("lavis-setup-identity-{}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state_path = path.join("state");
+        let token_path = path.join("token");
+        let mut setup = CompanionSetup::new(
+            crate::setup::validate_username("lavis_test_bot").unwrap(),
+            state_path.clone(),
+            token_path.clone(),
+        );
+        setup.start(&telegram).await.unwrap();
+        for prompt in [
+            "How are we going to call it?",
+            "Now choose a username",
+            "123456:abcdefghijklmnopqrstUVWX",
+        ] {
+            setup
+                .on_botfather_reply(prompt, &telegram, &BotApiMock)
+                .await
+                .unwrap();
+        }
+        let store = SetupStore::new(state_path, token_path);
+        let state = store.load_state().unwrap();
+        assert_eq!(
+            state.identities.bot_username.as_deref(),
+            Some("lavis_test_bot")
+        );
+        assert_eq!(state.identities.bot_user_id, Some(1));
+        assert!(state.stages.bot_created);
+        assert_eq!(state.status, "bot_validated");
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn maps_every_provision_result_without_losing_the_partial_reason() {
+        assert_eq!(
+            provision_outcome(ProvisionResult::Completed),
+            ProvisionOutcome::Completed
+        );
+        assert_eq!(
+            provision_outcome(ProvisionResult::CompletedWithoutFolder(
+                CompletedWithoutFolder::Capacity,
+            )),
+            ProvisionOutcome::CompletedWithoutFolder(CompletedWithoutFolder::Capacity)
+        );
+        assert_eq!(
+            provision_outcome(ProvisionResult::CompletedWithoutFolder(
+                CompletedWithoutFolder::NameOrOwnershipConflict,
+            )),
+            ProvisionOutcome::CompletedWithoutFolder(
+                CompletedWithoutFolder::NameOrOwnershipConflict,
+            )
+        );
     }
 }

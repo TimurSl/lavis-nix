@@ -10,7 +10,7 @@ use grammers_client::{Client, tl};
 use crate::{
     setup_provision::{
         self, AdminRights, BotIdentity, DialogFolder, FolderCapacity, ForumGroup, ForumTopic,
-        ProvisionFuture, ProvisionTransport,
+        ProvisionFuture, ProvisionResult, ProvisionTransport,
     },
     setup_store::{PersistedSetupState, SetupStore},
 };
@@ -37,6 +37,7 @@ pub enum ProvisionError {
     FolderCapacity,
     FolderNameConflict,
     Storage,
+    Timeout,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,7 +53,7 @@ pub async fn production_provision(
     state_path: PathBuf,
     token_path: PathBuf,
     bot_username: &str,
-) -> Result<(), ProvisionError> {
+) -> Result<ProvisionResult, ProvisionError> {
     let mut state = load_state(state_path.clone(), token_path.clone()).await?;
     let bot = match (
         state.identities.bot_user_id,
@@ -89,7 +90,7 @@ async fn run_state_machine(
     transport: &impl ProvisionTransport,
     state: &mut PersistedSetupState,
     bot_username: &str,
-) -> Result<(), ProvisionError> {
+) -> Result<ProvisionResult, ProvisionError> {
     setup_provision::provision(transport, state, bot_username)
         .await
         .map_err(map_provision_error)
@@ -166,11 +167,11 @@ impl ProvisionTransport for GrammersTransport<'_> {
         Box::pin(async move {
             let bot = resolve_bot(self.client, username)
                 .await
-                .map_err(|_| setup_provision::ProvisionError::GroupUnavailable)?;
+                .map_err(|_| setup_provision::ProvisionError::ResolveBot)?;
             *self
                 .bot
                 .lock()
-                .map_err(|_| setup_provision::ProvisionError::Telegram)? = Some(bot);
+                .map_err(|_| setup_provision::ProvisionError::ResolveBot)? = Some(bot);
             Ok(BotIdentity {
                 id: bot.id,
                 access_hash: bot.access_hash,
@@ -189,11 +190,11 @@ impl ProvisionTransport for GrammersTransport<'_> {
                     bot: input_user(bot),
                     peer: input_peer_user(bot),
                     random_id: random_id()
-                        .map_err(|_| setup_provision::ProvisionError::Telegram)?,
+                        .map_err(|_| setup_provision::ProvisionError::StartBot)?,
                     start_param: String::new(),
                 })
                 .await
-                .map_err(|_| setup_provision::ProvisionError::Telegram)?;
+                .map_err(|_| setup_provision::ProvisionError::StartBot)?;
             Ok(())
         })
     }
@@ -206,7 +207,7 @@ impl ProvisionTransport for GrammersTransport<'_> {
                     id: vec![tl::enums::InputUser::UserSelf],
                 })
                 .await
-                .map_err(|_| setup_provision::ProvisionError::Telegram)?
+                .map_err(|_| setup_provision::ProvisionError::AppConfig)?
                 .pop()
             {
                 Some(tl::enums::User::User(user)) => user.premium,
@@ -216,7 +217,7 @@ impl ProvisionTransport for GrammersTransport<'_> {
                 .client
                 .invoke(&tl::functions::help::GetAppConfig { hash: 0 })
                 .await
-                .map_err(|_| setup_provision::ProvisionError::Telegram)?;
+                .map_err(|_| setup_provision::ProvisionError::AppConfig)?;
             Ok(FolderCapacity {
                 maximum: app_config_folder_limit(&config, premium),
                 first_valid_id: 2,
@@ -233,7 +234,7 @@ impl ProvisionTransport for GrammersTransport<'_> {
                     id: vec![input_channel(identity)],
                 })
                 .await
-                .map_err(|_| setup_provision::ProvisionError::Telegram)?;
+                .map_err(|_| setup_provision::ProvisionError::GroupUnavailable)?;
             let available_chats = chats.chats();
             let matching = available_chats.iter().find(
                 |chat| matches!(chat, tl::enums::Chat::Channel(channel) if channel.id == group.id),
@@ -264,9 +265,9 @@ impl ProvisionTransport for GrammersTransport<'_> {
                     ttl_period: None,
                 })
                 .await
-                .map_err(|_| setup_provision::ProvisionError::Telegram)?;
+                .map_err(|_| setup_provision::ProvisionError::CreateGroup)?;
             let identity = extract_created_channel(&updates, title)
-                .ok_or(setup_provision::ProvisionError::Telegram)?;
+                .ok_or(setup_provision::ProvisionError::CreateGroup)?;
             *self
                 .group
                 .lock()
@@ -505,13 +506,21 @@ async fn persist(
 
 fn map_provision_error(error: setup_provision::ProvisionError) -> ProvisionError {
     match error {
+        setup_provision::ProvisionError::ResolveBot => ProvisionError::ResolveBot,
+        setup_provision::ProvisionError::StartBot => ProvisionError::StartBot,
+        setup_provision::ProvisionError::AppConfig => ProvisionError::AppConfig,
+        setup_provision::ProvisionError::CreateGroup => ProvisionError::CreateGroup,
         setup_provision::ProvisionError::Storage => ProvisionError::Storage,
         setup_provision::ProvisionError::GroupUnavailable => ProvisionError::GroupUnavailable,
         setup_provision::ProvisionError::GroupChanged => ProvisionError::GroupChanged,
         setup_provision::ProvisionError::GeneralTopicLookup => ProvisionError::GeneralTopicLookup,
         setup_provision::ProvisionError::FolderCapacity => ProvisionError::FolderCapacity,
         setup_provision::ProvisionError::FolderNameConflict => ProvisionError::FolderNameConflict,
-        setup_provision::ProvisionError::Telegram => ProvisionError::DialogFilters,
+        setup_provision::ProvisionError::CreateTopic => ProvisionError::CreateTopic,
+        setup_provision::ProvisionError::InviteBot => ProvisionError::InviteBot,
+        setup_provision::ProvisionError::PromoteBot => ProvisionError::PromoteBot,
+        setup_provision::ProvisionError::DialogFilters => ProvisionError::DialogFilters,
+        setup_provision::ProvisionError::Telegram => ProvisionError::GroupChanged,
     }
 }
 

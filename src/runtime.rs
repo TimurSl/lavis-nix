@@ -1146,17 +1146,15 @@ impl SetupCoordinator {
                 ));
             }
         };
-        let (username, bot_id) = match (state.identities.bot_username, state.identities.bot_user_id)
-        {
-            (Some(username), Some(bot_id)) if setup::validate_username(&username).is_ok() => {
-                (username, bot_id)
-            }
+        let username = match state.identities.bot_username.as_deref() {
+            Some(username) if setup::validate_username(username).is_ok() => username.to_owned(),
             _ => {
                 return Err(Response::plain(
                     "⚠️ Сохранённая идентификация бота неполна или небезопасна.".to_owned(),
                 ));
             }
         };
+        let persisted_bot_id = state.identities.bot_user_id;
         let identity = match tokio::time::timeout(Duration::from_secs(25), bot_api.get_me(&token))
             .await
         {
@@ -1168,11 +1166,44 @@ impl SetupCoordinator {
                 ));
             }
         };
-        if identity.id != bot_id || !identity.username.eq_ignore_ascii_case(&username) {
+        if !identity.username.eq_ignore_ascii_case(&username) {
             return Err(Response::plain(
                 "⚠️ Сохранённый токен не соответствует сохранённому боту. Восстановление не запущено."
                     .to_owned(),
             ));
+        }
+        if let Some(bot_id) = persisted_bot_id {
+            if identity.id != bot_id {
+                return Err(Response::plain(
+                    "⚠️ Сохранённый токен не соответствует сохранённому боту. Восстановление не запущено."
+                        .to_owned(),
+                ));
+            }
+        } else {
+            let state_path = self.state_path.clone();
+            let token_path = self.token_path.clone();
+            let verified_username = identity.username;
+            let verified_id = identity.id;
+            let expected_username = username.clone();
+            let persisted = tokio::task::spawn_blocking(move || {
+                let mut store = SetupStore::new(state_path, token_path);
+                let mut current = store.load_state()?;
+                if current.identities.bot_username.as_deref() != Some(expected_username.as_str())
+                    || current.identities.bot_user_id.is_some()
+                {
+                    return Err(crate::error::SetupStoreError::Read);
+                }
+                current.identities.bot_username = Some(verified_username);
+                current.identities.bot_user_id = Some(verified_id);
+                store.save_state(&current)
+            })
+            .await;
+            if !matches!(persisted, Ok(Ok(()))) {
+                return Err(Response::plain(
+                    "⚠️ Проверенный идентификатор бота не удалось безопасно сохранить. Восстановление не запущено."
+                        .to_owned(),
+                ));
+            }
         }
         Ok(username)
     }
@@ -1568,6 +1599,61 @@ mod tests {
         assert_eq!(
             setup.repair_preflight(&matching).await.unwrap(),
             "lavis_test_bot"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn repair_migrates_a_missing_id_only_after_matching_token_validation() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        #[cfg(unix)]
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let state_path = directory.join("setup.json");
+        let token_path = directory.join("token");
+        let mut state = PersistedSetupState::default();
+        state.identities.bot_username = Some("lavis_test_bot".to_owned());
+        let mut store = SetupStore::new(state_path.clone(), token_path.clone());
+        store.save_state(&state).unwrap();
+        store
+            .save_token(&CompanionToken::new("123456:abcdefghijklmnopqrstUVWX".to_owned()).unwrap())
+            .unwrap();
+        runtime.configure_setup(
+            state_path.clone(),
+            token_path.clone(),
+            PeerId::user(1).unwrap(),
+        );
+        let setup = runtime.setup.as_ref().unwrap();
+
+        let wrong = RepairBotApi {
+            identity: Ok(BotIdentity {
+                id: 7,
+                username: "other_bot".to_owned(),
+            }),
+        };
+        assert!(setup.repair_preflight(&wrong).await.is_err());
+        assert_eq!(
+            SetupStore::new(state_path.clone(), token_path.clone())
+                .load_state()
+                .unwrap()
+                .identities
+                .bot_user_id,
+            None
+        );
+
+        let matching = RepairBotApi {
+            identity: Ok(BotIdentity {
+                id: 7,
+                username: "LAVIS_TEST_BOT".to_owned(),
+            }),
+        };
+        assert!(setup.repair_preflight(&matching).await.is_ok());
+        assert_eq!(
+            SetupStore::new(state_path, token_path)
+                .load_state()
+                .unwrap()
+                .identities
+                .bot_user_id,
+            Some(7)
         );
         fs::remove_dir_all(directory).unwrap();
     }

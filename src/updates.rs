@@ -457,7 +457,7 @@ async fn send_provision_completion(
     runtime: &mut RuntimeState,
     outcome: ProvisionOutcome,
 ) {
-    let text = provision_completion_text(outcome);
+    let text = provision_completion_text(outcome, runtime.prefix());
     match client
         .send_message(
             &grammers_client::tl::types::InputPeerSelf {},
@@ -474,12 +474,22 @@ async fn send_provision_completion(
     }
 }
 
-fn provision_completion_text(outcome: ProvisionOutcome) -> &'static str {
+fn provision_completion_text(outcome: ProvisionOutcome, prefix: &str) -> String {
     match outcome {
-        ProvisionOutcome::Completed => "✅ Companion workspace настроен.",
-        ProvisionOutcome::Failed => {
-            "⚠️ Восстановление companion workspace не завершено. Повторите позже."
-        }
+        ProvisionOutcome::Completed => "✅ Companion workspace настроен.".to_owned(),
+        ProvisionOutcome::CompletedWithoutFolder(
+            crate::setup_provision::CompletedWithoutFolder::Capacity,
+        ) => format!(
+            "⚠️ Companion workspace настроен без папки: достигнут лимит папок. Повторите {prefix}setup repair позже."
+        ),
+        ProvisionOutcome::CompletedWithoutFolder(
+            crate::setup_provision::CompletedWithoutFolder::NameOrOwnershipConflict,
+        ) => format!(
+            "⚠️ Companion workspace настроен без папки: папка занята или принадлежит другой настройке. Повторите {prefix}setup repair после устранения конфликта."
+        ),
+        ProvisionOutcome::Failed(_) => format!(
+            "⚠️ Восстановление companion workspace не завершено. Повторите {prefix}setup repair позже."
+        ),
     }
 }
 
@@ -650,12 +660,35 @@ mod tests {
     #[test]
     fn provisioning_completion_uses_only_safe_status_text() {
         assert_eq!(
-            provision_completion_text(crate::setup_telegram::ProvisionOutcome::Completed),
+            provision_completion_text(crate::setup_telegram::ProvisionOutcome::Completed, "."),
             "✅ Companion workspace настроен."
         );
         assert_eq!(
-            provision_completion_text(crate::setup_telegram::ProvisionOutcome::Failed),
-            "⚠️ Восстановление companion workspace не завершено. Повторите позже."
+            provision_completion_text(
+                crate::setup_telegram::ProvisionOutcome::CompletedWithoutFolder(
+                    crate::setup_provision::CompletedWithoutFolder::Capacity,
+                ),
+                ".",
+            ),
+            "⚠️ Companion workspace настроен без папки: достигнут лимит папок. Повторите .setup repair позже."
+        );
+        assert_eq!(
+            provision_completion_text(
+                crate::setup_telegram::ProvisionOutcome::CompletedWithoutFolder(
+                    crate::setup_provision::CompletedWithoutFolder::NameOrOwnershipConflict,
+                ),
+                ".",
+            ),
+            "⚠️ Companion workspace настроен без папки: папка занята или принадлежит другой настройке. Повторите .setup repair после устранения конфликта."
+        );
+        assert_eq!(
+            provision_completion_text(
+                crate::setup_telegram::ProvisionOutcome::Failed(
+                    crate::setup_grammers::ProvisionError::InviteBot,
+                ),
+                ".",
+            ),
+            "⚠️ Восстановление companion workspace не завершено. Повторите .setup repair позже."
         );
     }
 

@@ -74,13 +74,35 @@ pub enum FolderPlan {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProvisionError {
+    /// Internal invariant failure; production transport maps remote failures to
+    /// the operation-specific variants below.
     Telegram,
+    ResolveBot,
+    StartBot,
+    AppConfig,
+    CreateGroup,
     Storage,
     GroupUnavailable,
     GroupChanged,
     GeneralTopicLookup,
+    CreateTopic,
+    InviteBot,
+    PromoteBot,
+    DialogFilters,
     FolderCapacity,
     FolderNameConflict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompletedWithoutFolder {
+    Capacity,
+    NameOrOwnershipConflict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProvisionResult {
+    Completed,
+    CompletedWithoutFolder(CompletedWithoutFolder),
 }
 
 /// The only transport surface the staged provisioner needs. The production
@@ -167,7 +189,7 @@ pub async fn provision(
     transport: &impl ProvisionTransport,
     state: &mut PersistedSetupState,
     bot_username: &str,
-) -> Result<(), ProvisionError> {
+) -> Result<ProvisionResult, ProvisionError> {
     let bot = if let (Some(id), Some(access_hash)) = (
         state.identities.bot_user_id,
         state.identities.bot_access_hash,
@@ -263,13 +285,17 @@ pub async fn provision(
                 state.status = "completed_without_folder_capacity".to_owned();
                 state.stages.companion_configured = true;
                 persist(transport, state).await?;
-                return Ok(());
+                return Ok(ProvisionResult::CompletedWithoutFolder(
+                    CompletedWithoutFolder::Capacity,
+                ));
             }
             Err(ProvisionError::FolderNameConflict) => {
                 state.status = "completed_without_folder_name_conflict".to_owned();
                 state.stages.companion_configured = true;
                 persist(transport, state).await?;
-                return Ok(());
+                return Ok(ProvisionResult::CompletedWithoutFolder(
+                    CompletedWithoutFolder::NameOrOwnershipConflict,
+                ));
             }
             Err(error) => return Err(error),
         };
@@ -299,7 +325,7 @@ pub async fn provision(
                     && folder.pinned_chat_ids == [group.id, bot.id]
             });
         if !verified {
-            return Err(ProvisionError::Telegram);
+            return Err(ProvisionError::DialogFilters);
         }
         state.identities.companion_folder_id = Some(folder_id);
         state.stages.folder_configured = true;
@@ -307,7 +333,7 @@ pub async fn provision(
         state.status = "companion_configured".to_owned();
         persist(transport, state).await?;
     }
-    Ok(())
+    Ok(ProvisionResult::Completed)
 }
 
 async fn persist(
