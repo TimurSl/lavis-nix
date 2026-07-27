@@ -124,16 +124,16 @@ impl<'a> GrammersTransport<'a> {
     fn group(&self, group: ForumGroup) -> Result<InputIdentity, setup_provision::ProvisionError> {
         self.group
             .lock()
-            .map_err(|_| setup_provision::ProvisionError::Telegram)?
+            .map_err(|_| setup_provision::ProvisionError::GroupChanged)?
             .filter(|identity| identity.id == group.id)
-            .ok_or(setup_provision::ProvisionError::Telegram)
+            .ok_or(setup_provision::ProvisionError::GroupChanged)
     }
 
     fn input_peer(&self, id: i64) -> Result<tl::enums::InputPeer, setup_provision::ProvisionError> {
         if let Some(group) = self
             .group
             .lock()
-            .map_err(|_| setup_provision::ProvisionError::Telegram)?
+            .map_err(|_| setup_provision::ProvisionError::DialogFilters)?
             .as_ref()
             .copied()
             .filter(|group| group.id == id)
@@ -143,14 +143,14 @@ impl<'a> GrammersTransport<'a> {
         if let Some(bot) = self
             .bot
             .lock()
-            .map_err(|_| setup_provision::ProvisionError::Telegram)?
+            .map_err(|_| setup_provision::ProvisionError::DialogFilters)?
             .as_ref()
             .copied()
             .filter(|bot| bot.id == id)
         {
             return Ok(input_peer_user(bot));
         }
-        Err(setup_provision::ProvisionError::Telegram)
+        Err(setup_provision::ProvisionError::DialogFilters)
     }
 }
 
@@ -271,7 +271,7 @@ impl ProvisionTransport for GrammersTransport<'_> {
             *self
                 .group
                 .lock()
-                .map_err(|_| setup_provision::ProvisionError::Telegram)? = Some(identity);
+                .map_err(|_| setup_provision::ProvisionError::CreateGroup)? = Some(identity);
             Ok(ForumGroup {
                 id: identity.id,
                 access_hash: Some(identity.access_hash),
@@ -297,7 +297,13 @@ impl ProvisionTransport for GrammersTransport<'_> {
                     limit: 20,
                 })
                 .await
-                .map_err(|_| setup_provision::ProvisionError::Telegram)?;
+                .map_err(|_| {
+                    if title == "General" {
+                        setup_provision::ProvisionError::GeneralTopicLookup
+                    } else {
+                        setup_provision::ProvisionError::CreateTopic
+                    }
+                })?;
             Ok(find_topic_id(&topics, title).map(|id| ForumTopic { id }))
         })
     }
@@ -317,11 +323,11 @@ impl ProvisionTransport for GrammersTransport<'_> {
                     icon_color: None,
                     icon_emoji_id: None,
                     random_id: random_id()
-                        .map_err(|_| setup_provision::ProvisionError::Telegram)?,
+                        .map_err(|_| setup_provision::ProvisionError::CreateTopic)?,
                     send_as: None,
                 })
                 .await
-                .map_err(|_| setup_provision::ProvisionError::Telegram)?;
+                .map_err(|_| setup_provision::ProvisionError::CreateTopic)?;
             let topics = self
                 .client
                 .invoke(&tl::functions::messages::GetForumTopics {
@@ -333,10 +339,10 @@ impl ProvisionTransport for GrammersTransport<'_> {
                     limit: 20,
                 })
                 .await
-                .map_err(|_| setup_provision::ProvisionError::Telegram)?;
+                .map_err(|_| setup_provision::ProvisionError::CreateTopic)?;
             find_topic_id(&topics, title)
                 .map(|id| ForumTopic { id })
-                .ok_or(setup_provision::ProvisionError::Telegram)
+                .ok_or(setup_provision::ProvisionError::CreateTopic)
         })
     }
 
@@ -348,7 +354,7 @@ impl ProvisionTransport for GrammersTransport<'_> {
         Box::pin(async move {
             let bot = resolve_bot(self.client, bot_username)
                 .await
-                .map_err(|_| setup_provision::ProvisionError::Telegram)?;
+                .map_err(|_| setup_provision::ProvisionError::InviteBot)?;
             match self
                 .client
                 .invoke(&tl::functions::channels::InviteToChannel {
@@ -359,7 +365,7 @@ impl ProvisionTransport for GrammersTransport<'_> {
             {
                 Ok(_) => Ok(()),
                 Err(error) if error.is("USER_ALREADY_PARTICIPANT") => Ok(()),
-                Err(_) => Err(setup_provision::ProvisionError::Telegram),
+                Err(_) => Err(setup_provision::ProvisionError::InviteBot),
             }
         })
     }
@@ -373,7 +379,7 @@ impl ProvisionTransport for GrammersTransport<'_> {
         Box::pin(async move {
             let bot = resolve_bot(self.client, bot_username)
                 .await
-                .map_err(|_| setup_provision::ProvisionError::Telegram)?;
+                .map_err(|_| setup_provision::ProvisionError::PromoteBot)?;
             self.client
                 .invoke(&tl::functions::channels::EditAdmin {
                     channel: input_channel(self.group(group)?),
@@ -382,7 +388,7 @@ impl ProvisionTransport for GrammersTransport<'_> {
                     rank: None,
                 })
                 .await
-                .map_err(|_| setup_provision::ProvisionError::Telegram)?;
+                .map_err(|_| setup_provision::ProvisionError::PromoteBot)?;
             Ok(())
         })
     }
@@ -393,7 +399,7 @@ impl ProvisionTransport for GrammersTransport<'_> {
                 .client
                 .invoke(&tl::functions::messages::GetDialogFilters {})
                 .await
-                .map_err(|_| setup_provision::ProvisionError::Telegram)?;
+                .map_err(|_| setup_provision::ProvisionError::DialogFilters)?;
             let tl::enums::messages::DialogFilters::Filters(filters) = filters;
             Ok(filters
                 .filters
@@ -458,7 +464,7 @@ impl ProvisionTransport for GrammersTransport<'_> {
                     filter: Some(tl::enums::DialogFilter::Filter(filter)),
                 })
                 .await
-                .map_err(|_| setup_provision::ProvisionError::Telegram)?;
+                .map_err(|_| setup_provision::ProvisionError::DialogFilters)?;
             Ok(())
         })
     }
@@ -468,7 +474,7 @@ impl ProvisionTransport for GrammersTransport<'_> {
             self.client
                 .invoke(&tl::functions::messages::UpdateDialogFiltersOrder { order })
                 .await
-                .map_err(|_| setup_provision::ProvisionError::Telegram)?;
+                .map_err(|_| setup_provision::ProvisionError::DialogFilters)?;
             Ok(())
         })
     }
@@ -520,7 +526,6 @@ fn map_provision_error(error: setup_provision::ProvisionError) -> ProvisionError
         setup_provision::ProvisionError::InviteBot => ProvisionError::InviteBot,
         setup_provision::ProvisionError::PromoteBot => ProvisionError::PromoteBot,
         setup_provision::ProvisionError::DialogFilters => ProvisionError::DialogFilters,
-        setup_provision::ProvisionError::Telegram => ProvisionError::GroupChanged,
     }
 }
 
@@ -686,5 +691,35 @@ fn minimum_rights() -> tl::types::ChatAdminRights {
         delete_stories: false,
         manage_direct_messages: false,
         manage_ranks: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProvisionError, map_provision_error};
+    use crate::setup_provision::ProvisionError as StateError;
+
+    #[test]
+    fn operation_categories_are_not_collapsed_into_dialog_filters() {
+        assert_eq!(
+            map_provision_error(StateError::ResolveBot),
+            ProvisionError::ResolveBot
+        );
+        assert_eq!(
+            map_provision_error(StateError::CreateTopic),
+            ProvisionError::CreateTopic
+        );
+        assert_eq!(
+            map_provision_error(StateError::InviteBot),
+            ProvisionError::InviteBot
+        );
+        assert_eq!(
+            map_provision_error(StateError::PromoteBot),
+            ProvisionError::PromoteBot
+        );
+        assert_eq!(
+            map_provision_error(StateError::DialogFilters),
+            ProvisionError::DialogFilters
+        );
     }
 }

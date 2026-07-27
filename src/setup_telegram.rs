@@ -310,6 +310,7 @@ impl CompanionSetup {
             // never mark a bot validated without its token being durable.
             state.identities.bot_username = Some(username);
             state.identities.bot_user_id = Some(bot_id);
+            state.stages.bot_identity_recorded = true;
             store.save_state(&state)?;
             store.save_token(&token)?;
             state.status = "bot_validated".into();
@@ -552,6 +553,7 @@ mod tests {
             Some("lavis_test_bot")
         );
         assert_eq!(state.identities.bot_user_id, Some(1));
+        assert!(state.stages.bot_identity_recorded);
         assert!(state.stages.bot_created);
         assert_eq!(state.status, "bot_validated");
         let _ = std::fs::remove_dir_all(path);

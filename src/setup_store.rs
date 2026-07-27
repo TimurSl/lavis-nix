@@ -45,6 +45,11 @@ impl fmt::Debug for CompanionToken {
 #[serde(deny_unknown_fields)]
 pub struct SetupStages {
     pub bot_created: bool,
+    /// A Bot API identity was verified and durably recorded before writing the
+    /// separate token file. This prevents a token-write crash from allowing a
+    /// second BotFather creation attempt.
+    #[serde(default)]
+    pub bot_identity_recorded: bool,
     #[serde(default)]
     pub bot_dialog_initialized: bool,
     #[serde(default)]
@@ -343,6 +348,22 @@ mod tests {
         assert!(!state.contains(token.as_str()));
         assert_eq!(store.load_token().unwrap(), token);
         assert!(!format!("{token:?}").contains(token.as_str()));
+    }
+
+    #[test]
+    fn identity_recorded_stage_round_trips_for_partial_credential_recovery() {
+        let (mut store, directory) = store();
+        let mut state = PersistedSetupState::default();
+        state.stages.bot_identity_recorded = true;
+        state.identities.bot_username = Some("lavis_test_bot".to_owned());
+        state.identities.bot_user_id = Some(7);
+        store.save_state(&state).unwrap();
+
+        let loaded = store.load_state().unwrap();
+        assert!(loaded.stages.bot_identity_recorded);
+        assert!(!loaded.stages.bot_created);
+        assert_eq!(loaded.identities.bot_user_id, Some(7));
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[cfg(unix)]

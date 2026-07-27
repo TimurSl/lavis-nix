@@ -74,9 +74,6 @@ pub enum FolderPlan {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProvisionError {
-    /// Internal invariant failure; production transport maps remote failures to
-    /// the operation-specific variants below.
-    Telegram,
     ResolveBot,
     StartBot,
     AppConfig,

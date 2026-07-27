@@ -1089,7 +1089,9 @@ impl SetupCoordinator {
         let token_path = self.token_path.clone();
         matches!(
             tokio::task::spawn_blocking(move || SetupStore::new(state_path, token_path).load_state()).await,
-            Ok(Ok(state)) if state.stages.bot_created && state.identities.bot_username.is_some()
+            Ok(Ok(state))
+                if state.identities.bot_username.is_some()
+                    && state.identities.bot_user_id.is_some()
         )
     }
 
@@ -1655,6 +1657,26 @@ mod tests {
                 .bot_user_id,
             Some(7)
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recorded_identity_blocks_new_botfather_flow_when_token_is_missing() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        #[cfg(unix)]
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let state_path = directory.join("setup.json");
+        let token_path = directory.join("token");
+        let mut state = PersistedSetupState::default();
+        state.identities.bot_username = Some("lavis_test_bot".to_owned());
+        state.identities.bot_user_id = Some(7);
+        state.stages.bot_identity_recorded = true;
+        SetupStore::new(state_path.clone(), token_path.clone())
+            .save_state(&state)
+            .unwrap();
+        runtime.configure_setup(state_path, token_path, PeerId::user(1).unwrap());
+
+        assert!(runtime.setup.as_ref().unwrap().has_created_bot().await);
         fs::remove_dir_all(directory).unwrap();
     }
 
