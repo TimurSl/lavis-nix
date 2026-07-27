@@ -10,6 +10,7 @@ use std::{
 
 pub mod aliases;
 pub mod auth;
+pub mod bot_api;
 pub mod client;
 pub mod command;
 pub mod commands;
@@ -23,6 +24,11 @@ pub mod modules;
 pub mod response;
 pub mod runtime;
 pub mod settings;
+pub mod setup;
+pub mod setup_grammers;
+pub mod setup_provision;
+pub mod setup_store;
+pub mod setup_telegram;
 pub mod updates;
 
 use auth::AuthorizationOutcome;
@@ -243,6 +249,13 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
             aliases,
             settings,
             config.fastfetch_profile_path.clone(),
+        );
+        runtime.configure_setup(
+            config::ConfigPaths::setup_state_path_with(&environment)
+                .context("failed to determine setup state path")?,
+            config::ConfigPaths::companion_token_path_with(&environment)
+                .context("failed to determine companion token path")?,
+            self_user_id,
         );
         runtime.set_external_manager(handle).await;
 

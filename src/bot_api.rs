@@ -1,0 +1,194 @@
+//! Minimal, token-redacting Telegram Bot API validation client.
+
+use std::{future::Future, pin::Pin, time::Duration};
+
+use serde::Deserialize;
+
+use crate::setup_store::CompanionToken;
+
+pub type BotApiFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<BotIdentity, BotApiError>> + Send + 'a>>;
+
+/// The deliberately narrow HTTP boundary used by setup.  Tests can inject this
+/// without opening a socket or ever constructing a token URL.
+pub trait BotApi: Send + Sync {
+    fn get_me<'a>(&'a self, token: &'a CompanionToken) -> BotApiFuture<'a>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BotIdentity {
+    pub id: i64,
+    pub username: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BotApiError {
+    Transport,
+    Timeout,
+    Rejected,
+    Oversized,
+    Malformed,
+    NotBot,
+    WrongUsername,
+}
+
+const MAX_GET_ME_BODY_BYTES: usize = 64 * 1024;
+
+/// Uses Rustls only (via reqwest's `rustls-tls` feature).  Do not include the
+/// request URL in errors: its path contains the token.
+pub struct HttpBotApi {
+    client: reqwest::Client,
+}
+
+impl HttpBotApi {
+    pub fn new() -> Result<Self, BotApiError> {
+        reqwest::Client::builder()
+            .https_only(true)
+            .timeout(Duration::from_secs(20))
+            .build()
+            .map(|client| Self { client })
+            .map_err(|_| BotApiError::Transport)
+    }
+}
+
+#[derive(Deserialize)]
+struct GetMeResponse {
+    ok: bool,
+    result: Option<GetMeResult>,
+}
+
+#[derive(Deserialize)]
+struct GetMeResult {
+    id: i64,
+    username: Option<String>,
+    is_bot: bool,
+}
+
+fn parse_get_me_body(body: &[u8]) -> Result<BotIdentity, BotApiError> {
+    let body: GetMeResponse = serde_json::from_slice(body).map_err(|_| BotApiError::Malformed)?;
+    let Some(result) = body.ok.then_some(body.result).flatten() else {
+        return Err(BotApiError::Rejected);
+    };
+    if !result.is_bot {
+        return Err(BotApiError::NotBot);
+    }
+    let Some(username) = result.username.filter(|name| !name.is_empty()) else {
+        return Err(BotApiError::WrongUsername);
+    };
+    if crate::setup::validate_username(&username).is_err() {
+        return Err(BotApiError::WrongUsername);
+    }
+    Ok(BotIdentity {
+        id: result.id,
+        username,
+    })
+}
+
+async fn read_bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>, BotApiError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_GET_ME_BODY_BYTES as u64)
+    {
+        return Err(BotApiError::Oversized);
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(request_error)? {
+        append_body_chunk(&mut body, &chunk)?;
+    }
+    Ok(body)
+}
+
+fn append_body_chunk(body: &mut Vec<u8>, chunk: &[u8]) -> Result<(), BotApiError> {
+    if body.len().saturating_add(chunk.len()) > MAX_GET_ME_BODY_BYTES {
+        return Err(BotApiError::Oversized);
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+fn request_error(error: reqwest::Error) -> BotApiError {
+    if error.is_timeout() {
+        BotApiError::Timeout
+    } else {
+        BotApiError::Transport
+    }
+}
+
+impl BotApi for HttpBotApi {
+    fn get_me<'a>(&'a self, token: &'a CompanionToken) -> BotApiFuture<'a> {
+        Box::pin(async move {
+            let url = format!("https://api.telegram.org/bot{}/getMe", token.as_str());
+            let response = self.client.get(url).send().await.map_err(request_error)?;
+            if !response.status().is_success() {
+                return Err(BotApiError::Rejected);
+            }
+            let body = read_bounded_body(response).await?;
+            parse_get_me_body(&body)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Mock;
+    impl BotApi for Mock {
+        fn get_me<'a>(&'a self, _: &'a CompanionToken) -> BotApiFuture<'a> {
+            Box::pin(async {
+                Ok(BotIdentity {
+                    id: 7,
+                    username: "lavis_test_bot".into(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_mock_validates_without_network() {
+        let token = CompanionToken::new("123456:abcdefghijklmnopqrstUVWX".into()).unwrap();
+        assert_eq!(
+            Mock.get_me(&token).await.unwrap().username,
+            "lavis_test_bot"
+        );
+        assert!(!format!("{token:?}").contains(token.as_str()));
+    }
+
+    #[test]
+    fn get_me_response_categories_are_deterministic() {
+        assert_eq!(
+            parse_get_me_body(
+                br#"{"ok":true,"result":{"id":7,"username":"lavis_test_bot","is_bot":true}}"#
+            )
+            .unwrap(),
+            BotIdentity {
+                id: 7,
+                username: "lavis_test_bot".into(),
+            }
+        );
+        assert_eq!(
+            parse_get_me_body(
+                br#"{"ok":true,"result":{"id":7,"username":"lavis_test_bot","is_bot":false}}"#
+            ),
+            Err(BotApiError::NotBot)
+        );
+        assert_eq!(parse_get_me_body(b"not json"), Err(BotApiError::Malformed));
+        assert_eq!(
+            parse_get_me_body(
+                br#"{"ok":true,"result":{"id":7,"username":"lavis_helper","is_bot":true}}"#
+            ),
+            Err(BotApiError::WrongUsername)
+        );
+    }
+
+    #[test]
+    fn oversized_body_is_rejected_before_json_parsing() {
+        let mut body = Vec::new();
+        assert_eq!(
+            append_body_chunk(&mut body, &vec![b'x'; MAX_GET_ME_BODY_BYTES + 1]),
+            Err(BotApiError::Oversized)
+        );
+        assert!(body.is_empty());
+    }
+}

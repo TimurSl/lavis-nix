@@ -346,8 +346,13 @@ mod tests {
                             .contains(&ModuleCapability::RestrictedProcess)
                     );
                 }
-                CommandRisk::ArbitraryProcess | CommandRisk::Privileged => {
+                CommandRisk::ArbitraryProcess => {
                     panic!("production command has prohibited risk");
+                }
+                CommandRisk::Privileged => {
+                    assert_eq!(command.name, "setup");
+                    assert_eq!(command.module, ModuleId::Core);
+                    assert!(!command.aliasable);
                 }
             }
         }

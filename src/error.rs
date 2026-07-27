@@ -63,6 +63,36 @@ pub enum CredentialsError {
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
+pub enum SetupStoreError {
+    #[error("companion token is invalid")]
+    InvalidToken,
+    #[error("setup storage was not found")]
+    NotFound,
+    #[error("setup storage is unsafe")]
+    UnsafeStorage,
+    #[error("setup storage is too large")]
+    FileTooLarge,
+    #[error("setup state is malformed")]
+    MalformedState,
+    #[error("setup state version is unsupported")]
+    UnsupportedVersion,
+    #[error("failed to read setup storage")]
+    Read,
+    #[error("failed to create setup storage directory")]
+    CreateDirectory,
+    #[error("failed to create setup storage temporary file")]
+    CreateTemporary,
+    #[error("failed to write setup storage temporary file")]
+    WriteTemporary,
+    #[error("failed to synchronize setup storage temporary file")]
+    SyncTemporary,
+    #[error("failed to synchronize setup storage directory")]
+    SyncDirectory,
+    #[error("failed to replace setup storage file")]
+    Replace,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum SettingsError {
     #[error("settings prefix must be 1–4 visible non-alphabetic characters")]
     InvalidPrefix,

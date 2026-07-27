@@ -10,8 +10,12 @@ use grammers_session::types::PeerId;
 
 use crate::{
     aliases::{Alias, AliasStore, DeleteResult},
+    bot_api::{BotApi, HttpBotApi},
     command::Command,
-    commands::{Action, AliasRequest, ExternalInvocation, ModulesRequest, PrefixRequest, dispatch},
+    commands::{
+        Action, AliasRequest, ExternalInvocation, ModulesRequest, PrefixRequest, SetupRequest,
+        dispatch,
+    },
     error::ExternalError,
     external_modules::manager::{ExternalManagerHandle, ExternalRuntimeSnapshot},
     external_modules::{
@@ -25,6 +29,9 @@ use crate::{
     help::{render_modules_overview_with_external, render_with_external},
     response::Response,
     settings::{DEFAULT_PREFIX, SettingsStore},
+    setup::{self, UsernameCandidate},
+    setup_store::SetupStore,
+    setup_telegram::{BotFatherProgress, CompanionSetup, GrammersTelegramSetup, ProvisionRequest},
 };
 
 pub struct RuntimeState {
@@ -36,9 +43,12 @@ pub struct RuntimeState {
     external_manager: Option<ExternalManagerHandle>,
     external_snapshot: ExternalRuntimeSnapshot,
     expected_self_edits: VecDeque<ExpectedSelfEdit>,
+    setup_notification_ids: VecDeque<(PeerId, i32)>,
+    setup: Option<SetupCoordinator>,
 }
 
 const MAX_EXPECTED_SELF_EDITS: usize = 128;
+const SETUP_STAGE_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub struct CreatedEventDispatch {
     handle: ExternalManagerHandle,
@@ -118,6 +128,62 @@ struct ExpectedSelfEdit {
     text: String,
 }
 
+struct SetupCoordinator {
+    state_path: PathBuf,
+    token_path: PathBuf,
+    saved_messages_peer: PeerId,
+    botfather_peer: Option<PeerId>,
+    phase: SetupPhase,
+}
+
+enum SetupPhase {
+    Idle,
+    AwaitingUsername {
+        automatic: bool,
+        deadline: Instant,
+    },
+    AwaitingConfirmation {
+        username: UsernameCandidate,
+        automatic: bool,
+        attempts: u8,
+        deadline: Instant,
+    },
+    Running {
+        flow: CompanionSetup,
+        transport: GrammersTelegramSetup,
+        automatic: bool,
+        attempts: u8,
+        deadline: Instant,
+    },
+}
+
+pub(crate) enum SetupInput {
+    Ignored,
+    Consumed {
+        response: Option<Response>,
+        provision: Option<ProvisionRequest>,
+    },
+}
+
+struct BotFatherOutcome {
+    response: Option<Response>,
+    provision: Option<ProvisionRequest>,
+}
+
+pub(crate) struct RuntimeExecution {
+    pub response: Response,
+    pub provision: Option<ProvisionRequest>,
+}
+
+impl From<Response> for RuntimeExecution {
+    fn from(response: Response) -> Self {
+        Self {
+            response,
+            provision: None,
+        }
+    }
+}
+
 impl RuntimeState {
     pub fn new(
         started_at: Instant,
@@ -134,6 +200,104 @@ impl RuntimeState {
             external_manager: None,
             external_snapshot: ExternalRuntimeSnapshot::new(),
             expected_self_edits: VecDeque::new(),
+            setup_notification_ids: VecDeque::new(),
+            setup: None,
+        }
+    }
+
+    pub fn configure_setup(
+        &mut self,
+        state_path: PathBuf,
+        token_path: PathBuf,
+        saved_messages_peer: PeerId,
+    ) {
+        self.setup = Some(SetupCoordinator {
+            state_path,
+            token_path,
+            saved_messages_peer,
+            botfather_peer: None,
+            phase: SetupPhase::Idle,
+        });
+    }
+
+    /// Marks a resolved BotFather peer as setup-private. Resolution is kept in
+    /// the update layer because it needs Telegram APIs; this state only guards
+    /// routing once a peer is known.
+    pub fn set_setup_botfather_peer(&mut self, peer: PeerId) {
+        if let Some(setup) = &mut self.setup {
+            setup.botfather_peer = Some(peer);
+        }
+    }
+
+    pub fn setup_protects_message(&self, peer: PeerId, authored_by_self: bool) -> bool {
+        self.setup.as_ref().is_some_and(|setup| {
+            setup.botfather_peer == Some(peer)
+                || (authored_by_self && peer == setup.saved_messages_peer && setup.is_active())
+        })
+    }
+
+    /// The update loop owns this deadline, so expiry does not depend on an
+    /// unrelated inbound message arriving.
+    pub(crate) fn setup_timeout_deadline(&self) -> Option<Instant> {
+        match &self.setup.as_ref()?.phase {
+            SetupPhase::AwaitingUsername { deadline, .. }
+            | SetupPhase::AwaitingConfirmation { deadline, .. }
+            | SetupPhase::Running { deadline, .. } => Some(*deadline),
+            SetupPhase::Idle => None,
+        }
+    }
+
+    pub(crate) fn handle_setup_timeout(&mut self) -> Option<Response> {
+        let setup = self.setup.as_mut()?;
+        let expired = matches!(
+            setup.phase,
+            SetupPhase::AwaitingUsername { deadline, .. }
+                | SetupPhase::AwaitingConfirmation { deadline, .. }
+                | SetupPhase::Running { deadline, .. }
+                if deadline <= Instant::now()
+        );
+        if !expired {
+            return None;
+        }
+        // Only the ephemeral conversation ends. Persisted bot data remains
+        // available to the repair path.
+        setup.phase = SetupPhase::Idle;
+        Some(Response::plain(
+            "⌛ Настройка остановлена по таймауту. Постоянные данные сохранены; повторите setup или setup repair.".to_owned(),
+        ))
+    }
+
+    pub(crate) async fn handle_setup_input(
+        &mut self,
+        client: &Client,
+        peer: PeerId,
+        authored_by_self: bool,
+        outgoing: bool,
+        edited: bool,
+        text: &str,
+    ) -> SetupInput {
+        let Some(setup) = &mut self.setup else {
+            return SetupInput::Ignored;
+        };
+        if setup.botfather_peer == Some(peer) {
+            if authored_by_self || outgoing || edited {
+                return SetupInput::Consumed {
+                    response: None,
+                    provision: None,
+                };
+            }
+            let outcome = setup.handle_botfather_reply(client, text).await;
+            return SetupInput::Consumed {
+                response: outcome.response,
+                provision: outcome.provision,
+            };
+        }
+        if !authored_by_self || peer != setup.saved_messages_peer || !setup.is_active() {
+            return SetupInput::Ignored;
+        }
+        SetupInput::Consumed {
+            response: Some(setup.handle_input(client, text).await),
+            provision: None,
         }
     }
 
@@ -242,6 +406,25 @@ impl RuntimeState {
 
     pub fn remove_expected_self_edit(&mut self, peer_id: PeerId, message_id: i32, text: &str) {
         self.consume_expected_self_edit(peer_id, message_id, text);
+    }
+
+    pub fn register_setup_notification(&mut self, peer_id: PeerId, message_id: i32) {
+        if self.setup_notification_ids.len() == MAX_EXPECTED_SELF_EDITS {
+            self.setup_notification_ids.pop_front();
+        }
+        self.setup_notification_ids.push_back((peer_id, message_id));
+    }
+
+    pub fn consume_setup_notification(&mut self, peer_id: PeerId, message_id: i32) -> bool {
+        let Some(index) = self
+            .setup_notification_ids
+            .iter()
+            .position(|notification| *notification == (peer_id, message_id))
+        else {
+            return false;
+        };
+        self.setup_notification_ids.remove(index);
+        true
     }
 
     pub fn resolve_alias(&self, name: &str, args: &str) -> Option<Action> {
@@ -376,9 +559,18 @@ impl RuntimeState {
         response
     }
 
-    pub async fn execute(&mut self, client: &Client, action: &Action, message_id: i32) -> Response {
+    pub(crate) async fn execute(
+        &mut self,
+        client: &Client,
+        action: &Action,
+        message_id: i32,
+        peer_id: PeerId,
+    ) -> RuntimeExecution {
         self.recognized_commands = self.recognized_commands.saturating_add(1);
         let prefix = self.prefix().to_owned();
+        if let Action::Setup(request) = action {
+            return self.execute_setup(client, request, peer_id).await;
+        }
         match action {
             Action::Ping => match telegram_ping(client, message_id).await {
                 Ok(latency) => Response::plain(format!("🏓 Pong: {}", format_latency(latency))),
@@ -428,8 +620,28 @@ impl RuntimeState {
             Action::Alias(request) => self.execute_alias(request, &prefix).await,
             Action::Prefix(request) => self.execute_prefix(request).await,
             Action::Modules(request) => self.execute_modules(request, &prefix),
+            Action::Setup(_) => unreachable!("setup actions return before response dispatch"),
             Action::External(invocation) => self.execute_external(invocation).await,
         }
+        .into()
+    }
+
+    async fn execute_setup(
+        &mut self,
+        client: &Client,
+        request: &SetupRequest,
+        peer: PeerId,
+    ) -> RuntimeExecution {
+        let Some(setup) = &mut self.setup else {
+            return Response::plain("⚠️ Setup storage is unavailable.".to_owned()).into();
+        };
+        if peer != setup.saved_messages_peer {
+            return Response::plain(
+                "⚠️ Setup is available only in Saved Messages. Start it there with the active prefix."
+                    .to_owned(),
+            ).into();
+        }
+        setup.handle_command(client, request).await
     }
 
     fn execute_modules(&self, request: &ModulesRequest, prefix: &str) -> Response {
@@ -547,6 +759,455 @@ impl RuntimeState {
                 "⚠️ Usage: {prefix}alias [list|add <name> <command> [arguments...]|show <name>|del <name>]"
             )),
         }
+    }
+}
+
+impl SetupCoordinator {
+    fn is_active(&self) -> bool {
+        !matches!(self.phase, SetupPhase::Idle)
+    }
+
+    async fn handle_command(
+        &mut self,
+        client: &Client,
+        request: &SetupRequest,
+    ) -> RuntimeExecution {
+        if matches!(
+            request,
+            SetupRequest::Start | SetupRequest::Auto | SetupRequest::Username(_)
+        ) {
+            if self.is_active() {
+                return Response::plain(
+                    "⚠️ Настройка уже выполняется. Напишите cancel для отмены.".to_owned(),
+                )
+                .into();
+            }
+            if self.has_created_bot().await {
+                return Response::plain(
+                    "ℹ️ Бот уже создан. Используйте setup repair для восстановления workspace."
+                        .to_owned(),
+                )
+                .into();
+            }
+        }
+        if matches!(request, SetupRequest::Repair) {
+            return self.repair(client).await;
+        }
+        match request {
+            SetupRequest::Status => self.status().await,
+            SetupRequest::Cancel => {
+                if !self.is_active() {
+                    return Response::plain("ℹ️ Нет активной настройки для отмены.".to_owned())
+                        .into();
+                }
+                self.phase = SetupPhase::Idle;
+                Response::plain("✅ Настройка отменена.".to_owned())
+            }
+            SetupRequest::Start => {
+                self.phase = SetupPhase::AwaitingUsername {
+                    automatic: false,
+                    deadline: Instant::now() + SETUP_STAGE_TIMEOUT,
+                };
+                Response::plain("🤖 Введите желаемое имя бота, оканчивающееся на _bot.".to_owned())
+            }
+            SetupRequest::Auto => match setup::generate_candidate() {
+                Ok(username) => self.confirm_or_start(username, true, 1).await,
+                Err(_) => Response::plain("⚠️ Не удалось сгенерировать имя бота.".to_owned()),
+            },
+            SetupRequest::Username(value) => match setup::validate_username(value) {
+                Ok(username) => self.confirm_or_start(username, false, 1).await,
+                Err(_) => Response::plain(
+                    "⚠️ Имя должно содержать 5–32 ASCII-букв, цифр или _ и оканчиваться на _bot."
+                        .to_owned(),
+                ),
+            },
+            SetupRequest::Repair => unreachable!("repair returns a provisioning request"),
+            SetupRequest::Invalid => Response::plain(
+                "⚠️ Использование: setup [auto|<username_bot>|status|repair|cancel]".to_owned(),
+            ),
+        }
+        .into()
+    }
+
+    async fn confirm_or_start(
+        &mut self,
+        username: UsernameCandidate,
+        automatic: bool,
+        attempts: u8,
+    ) -> Response {
+        self.phase = SetupPhase::AwaitingConfirmation {
+            username: username.clone(),
+            automatic,
+            attempts,
+            deadline: Instant::now() + SETUP_STAGE_TIMEOUT,
+        };
+        Response::plain(format!(
+            "📋 План настройки\n\nБудет создан бот @{} с именем «{}».\n\nНапишите confirm для подтверждения или cancel для отмены.",
+            username.display(),
+            crate::setup_telegram::DISPLAY_NAME
+        ))
+    }
+
+    async fn handle_input(&mut self, client: &Client, text: &str) -> Response {
+        if matches!(
+            setup::parse_confirmation(text),
+            Some(setup::Confirmation::Cancelled)
+        ) {
+            self.phase = SetupPhase::Idle;
+            return Response::plain("✅ Настройка отменена.".to_owned());
+        }
+        match &self.phase {
+            SetupPhase::AwaitingUsername { .. } => self.handle_username_input(text).await,
+            SetupPhase::AwaitingConfirmation {
+                username,
+                automatic,
+                attempts,
+                ..
+            } => {
+                if matches!(
+                    setup::parse_confirmation(text),
+                    Some(setup::Confirmation::Confirmed)
+                ) {
+                    self.start_flow(client, username.clone(), *automatic, *attempts)
+                        .await
+                } else {
+                    Response::plain("⚠️ Напишите confirm или cancel.".to_owned())
+                }
+            }
+            _ => Response::plain("ℹ️ Настройка ожидает ответ BotFather.".to_owned()),
+        }
+    }
+
+    async fn handle_username_input(&mut self, text: &str) -> Response {
+        let automatic = match &self.phase {
+            SetupPhase::AwaitingUsername { automatic, .. } => *automatic,
+            _ => return Response::plain("ℹ️ Настройка ожидает ответ BotFather.".to_owned()),
+        };
+        let generated = matches!(text.trim().to_ascii_lowercase().as_str(), "-" | "auto");
+        let username = match generated {
+            true => setup::generate_candidate()
+                .map_err(|_| crate::setup::UsernameError::InvalidCharactersOrLength),
+            false => setup::validate_username(text.trim()),
+        };
+        match username {
+            Ok(username) => {
+                self.confirm_or_start(username, automatic || generated, 1)
+                    .await
+            }
+            Err(_) => {
+                Response::plain("⚠️ Некорректное имя. Оно должно оканчиваться на _bot.".to_owned())
+            }
+        }
+    }
+
+    async fn start_flow(
+        &mut self,
+        client: &Client,
+        username: UsernameCandidate,
+        automatic: bool,
+        attempts: u8,
+    ) -> Response {
+        let Ok((transport, peer)) = GrammersTelegramSetup::resolve(client).await else {
+            return Response::plain("⚠️ Не удалось связаться с BotFather.".to_owned());
+        };
+        let mut flow =
+            CompanionSetup::new(username, self.state_path.clone(), self.token_path.clone());
+        if flow.start(&transport).await.is_err() {
+            return Response::plain("⚠️ Не удалось начать диалог с BotFather.".to_owned());
+        }
+        self.botfather_peer = Some(peer);
+        self.phase = SetupPhase::Running {
+            flow,
+            transport,
+            automatic,
+            attempts,
+            deadline: Instant::now() + SETUP_STAGE_TIMEOUT,
+        };
+        Response::plain("⏳ Настройка начата. Ожидается ответ BotFather.".to_owned())
+    }
+
+    async fn handle_botfather_reply(&mut self, client: &Client, text: &str) -> BotFatherOutcome {
+        let SetupPhase::Running {
+            flow,
+            transport,
+            automatic,
+            attempts,
+            deadline,
+        } = &mut self.phase
+        else {
+            return BotFatherOutcome {
+                response: None,
+                provision: None,
+            };
+        };
+        let api = match HttpBotApi::new() {
+            Ok(api) => api,
+            Err(_) => {
+                self.phase = SetupPhase::Idle;
+                return BotFatherOutcome {
+                    response: Some(Response::plain("⚠️ Проверка бота недоступна.".to_owned())),
+                    provision: None,
+                };
+            }
+        };
+        match flow.on_botfather_reply(text, transport, &api).await {
+            Ok(BotFatherProgress::Pending) => {
+                *deadline = Instant::now() + SETUP_STAGE_TIMEOUT;
+                BotFatherOutcome {
+                    response: None,
+                    provision: None,
+                }
+            }
+            Ok(BotFatherProgress::ProvisionReady) => {
+                let request = flow.provision_request(client.clone());
+                self.phase = SetupPhase::Idle;
+                BotFatherOutcome {
+                    response: None,
+                    provision: Some(request),
+                }
+            }
+            Ok(BotFatherProgress::UsernameOccupied) if *automatic && *attempts < 10 => {
+                let next_attempt = *attempts + 1;
+                self.phase = SetupPhase::Idle;
+                match setup::generate_candidate() {
+                    Ok(username) => {
+                        let response = self.start_flow(client, username, true, next_attempt).await;
+                        BotFatherOutcome {
+                            response: Some(response),
+                            provision: None,
+                        }
+                    }
+                    Err(_) => BotFatherOutcome {
+                        response: Some(Response::plain(
+                            "⚠️ Не удалось сгенерировать новое имя бота.".to_owned(),
+                        )),
+                        provision: None,
+                    },
+                }
+            }
+            Ok(BotFatherProgress::UsernameOccupied | BotFatherProgress::UsernameInvalid) => {
+                self.phase = SetupPhase::AwaitingUsername {
+                    automatic: false,
+                    deadline: Instant::now() + SETUP_STAGE_TIMEOUT,
+                };
+                BotFatherOutcome {
+                    response: Some(Response::plain(
+                        "⚠️ BotFather отклонил имя. Введите другое имя, оканчивающееся на _bot."
+                            .to_owned(),
+                    )),
+                    provision: None,
+                }
+            }
+            Ok(BotFatherProgress::LimitReached) => {
+                self.phase = SetupPhase::Idle;
+                BotFatherOutcome {
+                    response: Some(Response::plain(
+                        "⚠️ BotFather сообщил о достигнутом лимите ботов.".to_owned(),
+                    )),
+                    provision: None,
+                }
+            }
+            Ok(BotFatherProgress::FloodWait) => {
+                self.phase = SetupPhase::Idle;
+                BotFatherOutcome {
+                    response: Some(Response::plain(
+                        "⚠️ BotFather просит повторить попытку позже.".to_owned(),
+                    )),
+                    provision: None,
+                }
+            }
+            Ok(BotFatherProgress::Unexpected) => {
+                self.phase = SetupPhase::Idle;
+                BotFatherOutcome {
+                    response: Some(Response::plain(
+                        "⚠️ Диалог с BotFather завершился из-за неожиданного ответа.".to_owned(),
+                    )),
+                    provision: None,
+                }
+            }
+            Err(crate::setup_telegram::SetupTelegramError::Storage) => {
+                self.phase = SetupPhase::Idle;
+                BotFatherOutcome {
+                    response: Some(Response::plain(
+                        "⚠️ Данные бота не удалось безопасно сохранить. Настройка остановлена."
+                            .to_owned(),
+                    )),
+                    provision: None,
+                }
+            }
+            Err(crate::setup_telegram::SetupTelegramError::Timeout) => {
+                self.phase = SetupPhase::Idle;
+                BotFatherOutcome {
+                    response: Some(Response::plain(
+                        "⚠️ BotFather не ответил вовремя. Настройка остановлена.".to_owned(),
+                    )),
+                    provision: None,
+                }
+            }
+            Err(_) => {
+                self.phase = SetupPhase::Idle;
+                BotFatherOutcome {
+                    response: Some(Response::plain(
+                        "⚠️ Проверка или сохранение бота завершились ошибкой. Настройка остановлена."
+                            .to_owned(),
+                    )),
+                    provision: None,
+                }
+            }
+        }
+    }
+
+    async fn status(&self) -> Response {
+        let state_path = self.state_path.clone();
+        let token_path = self.token_path.clone();
+        match tokio::task::spawn_blocking(move || {
+            SetupStore::new(state_path, token_path).load_state()
+        })
+        .await
+        {
+            Ok(Ok(state)) => Response::plain(format!(
+                "⚙️ Setup status: {}\nBot: {}",
+                state.status,
+                state
+                    .identities
+                    .bot_username
+                    .as_deref()
+                    .unwrap_or("not configured")
+            )),
+            Ok(Err(crate::error::SetupStoreError::NotFound)) => {
+                Response::plain("⚙️ Setup status: idle".to_owned())
+            }
+            Ok(Err(_)) | Err(_) => Response::plain(
+                "⚠️ Setup status is unavailable because local state could not be read safely."
+                    .to_owned(),
+            ),
+        }
+    }
+
+    async fn has_created_bot(&self) -> bool {
+        let state_path = self.state_path.clone();
+        let token_path = self.token_path.clone();
+        matches!(
+            tokio::task::spawn_blocking(move || SetupStore::new(state_path, token_path).load_state()).await,
+            Ok(Ok(state))
+                if state.identities.bot_username.is_some()
+                    && state.identities.bot_user_id.is_some()
+        )
+    }
+
+    async fn repair(&self, client: &Client) -> RuntimeExecution {
+        let api = match HttpBotApi::new() {
+            Ok(api) => api,
+            Err(_) => {
+                return Response::plain("⚠️ Проверка сохранённого бота недоступна.".to_owned())
+                    .into();
+            }
+        };
+        self.repair_with_api(client, &api).await
+    }
+
+    async fn repair_with_api(&self, client: &Client, bot_api: &impl BotApi) -> RuntimeExecution {
+        match self.repair_preflight(bot_api).await {
+            Ok(username) => RuntimeExecution {
+                response: Response::plain(
+                    "⏳ Восстановление companion workspace начато.".to_owned(),
+                ),
+                provision: Some(ProvisionRequest::new(
+                    client.clone(),
+                    self.state_path.clone(),
+                    self.token_path.clone(),
+                    username,
+                )),
+            },
+            Err(response) => response.into(),
+        }
+    }
+
+    async fn repair_preflight(&self, bot_api: &impl BotApi) -> Result<String, Response> {
+        let state_path = self.state_path.clone();
+        let token_path = self.token_path.clone();
+        let loaded = tokio::task::spawn_blocking({
+            let state_path = state_path.clone();
+            let token_path = token_path.clone();
+            move || {
+                let store = SetupStore::new(state_path, token_path);
+                Ok::<_, crate::error::SetupStoreError>((store.load_state()?, store.load_token()?))
+            }
+        })
+        .await;
+        let (state, token) = match loaded {
+            Ok(Ok(loaded)) => loaded,
+            Ok(Err(crate::error::SetupStoreError::NotFound)) => {
+                return Err(Response::plain(
+                    "⚠️ Нет безопасных данных для восстановления.".to_owned(),
+                ));
+            }
+            Ok(Err(_)) | Err(_) => {
+                return Err(Response::plain(
+                    "⚠️ Сохранённые данные нельзя безопасно проверить.".to_owned(),
+                ));
+            }
+        };
+        let username = match state.identities.bot_username.as_deref() {
+            Some(username) if setup::validate_username(username).is_ok() => username.to_owned(),
+            _ => {
+                return Err(Response::plain(
+                    "⚠️ Сохранённая идентификация бота неполна или небезопасна.".to_owned(),
+                ));
+            }
+        };
+        let persisted_bot_id = state.identities.bot_user_id;
+        let identity = match tokio::time::timeout(Duration::from_secs(25), bot_api.get_me(&token))
+            .await
+        {
+            Ok(Ok(identity)) => identity,
+            Ok(Err(_)) | Err(_) => {
+                return Err(Response::plain(
+                    "⚠️ Сохранённый токен не удалось безопасно проверить. Восстановление не запущено."
+                        .to_owned(),
+                ));
+            }
+        };
+        if !identity.username.eq_ignore_ascii_case(&username) {
+            return Err(Response::plain(
+                "⚠️ Сохранённый токен не соответствует сохранённому боту. Восстановление не запущено."
+                    .to_owned(),
+            ));
+        }
+        if let Some(bot_id) = persisted_bot_id {
+            if identity.id != bot_id {
+                return Err(Response::plain(
+                    "⚠️ Сохранённый токен не соответствует сохранённому боту. Восстановление не запущено."
+                        .to_owned(),
+                ));
+            }
+        } else {
+            let state_path = self.state_path.clone();
+            let token_path = self.token_path.clone();
+            let verified_username = identity.username;
+            let verified_id = identity.id;
+            let expected_username = username.clone();
+            let persisted = tokio::task::spawn_blocking(move || {
+                let mut store = SetupStore::new(state_path, token_path);
+                let mut current = store.load_state()?;
+                if current.identities.bot_username.as_deref() != Some(expected_username.as_str())
+                    || current.identities.bot_user_id.is_some()
+                {
+                    return Err(crate::error::SetupStoreError::Read);
+                }
+                current.identities.bot_username = Some(verified_username);
+                current.identities.bot_user_id = Some(verified_id);
+                store.save_state(&current)
+            })
+            .await;
+            if !matches!(persisted, Ok(Ok(()))) {
+                return Err(Response::plain(
+                    "⚠️ Проверенный идентификатор бота не удалось безопасно сохранить. Восстановление не запущено."
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(username)
     }
 }
 
@@ -775,16 +1436,19 @@ mod tests {
     use crate::response::Response;
     use crate::{
         aliases::{Alias, AliasStore},
+        bot_api::{BotApi, BotApiFuture, BotIdentity},
         commands::{Action, AliasRequest},
         fastfetch::{FastfetchInputError, FastfetchProfileError, FastfetchResult},
+        setup_store::{CompanionToken, PersistedSetupState, SetupStore},
     };
+    use grammers_session::types::PeerId;
     use std::{
         fs,
         path::PathBuf,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
-    #[cfg(all(feature = "fixture-tests", unix))]
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     async fn runtime_with_alias() -> (super::RuntimeState, PathBuf) {
@@ -819,6 +1483,201 @@ mod tests {
             ),
             directory,
         )
+    }
+
+    #[tokio::test]
+    async fn setup_timeout_ends_flow_without_an_inbound_botfather_update() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        let saved_messages = PeerId::user(1).unwrap();
+        let botfather = PeerId::user(2).unwrap();
+        runtime.configure_setup(
+            directory.join("state.json"),
+            directory.join("token"),
+            saved_messages,
+        );
+        runtime.set_setup_botfather_peer(botfather);
+        runtime.setup.as_mut().unwrap().phase = super::SetupPhase::AwaitingUsername {
+            automatic: false,
+            deadline: Instant::now() + Duration::from_millis(1),
+        };
+
+        let deadline = runtime.setup_timeout_deadline().unwrap();
+        tokio::time::sleep_until(deadline.into()).await;
+        let response = runtime.handle_setup_timeout().unwrap();
+
+        assert!(response.text.contains("таймаут"));
+        assert!(runtime.setup_timeout_deadline().is_none());
+        assert!(runtime.setup_protects_message(botfather, false));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn generated_username_has_no_botfather_side_effect_before_confirmation() {
+        let mut setup = super::SetupCoordinator {
+            state_path: PathBuf::new(),
+            token_path: PathBuf::new(),
+            saved_messages_peer: PeerId::user(1).unwrap(),
+            botfather_peer: None,
+            phase: super::SetupPhase::Idle,
+        };
+
+        let response = setup
+            .confirm_or_start(crate::setup::generate_candidate().unwrap(), true, 1)
+            .await;
+
+        assert!(response.text.contains("confirm"));
+        assert!(matches!(
+            setup.phase,
+            super::SetupPhase::AwaitingConfirmation { .. }
+        ));
+        assert!(setup.botfather_peer.is_none());
+    }
+
+    #[tokio::test]
+    async fn interactive_username_transitions_to_confirmation_while_flow_is_active() {
+        let mut setup = super::SetupCoordinator {
+            state_path: PathBuf::new(),
+            token_path: PathBuf::new(),
+            saved_messages_peer: PeerId::user(1).unwrap(),
+            botfather_peer: None,
+            phase: super::SetupPhase::AwaitingUsername {
+                automatic: false,
+                deadline: Instant::now(),
+            },
+        };
+
+        let response = setup.handle_username_input("lavis_test_bot").await;
+
+        assert!(response.text.contains("confirm"));
+        assert!(matches!(
+            setup.phase,
+            super::SetupPhase::AwaitingConfirmation { .. }
+        ));
+    }
+
+    struct RepairBotApi {
+        identity: Result<BotIdentity, crate::bot_api::BotApiError>,
+    }
+
+    impl BotApi for RepairBotApi {
+        fn get_me<'a>(&'a self, _: &'a CompanionToken) -> BotApiFuture<'a> {
+            Box::pin(async { self.identity.clone() })
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_requires_a_verified_persisted_bot_identity() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        #[cfg(unix)]
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let state_path = directory.join("setup.json");
+        let token_path = directory.join("token");
+        let mut state = PersistedSetupState::default();
+        state.stages.bot_created = true;
+        state.identities.bot_username = Some("lavis_test_bot".to_owned());
+        state.identities.bot_user_id = Some(7);
+        let mut store = SetupStore::new(state_path.clone(), token_path.clone());
+        store.save_state(&state).unwrap();
+        store
+            .save_token(&CompanionToken::new("123456:abcdefghijklmnopqrstUVWX".to_owned()).unwrap())
+            .unwrap();
+        runtime.configure_setup(state_path, token_path, PeerId::user(1).unwrap());
+        let setup = runtime.setup.as_ref().unwrap();
+
+        let wrong = RepairBotApi {
+            identity: Ok(BotIdentity {
+                id: 8,
+                username: "lavis_test_bot".to_owned(),
+            }),
+        };
+        assert!(setup.repair_preflight(&wrong).await.is_err());
+
+        let matching = RepairBotApi {
+            identity: Ok(BotIdentity {
+                id: 7,
+                username: "LAVIS_TEST_BOT".to_owned(),
+            }),
+        };
+        assert_eq!(
+            setup.repair_preflight(&matching).await.unwrap(),
+            "lavis_test_bot"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn repair_migrates_a_missing_id_only_after_matching_token_validation() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        #[cfg(unix)]
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let state_path = directory.join("setup.json");
+        let token_path = directory.join("token");
+        let mut state = PersistedSetupState::default();
+        state.identities.bot_username = Some("lavis_test_bot".to_owned());
+        let mut store = SetupStore::new(state_path.clone(), token_path.clone());
+        store.save_state(&state).unwrap();
+        store
+            .save_token(&CompanionToken::new("123456:abcdefghijklmnopqrstUVWX".to_owned()).unwrap())
+            .unwrap();
+        runtime.configure_setup(
+            state_path.clone(),
+            token_path.clone(),
+            PeerId::user(1).unwrap(),
+        );
+        let setup = runtime.setup.as_ref().unwrap();
+
+        let wrong = RepairBotApi {
+            identity: Ok(BotIdentity {
+                id: 7,
+                username: "other_bot".to_owned(),
+            }),
+        };
+        assert!(setup.repair_preflight(&wrong).await.is_err());
+        assert_eq!(
+            SetupStore::new(state_path.clone(), token_path.clone())
+                .load_state()
+                .unwrap()
+                .identities
+                .bot_user_id,
+            None
+        );
+
+        let matching = RepairBotApi {
+            identity: Ok(BotIdentity {
+                id: 7,
+                username: "LAVIS_TEST_BOT".to_owned(),
+            }),
+        };
+        assert!(setup.repair_preflight(&matching).await.is_ok());
+        assert_eq!(
+            SetupStore::new(state_path, token_path)
+                .load_state()
+                .unwrap()
+                .identities
+                .bot_user_id,
+            Some(7)
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recorded_identity_blocks_new_botfather_flow_when_token_is_missing() {
+        let (mut runtime, directory) = runtime_with_alias().await;
+        #[cfg(unix)]
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let state_path = directory.join("setup.json");
+        let token_path = directory.join("token");
+        let mut state = PersistedSetupState::default();
+        state.identities.bot_username = Some("lavis_test_bot".to_owned());
+        state.identities.bot_user_id = Some(7);
+        state.stages.bot_identity_recorded = true;
+        SetupStore::new(state_path.clone(), token_path.clone())
+            .save_state(&state)
+            .unwrap();
+        runtime.configure_setup(state_path, token_path, PeerId::user(1).unwrap());
+
+        assert!(runtime.setup.as_ref().unwrap().has_created_bot().await);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
@@ -891,7 +1750,7 @@ mod tests {
             runtime.execute_modules(&crate::commands::ModulesRequest::Overview, runtime.prefix());
         assert!(overview.text.starts_with("🧩 Модули Lavis: 3\n\n"));
         assert!(overview.text.contains("🦀fastfetch"));
-        assert!(overview.text.contains("Команды (7)"));
+        assert!(overview.text.contains("Команды (8)"));
         assert_eq!(overview.entities.len(), 2);
         assert_eq!(
             runtime.execute_modules(&crate::commands::ModulesRequest::Invalid, runtime.prefix(),),
@@ -909,7 +1768,7 @@ mod tests {
             "🧩 Модули Lavis: 3\n\n"
         );
         let body = String::from_utf16(&units[offset..offset + length]).unwrap();
-        assert!(body.contains("Команды (7)"));
+        assert!(body.contains("Команды (8)"));
         let grammers_client::tl::enums::MessageEntity::Blockquote(provenance) =
             &overview.entities[1]
         else {
