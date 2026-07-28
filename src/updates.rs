@@ -487,7 +487,12 @@ async fn send_provision_completion(
 
 fn provision_completion_text(outcome: ProvisionOutcome, prefix: &str) -> String {
     match outcome {
-        ProvisionOutcome::Completed => "✅ Companion workspace настроен.".to_owned(),
+        ProvisionOutcome::Completed => {
+            "✅ Companion workspace и официальное сообщество @lavis_userbot настроены.".to_owned()
+        }
+        ProvisionOutcome::CompletedWithoutCommunity(_) => format!(
+            "⚠️ Companion workspace готов, но присоединиться к @lavis_userbot не удалось. Повторите {prefix}setup repair."
+        ),
         ProvisionOutcome::CompletedWithoutFolder(
             crate::setup_provision::CompletedWithoutFolder::Capacity,
         ) => format!(
@@ -672,7 +677,16 @@ mod tests {
     fn provisioning_completion_uses_only_safe_status_text() {
         assert_eq!(
             provision_completion_text(crate::setup_telegram::ProvisionOutcome::Completed, "."),
-            "✅ Companion workspace настроен."
+            "✅ Companion workspace и официальное сообщество @lavis_userbot настроены."
+        );
+        assert_eq!(
+            provision_completion_text(
+                crate::setup_telegram::ProvisionOutcome::CompletedWithoutCommunity(
+                    crate::setup_provision::ProvisionError::CommunityJoin,
+                ),
+                ".",
+            ),
+            "⚠️ Companion workspace готов, но присоединиться к @lavis_userbot не удалось. Повторите .setup repair."
         );
         assert_eq!(
             provision_completion_text(
