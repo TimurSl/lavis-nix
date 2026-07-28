@@ -33,6 +33,7 @@ pub struct ProvisionRequest {
 pub enum ProvisionOutcome {
     Completed,
     CompletedWithoutFolder(CompletedWithoutFolder),
+    CompletedWithoutCommunity(crate::setup_provision::ProvisionError),
     Failed(crate::setup_grammers::ProvisionError),
 }
 
@@ -81,6 +82,9 @@ fn provision_outcome(result: ProvisionResult) -> ProvisionOutcome {
         ProvisionResult::Completed => ProvisionOutcome::Completed,
         ProvisionResult::CompletedWithoutFolder(reason) => {
             ProvisionOutcome::CompletedWithoutFolder(reason)
+        }
+        ProvisionResult::CompletedWithoutCommunity(error) => {
+            ProvisionOutcome::CompletedWithoutCommunity(error)
         }
     }
 }
@@ -577,6 +581,14 @@ mod tests {
             )),
             ProvisionOutcome::CompletedWithoutFolder(
                 CompletedWithoutFolder::NameOrOwnershipConflict,
+            )
+        );
+        assert_eq!(
+            provision_outcome(ProvisionResult::CompletedWithoutCommunity(
+                crate::setup_provision::ProvisionError::CommunityJoin,
+            )),
+            ProvisionOutcome::CompletedWithoutCommunity(
+                crate::setup_provision::ProvisionError::CommunityJoin,
             )
         );
     }

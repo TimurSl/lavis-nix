@@ -4,13 +4,14 @@
 //! deliberately works with small owned identifiers so it can be tested without
 //! a Telegram connection and persist progress after every remote operation.
 
-use std::{future::Future, pin::Pin};
+use std::{collections::BTreeSet, future::Future, pin::Pin};
 
 use crate::setup_store::PersistedSetupState;
 
 pub const COMPANION_GROUP_TITLE: &str = "Lavis";
 pub const COMPANION_TOPIC_TITLES: [&str; 3] = ["General", "Logs", "Backups"];
 pub const COMPANION_FOLDER_TITLE: &str = "Lavis";
+pub const COMMUNITY_USERNAME: &str = "lavis_userbot";
 
 pub type ProvisionFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, ProvisionError>> + Send + 'a>>;
@@ -30,6 +31,14 @@ pub struct ForumTopic {
 pub struct BotIdentity {
     pub id: i64,
     pub access_hash: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommunityIdentity {
+    pub id: i64,
+    pub access_hash: i64,
+    pub public: bool,
+    pub megagroup: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,6 +97,10 @@ pub enum ProvisionError {
     DialogFilters,
     FolderCapacity,
     FolderNameConflict,
+    CommunityResolve,
+    CommunityInvalidPeer,
+    CommunityJoin,
+    CommunityUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,6 +113,7 @@ pub enum CompletedWithoutFolder {
 pub enum ProvisionResult {
     Completed,
     CompletedWithoutFolder(CompletedWithoutFolder),
+    CompletedWithoutCommunity(ProvisionError),
 }
 
 /// The only transport surface the staged provisioner needs. The production
@@ -134,6 +148,13 @@ pub trait ProvisionTransport: Send + Sync {
         bot_username: &'a str,
         rights: AdminRights,
     ) -> ProvisionFuture<'a, ()>;
+    fn resolve_community<'a>(&'a self, username: &'a str)
+    -> ProvisionFuture<'a, CommunityIdentity>;
+    fn get_community<'a>(
+        &'a self,
+        community: CommunityIdentity,
+    ) -> ProvisionFuture<'a, Option<CommunityIdentity>>;
+    fn join_community<'a>(&'a self, community: CommunityIdentity) -> ProvisionFuture<'a, ()>;
     fn get_dialog_filters<'a>(&'a self) -> ProvisionFuture<'a, Vec<DialogFolder>>;
     fn update_dialog_filter<'a>(&'a self, folder: DialogFolder) -> ProvisionFuture<'a, ()>;
     fn update_dialog_filters_order<'a>(&'a self, order: Vec<i32>) -> ProvisionFuture<'a, ()>;
@@ -143,25 +164,69 @@ pub trait ProvisionTransport: Send + Sync {
 pub fn plan_folder(
     filters: &[DialogFolder],
     companion_chat_id: i64,
+    companion_bot_id: i64,
     capacity: FolderCapacity,
     recorded_id: Option<i32>,
 ) -> Result<FolderPlan, ProvisionError> {
-    if let Some(folder) = filters
+    let named = filters
         .iter()
-        .find(|folder| folder.title == COMPANION_FOLDER_TITLE)
-    {
-        if recorded_id != Some(folder.id) || !folder.regular {
+        .filter(|folder| folder.title == COMPANION_FOLDER_TITLE)
+        .collect::<Vec<_>>();
+    if let Some(recorded_id) = recorded_id {
+        if let Some(folder) = filters.iter().find(|folder| folder.id == recorded_id) {
+            if !folder.regular
+                || folder.title != COMPANION_FOLDER_TITLE
+                || named.iter().any(|candidate| candidate.id != recorded_id)
+            {
+                return Err(ProvisionError::FolderNameConflict);
+            }
+            return Ok(FolderPlan::Existing {
+                id: folder.id,
+                folder: folder.clone(),
+            });
+        }
+        if !named.is_empty() || filters.len() >= capacity.maximum {
             return Err(ProvisionError::FolderNameConflict);
         }
+        return Ok(FolderPlan::Create {
+            id: recorded_id,
+            folder: DialogFolder {
+                id: recorded_id,
+                title: COMPANION_FOLDER_TITLE.to_owned(),
+                regular: true,
+                included_chat_ids: Vec::new(),
+                pinned_chat_ids: Vec::new(),
+            },
+        });
+    }
+    if named.iter().any(|folder| !folder.regular) {
+        return Err(ProvisionError::FolderNameConflict);
+    }
+    let candidates = named
+        .into_iter()
+        .filter(|folder| {
+            folder.included_chat_ids.contains(&companion_chat_id)
+                && folder.included_chat_ids.contains(&companion_bot_id)
+        })
+        .collect::<Vec<_>>();
+    if candidates.len() == 1 {
+        let folder = candidates[0];
         return Ok(FolderPlan::Existing {
             id: folder.id,
             folder: folder.clone(),
         });
     }
-    if filters
-        .iter()
-        .any(|folder| folder.included_chat_ids.contains(&companion_chat_id))
+    if !candidates.is_empty()
+        || filters
+            .iter()
+            .any(|folder| folder.title == COMPANION_FOLDER_TITLE)
     {
+        return Err(ProvisionError::FolderNameConflict);
+    }
+    if filters.iter().any(|folder| {
+        folder.included_chat_ids.contains(&companion_chat_id)
+            || folder.included_chat_ids.contains(&companion_bot_id)
+    }) {
         return Err(ProvisionError::FolderNameConflict);
     }
     if filters.len() >= capacity.maximum {
@@ -180,6 +245,21 @@ pub fn plan_folder(
             pinned_chat_ids: Vec::new(),
         },
     })
+}
+
+fn normalized_peer_set(peers: &[i64]) -> Option<BTreeSet<i64>> {
+    let set = peers.iter().copied().collect::<BTreeSet<_>>();
+    (set.len() == peers.len()).then_some(set)
+}
+
+fn contains_expected_peers(actual: &[i64], expected: &[i64]) -> bool {
+    let Some(actual) = normalized_peer_set(actual) else {
+        return false;
+    };
+    let Some(expected) = normalized_peer_set(expected) else {
+        return false;
+    };
+    expected.is_subset(&actual)
 }
 
 pub async fn provision(
@@ -268,12 +348,14 @@ pub async fn provision(
         .await?;
     state.stages.bot_rights_configured = true;
     persist(transport, state).await?;
+    let community_result = onboard_community(transport, state).await;
     {
         let folder_capacity = transport.get_app_config().await?;
         let filters = transport.get_dialog_filters().await?;
         let plan = match plan_folder(
             &filters,
             group.id,
+            bot.id,
             folder_capacity,
             state.identities.companion_folder_id,
         ) {
@@ -299,10 +381,23 @@ pub async fn provision(
         let (folder_id, mut folder) = match plan {
             FolderPlan::Existing { id, folder } | FolderPlan::Create { id, folder } => (id, folder),
         };
-        // This is a dedicated operational folder, not a broad query. Keep its
-        // complete selection deterministic so repairs also remove stale peers.
-        folder.included_chat_ids = vec![group.id, bot.id];
-        folder.pinned_chat_ids = vec![group.id, bot.id];
+        state.identities.companion_folder_id = Some(folder_id);
+        state.stages.folder_configured = false;
+        persist(transport, state).await?;
+        let mut managed = vec![group.id, bot.id];
+        if let Some(community_id) = state.identities.community_chat_id {
+            managed.push(community_id);
+        }
+        managed.sort_unstable();
+        if normalized_peer_set(&managed).is_none() {
+            return Err(ProvisionError::DialogFilters);
+        }
+        folder.included_chat_ids.extend(managed.iter().copied());
+        folder.included_chat_ids.sort_unstable();
+        folder.included_chat_ids.dedup();
+        folder.pinned_chat_ids.extend(managed.iter().copied());
+        folder.pinned_chat_ids.sort_unstable();
+        folder.pinned_chat_ids.dedup();
         transport.update_dialog_filter(folder).await?;
         let mut order = filters
             .iter()
@@ -318,19 +413,69 @@ pub async fn provision(
             .any(|folder| {
                 folder.id == folder_id
                     && folder.title == COMPANION_FOLDER_TITLE
-                    && folder.included_chat_ids == [group.id, bot.id]
-                    && folder.pinned_chat_ids == [group.id, bot.id]
+                    && folder.regular
+                    && contains_expected_peers(&folder.included_chat_ids, &managed)
+                    && contains_expected_peers(&folder.pinned_chat_ids, &managed)
             });
         if !verified {
             return Err(ProvisionError::DialogFilters);
         }
-        state.identities.companion_folder_id = Some(folder_id);
         state.stages.folder_configured = true;
         state.stages.companion_configured = true;
-        state.status = "companion_configured".to_owned();
+        state.status = if community_result.is_ok() {
+            "companion_and_community_configured"
+        } else {
+            "companion_configured_community_pending"
+        }
+        .to_owned();
         persist(transport, state).await?;
     }
-    Ok(ProvisionResult::Completed)
+    match community_result {
+        Ok(()) => Ok(ProvisionResult::Completed),
+        Err(error) => Ok(ProvisionResult::CompletedWithoutCommunity(error)),
+    }
+}
+
+async fn onboard_community(
+    transport: &impl ProvisionTransport,
+    state: &mut PersistedSetupState,
+) -> Result<(), ProvisionError> {
+    let community = match (
+        state.identities.community_chat_id,
+        state.identities.community_access_hash,
+    ) {
+        (Some(id), Some(access_hash)) => {
+            let recorded = CommunityIdentity {
+                id,
+                access_hash,
+                public: true,
+                megagroup: true,
+            };
+            transport
+                .get_community(recorded)
+                .await?
+                .ok_or(ProvisionError::CommunityUnavailable)?
+        }
+        _ => {
+            let resolved = transport.resolve_community(COMMUNITY_USERNAME).await?;
+            if !resolved.public || !resolved.megagroup {
+                return Err(ProvisionError::CommunityInvalidPeer);
+            }
+            state.identities.community_chat_id = Some(resolved.id);
+            state.identities.community_access_hash = Some(resolved.access_hash);
+            persist(transport, state).await?;
+            resolved
+        }
+    };
+    if !community.public || !community.megagroup {
+        return Err(ProvisionError::CommunityInvalidPeer);
+    }
+    if !state.stages.community_joined {
+        transport.join_community(community).await?;
+        state.stages.community_joined = true;
+        persist(transport, state).await?;
+    }
+    Ok(())
 }
 
 async fn persist(
@@ -351,6 +496,9 @@ mod tests {
         filters: Mutex<Vec<DialogFolder>>,
         topic: Option<ForumTopic>,
         start_fails: bool,
+        community_fails: bool,
+        update_failures: Mutex<usize>,
+        saved_states: Mutex<Vec<PersistedSetupState>>,
     }
     impl Mock {
         fn call(&self, call: &str) {
@@ -358,8 +506,11 @@ mod tests {
         }
     }
     impl ProvisionTransport for Mock {
-        fn save_state<'a>(&'a self, _: &'a PersistedSetupState) -> ProvisionFuture<'a, ()> {
-            Box::pin(async { Ok(()) })
+        fn save_state<'a>(&'a self, state: &'a PersistedSetupState) -> ProvisionFuture<'a, ()> {
+            Box::pin(async move {
+                self.saved_states.lock().unwrap().push(state.clone());
+                Ok(())
+            })
         }
         fn resolve_bot<'a>(&'a self, _: &'a str) -> ProvisionFuture<'a, BotIdentity> {
             Box::pin(async move {
@@ -445,6 +596,40 @@ mod tests {
                 Ok(())
             })
         }
+        fn resolve_community<'a>(
+            &'a self,
+            username: &'a str,
+        ) -> ProvisionFuture<'a, CommunityIdentity> {
+            Box::pin(async move {
+                assert_eq!(username, COMMUNITY_USERNAME);
+                self.call("resolve-community");
+                if self.community_fails {
+                    return Err(ProvisionError::CommunityResolve);
+                }
+                Ok(CommunityIdentity {
+                    id: 77,
+                    access_hash: 2,
+                    public: true,
+                    megagroup: true,
+                })
+            })
+        }
+        fn get_community<'a>(
+            &'a self,
+            community: CommunityIdentity,
+        ) -> ProvisionFuture<'a, Option<CommunityIdentity>> {
+            Box::pin(async move {
+                self.call("get-community");
+                Ok(Some(community))
+            })
+        }
+        fn join_community<'a>(&'a self, community: CommunityIdentity) -> ProvisionFuture<'a, ()> {
+            Box::pin(async move {
+                assert_eq!(community.id, 77);
+                self.call("join-community");
+                Ok(())
+            })
+        }
         fn get_dialog_filters<'a>(&'a self) -> ProvisionFuture<'a, Vec<DialogFolder>> {
             Box::pin(async move {
                 self.call("filters");
@@ -453,8 +638,14 @@ mod tests {
         }
         fn update_dialog_filter<'a>(&'a self, folder: DialogFolder) -> ProvisionFuture<'a, ()> {
             Box::pin(async move {
-                assert_eq!(folder.included_chat_ids, vec![42, 99]);
-                assert_eq!(folder.pinned_chat_ids, vec![42, 99]);
+                assert!(folder.included_chat_ids.contains(&42));
+                assert!(folder.included_chat_ids.contains(&99));
+                let mut failures = self.update_failures.lock().unwrap();
+                if *failures > 0 {
+                    *failures -= 1;
+                    return Err(ProvisionError::DialogFilters);
+                }
+                drop(failures);
                 self.filters
                     .lock()
                     .unwrap()
@@ -466,7 +657,7 @@ mod tests {
         }
         fn update_dialog_filters_order<'a>(&'a self, order: Vec<i32>) -> ProvisionFuture<'a, ()> {
             Box::pin(async move {
-                assert_eq!(order, vec![1000]);
+                assert_eq!(order.len(), 1);
                 self.call("order");
                 Ok(())
             })
@@ -493,6 +684,8 @@ mod tests {
                 "topic",
                 "invite",
                 "rights",
+                "resolve-community",
+                "join-community",
                 "config",
                 "filters",
                 "filter",
@@ -541,6 +734,7 @@ mod tests {
             plan_folder(
                 &filters,
                 group,
+                99,
                 FolderCapacity {
                     maximum: 10,
                     first_valid_id: 50,
@@ -563,6 +757,7 @@ mod tests {
             plan_folder(
                 &full,
                 group,
+                99,
                 FolderCapacity {
                     maximum: full.len(),
                     first_valid_id: 50,
@@ -580,6 +775,7 @@ mod tests {
                 pinned_chat_ids: vec![],
             }],
             group,
+            99,
             FolderCapacity {
                 maximum: 100,
                 first_valid_id: 50,
@@ -600,6 +796,7 @@ mod tests {
             plan_folder(
                 &[named_chatlist],
                 group,
+                99,
                 FolderCapacity {
                     maximum: 10,
                     first_valid_id: 2
@@ -608,5 +805,273 @@ mod tests {
             ),
             Err(ProvisionError::FolderNameConflict)
         );
+    }
+
+    fn capacity() -> FolderCapacity {
+        FolderCapacity {
+            maximum: 100,
+            first_valid_id: 2,
+        }
+    }
+
+    fn folder(id: i32, regular: bool, included: Vec<i64>) -> DialogFolder {
+        DialogFolder {
+            id,
+            title: COMPANION_FOLDER_TITLE.to_owned(),
+            regular,
+            included_chat_ids: included.clone(),
+            pinned_chat_ids: included,
+        }
+    }
+
+    #[test]
+    fn adopts_unique_regular_lavis_folder_with_both_core_peers() {
+        assert!(matches!(
+            plan_folder(&[folder(7, true, vec![42, 99])], 42, 99, capacity(), None),
+            Ok(FolderPlan::Existing { id: 7, .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_title_only_folder_without_both_managed_peers() {
+        assert_eq!(
+            plan_folder(&[folder(7, true, vec![42])], 42, 99, capacity(), None),
+            Err(ProvisionError::FolderNameConflict)
+        );
+    }
+
+    #[test]
+    fn rejects_shared_chatlist_named_lavis() {
+        assert_eq!(
+            plan_folder(&[folder(7, false, vec![42, 99])], 42, 99, capacity(), None),
+            Err(ProvisionError::FolderNameConflict)
+        );
+    }
+
+    #[test]
+    fn multiple_adoption_candidates_fail_closed() {
+        assert_eq!(
+            plan_folder(
+                &[folder(7, true, vec![42, 99]), folder(8, true, vec![42, 99]),],
+                42,
+                99,
+                capacity(),
+                None
+            ),
+            Err(ProvisionError::FolderNameConflict)
+        );
+    }
+
+    #[test]
+    fn conflicting_recorded_folder_id_is_rejected() {
+        assert_eq!(
+            plan_folder(
+                &[folder(7, true, vec![42, 99])],
+                42,
+                99,
+                capacity(),
+                Some(8)
+            ),
+            Err(ProvisionError::FolderNameConflict)
+        );
+    }
+
+    #[test]
+    fn reversed_peer_order_passes_verification() {
+        assert!(contains_expected_peers(&[99, 77, 42], &[42, 77, 99]));
+    }
+
+    #[test]
+    fn missing_expected_peer_fails_verification() {
+        assert!(!contains_expected_peers(&[42, 99], &[42, 77, 99]));
+    }
+
+    #[test]
+    fn duplicate_managed_peer_ids_are_rejected() {
+        assert!(!contains_expected_peers(&[42, 99], &[42, 42, 99]));
+        assert!(!contains_expected_peers(&[42, 42, 99], &[42, 99]));
+    }
+
+    #[tokio::test]
+    async fn persisted_folder_id_survives_failure_and_repair_reuses_it() {
+        let transport = Mock {
+            update_failures: Mutex::new(1),
+            ..Mock::default()
+        };
+        let mut state = PersistedSetupState::default();
+        assert_eq!(
+            provision(&transport, &mut state, "lavis_test_bot").await,
+            Err(ProvisionError::DialogFilters)
+        );
+        assert_eq!(state.identities.companion_folder_id, Some(1000));
+        assert!(!state.stages.folder_configured);
+        assert!(
+            transport
+                .saved_states
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|saved| saved.identities.companion_folder_id == Some(1000))
+        );
+
+        assert_eq!(
+            provision(&transport, &mut state, "lavis_test_bot").await,
+            Ok(ProvisionResult::Completed)
+        );
+        assert_eq!(state.identities.companion_folder_id, Some(1000));
+        assert_eq!(transport.filters.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn repair_adopts_folder_without_creating_a_second_one() {
+        let transport = Mock::default();
+        transport
+            .filters
+            .lock()
+            .unwrap()
+            .push(folder(12, true, vec![42, 99]));
+        let mut state = PersistedSetupState::default();
+        state.identities.bot_user_id = Some(99);
+        state.identities.bot_access_hash = Some(1);
+        state.identities.companion_chat_id = Some(42);
+        state.identities.companion_chat_access_hash = Some(1);
+
+        assert_eq!(
+            provision(&transport, &mut state, "lavis_test_bot").await,
+            Ok(ProvisionResult::Completed)
+        );
+        assert_eq!(state.identities.companion_folder_id, Some(12));
+        assert_eq!(transport.filters.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn authenticated_user_joins_official_community_once() {
+        let transport = Mock::default();
+        let mut state = PersistedSetupState::default();
+        provision(&transport, &mut state, "lavis_test_bot")
+            .await
+            .unwrap();
+        provision(&transport, &mut state, "lavis_test_bot")
+            .await
+            .unwrap();
+        let calls = transport.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.as_str() == "join-community")
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.as_str() == "resolve-community")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn already_participant_is_successful_and_idempotent() {
+        let transport = Mock::default();
+        let mut state = PersistedSetupState::default();
+        assert_eq!(
+            provision(&transport, &mut state, "lavis_test_bot").await,
+            Ok(ProvisionResult::Completed)
+        );
+        assert!(state.stages.community_joined);
+    }
+
+    #[tokio::test]
+    async fn companion_bot_is_never_invited_to_official_community() {
+        let transport = Mock::default();
+        let mut state = PersistedSetupState::default();
+        provision(&transport, &mut state, "lavis_test_bot")
+            .await
+            .unwrap();
+        let calls = transport.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.as_str() == "invite")
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.as_str() == "join-community")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn folder_contains_all_managed_peers_and_preserves_user_peers() {
+        let transport = Mock::default();
+        transport
+            .filters
+            .lock()
+            .unwrap()
+            .push(folder(12, true, vec![42, 99, 555]));
+        let mut state = PersistedSetupState::default();
+        state.identities.bot_user_id = Some(99);
+        state.identities.bot_access_hash = Some(1);
+        state.identities.companion_chat_id = Some(42);
+        state.identities.companion_chat_access_hash = Some(1);
+        provision(&transport, &mut state, "lavis_test_bot")
+            .await
+            .unwrap();
+        let filters = transport.filters.lock().unwrap();
+        assert_eq!(filters[0].included_chat_ids, [42, 77, 99, 555]);
+        assert_eq!(filters[0].pinned_chat_ids, [42, 77, 99, 555]);
+    }
+
+    #[tokio::test]
+    async fn community_failure_is_partial_and_preserves_core_workspace() {
+        let transport = Mock {
+            community_fails: true,
+            ..Mock::default()
+        };
+        let mut state = PersistedSetupState::default();
+        assert_eq!(
+            provision(&transport, &mut state, "lavis_test_bot").await,
+            Ok(ProvisionResult::CompletedWithoutCommunity(
+                ProvisionError::CommunityResolve
+            ))
+        );
+        assert!(state.stages.companion_configured);
+        assert!(state.stages.folder_configured);
+        assert!(!state.stages.community_joined);
+        assert_eq!(transport.filters.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pr15_pr16_state_migrates_without_reset() {
+        let transport = Mock::default();
+        transport
+            .filters
+            .lock()
+            .unwrap()
+            .push(folder(12, true, vec![42, 99]));
+        let mut state = PersistedSetupState::default();
+        state.identities.bot_username = Some("lavis_test_bot".into());
+        state.identities.bot_user_id = Some(99);
+        state.identities.bot_access_hash = Some(1);
+        state.identities.companion_chat_id = Some(42);
+        state.identities.companion_chat_access_hash = Some(1);
+        state.stages.bot_dialog_initialized = true;
+        state.stages.app_config_checked = true;
+        state.stages.forum_group_created = true;
+        state.stages.forum_topic_created = true;
+        state.stages.bot_invited = true;
+        state.stages.bot_rights_configured = true;
+
+        assert_eq!(
+            provision(&transport, &mut state, "lavis_test_bot").await,
+            Ok(ProvisionResult::Completed)
+        );
+        assert_eq!(state.identities.companion_folder_id, Some(12));
+        assert!(state.stages.companion_configured);
     }
 }

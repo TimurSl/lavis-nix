@@ -64,6 +64,8 @@ pub struct SetupStages {
     pub bot_rights_configured: bool,
     #[serde(default)]
     pub folder_configured: bool,
+    #[serde(default)]
+    pub community_joined: bool,
     pub companion_configured: bool,
 }
 
@@ -87,6 +89,10 @@ pub struct SetupIdentities {
     pub companion_backups_topic_id: Option<i32>,
     #[serde(default)]
     pub companion_folder_id: Option<i32>,
+    #[serde(default)]
+    pub community_chat_id: Option<i64>,
+    #[serde(default)]
+    pub community_access_hash: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -364,6 +370,32 @@ mod tests {
         assert!(!loaded.stages.bot_created);
         assert_eq!(loaded.identities.bot_user_id, Some(7));
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn legacy_companion_state_defaults_new_community_fields() {
+        let state: PersistedSetupState = serde_json::from_str(
+            r#"{
+                "version": 1,
+                "model": "companion",
+                "stages": {
+                    "bot_created": true,
+                    "companion_configured": true
+                },
+                "status": "companion_configured",
+                "identities": {
+                    "bot_username": "lavis_test_bot",
+                    "owner_user_id": 1,
+                    "companion_chat_id": 42
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(!state.stages.community_joined);
+        assert_eq!(state.identities.community_chat_id, None);
+        assert_eq!(state.identities.community_access_hash, None);
+        assert_eq!(state.identities.companion_folder_id, None);
     }
 
     #[cfg(unix)]

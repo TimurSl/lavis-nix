@@ -9,8 +9,8 @@ use grammers_client::{Client, message::InputMessage, tl};
 
 use crate::{
     setup_provision::{
-        self, AdminRights, BotIdentity, DialogFolder, FolderCapacity, ForumGroup, ForumTopic,
-        ProvisionFuture, ProvisionResult, ProvisionTransport,
+        self, AdminRights, BotIdentity, CommunityIdentity, DialogFolder, FolderCapacity,
+        ForumGroup, ForumTopic, ProvisionFuture, ProvisionResult, ProvisionTransport,
     },
     setup_store::{PersistedSetupState, SetupStore},
 };
@@ -36,6 +36,10 @@ pub enum ProvisionError {
     DialogFilters,
     FolderCapacity,
     FolderNameConflict,
+    CommunityResolve,
+    CommunityInvalidPeer,
+    CommunityJoin,
+    CommunityUnavailable,
     Storage,
     Timeout,
 }
@@ -68,6 +72,7 @@ pub async fn production_provision(
         token_path,
         group_from_state(&state),
         bot,
+        community_from_state(&state),
     );
     run_state_machine(&transport, &mut state, bot_username).await
 }
@@ -82,8 +87,9 @@ fn grammers_transport(
     token_path: PathBuf,
     group: Option<InputIdentity>,
     bot: Option<InputIdentity>,
+    community: Option<InputIdentity>,
 ) -> GrammersTransport<'_> {
-    GrammersTransport::new(client, state_path, token_path, group, bot)
+    GrammersTransport::new(client, state_path, token_path, group, bot, community)
 }
 
 async fn run_state_machine(
@@ -102,6 +108,7 @@ struct GrammersTransport<'a> {
     token_path: PathBuf,
     group: Mutex<Option<InputIdentity>>,
     bot: Mutex<Option<InputIdentity>>,
+    community: Mutex<Option<InputIdentity>>,
 }
 
 impl<'a> GrammersTransport<'a> {
@@ -111,6 +118,7 @@ impl<'a> GrammersTransport<'a> {
         token_path: PathBuf,
         group: Option<InputIdentity>,
         bot: Option<InputIdentity>,
+        community: Option<InputIdentity>,
     ) -> Self {
         Self {
             client,
@@ -118,6 +126,7 @@ impl<'a> GrammersTransport<'a> {
             token_path,
             group: Mutex::new(group),
             bot: Mutex::new(bot),
+            community: Mutex::new(community),
         }
     }
 
@@ -149,6 +158,16 @@ impl<'a> GrammersTransport<'a> {
             .filter(|bot| bot.id == id)
         {
             return Ok(input_peer_user(bot));
+        }
+        if let Some(community) = self
+            .community
+            .lock()
+            .map_err(|_| setup_provision::ProvisionError::DialogFilters)?
+            .as_ref()
+            .copied()
+            .filter(|community| community.id == id)
+        {
+            return Ok(input_peer_channel(community));
         }
         Err(setup_provision::ProvisionError::DialogFilters)
     }
@@ -387,6 +406,70 @@ impl ProvisionTransport for GrammersTransport<'_> {
         })
     }
 
+    fn resolve_community<'a>(
+        &'a self,
+        username: &'a str,
+    ) -> ProvisionFuture<'a, CommunityIdentity> {
+        Box::pin(async move {
+            let community = resolve_community(self.client, username).await?;
+            *self
+                .community
+                .lock()
+                .map_err(|_| setup_provision::ProvisionError::CommunityResolve)? =
+                Some(community.0);
+            Ok(community.1)
+        })
+    }
+
+    fn get_community<'a>(
+        &'a self,
+        community: CommunityIdentity,
+    ) -> ProvisionFuture<'a, Option<CommunityIdentity>> {
+        Box::pin(async move {
+            let identity = InputIdentity {
+                id: community.id,
+                access_hash: community.access_hash,
+            };
+            let chats = self
+                .client
+                .invoke(&tl::functions::channels::GetChannels {
+                    id: vec![input_channel(identity)],
+                })
+                .await
+                .map_err(|_| setup_provision::ProvisionError::CommunityUnavailable)?;
+            let found = chats.chats().iter().find_map(|chat| match chat {
+                tl::enums::Chat::Channel(channel) if channel.id == community.id => {
+                    Some(CommunityIdentity {
+                        id: channel.id,
+                        access_hash: channel.access_hash?,
+                        public: channel.username.is_some(),
+                        megagroup: channel.megagroup,
+                    })
+                }
+                _ => None,
+            });
+            Ok(found)
+        })
+    }
+
+    fn join_community<'a>(&'a self, community: CommunityIdentity) -> ProvisionFuture<'a, ()> {
+        Box::pin(async move {
+            let channel = input_channel(InputIdentity {
+                id: community.id,
+                access_hash: community.access_hash,
+            });
+            match self
+                .client
+                .invoke(&tl::functions::channels::JoinChannel { channel })
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(error) if error.is("USER_ALREADY_PARTICIPANT") => Ok(()),
+                Err(_) => Err(setup_provision::ProvisionError::CommunityJoin),
+            }
+        })
+    }
+
     fn get_dialog_filters<'a>(&'a self) -> ProvisionFuture<'a, Vec<DialogFolder>> {
         Box::pin(async move {
             let filters = self
@@ -516,6 +599,14 @@ fn map_provision_error(error: setup_provision::ProvisionError) -> ProvisionError
         setup_provision::ProvisionError::GeneralTopicLookup => ProvisionError::GeneralTopicLookup,
         setup_provision::ProvisionError::FolderCapacity => ProvisionError::FolderCapacity,
         setup_provision::ProvisionError::FolderNameConflict => ProvisionError::FolderNameConflict,
+        setup_provision::ProvisionError::CommunityResolve => ProvisionError::CommunityResolve,
+        setup_provision::ProvisionError::CommunityInvalidPeer => {
+            ProvisionError::CommunityInvalidPeer
+        }
+        setup_provision::ProvisionError::CommunityJoin => ProvisionError::CommunityJoin,
+        setup_provision::ProvisionError::CommunityUnavailable => {
+            ProvisionError::CommunityUnavailable
+        }
         setup_provision::ProvisionError::CreateTopic => ProvisionError::CreateTopic,
         setup_provision::ProvisionError::InviteBot => ProvisionError::InviteBot,
         setup_provision::ProvisionError::PromoteBot => ProvisionError::PromoteBot,
@@ -596,6 +687,48 @@ async fn resolve_bot(client: &Client, username: &str) -> Result<InputIdentity, P
         .ok_or(ProvisionError::ResolveBot)
 }
 
+async fn resolve_community(
+    client: &Client,
+    username: &str,
+) -> Result<(InputIdentity, CommunityIdentity), setup_provision::ProvisionError> {
+    let resolved = client
+        .invoke(&tl::functions::contacts::ResolveUsername {
+            username: username.to_owned(),
+            referer: None,
+        })
+        .await
+        .map_err(|_| setup_provision::ProvisionError::CommunityResolve)?;
+    let tl::enums::contacts::ResolvedPeer::Peer(resolved) = resolved;
+    let channel = resolved.chats.into_iter().find_map(|chat| match chat {
+        tl::enums::Chat::Channel(channel)
+            if channel
+                .username
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(username)) =>
+        {
+            Some(channel)
+        }
+        _ => None,
+    });
+    let channel = channel.ok_or(setup_provision::ProvisionError::CommunityInvalidPeer)?;
+    let access_hash = channel
+        .access_hash
+        .ok_or(setup_provision::ProvisionError::CommunityInvalidPeer)?;
+    let identity = InputIdentity {
+        id: channel.id,
+        access_hash,
+    };
+    Ok((
+        identity,
+        CommunityIdentity {
+            id: channel.id,
+            access_hash,
+            public: channel.username.is_some(),
+            megagroup: channel.megagroup,
+        },
+    ))
+}
+
 fn extract_created_channel(updates: &tl::enums::Updates, title: &str) -> Option<InputIdentity> {
     updates_chats(updates)?.iter().find_map(|chat| match chat {
         tl::enums::Chat::Channel(channel)
@@ -622,6 +755,13 @@ fn group_from_state(state: &PersistedSetupState) -> Option<InputIdentity> {
     Some(InputIdentity {
         id: state.identities.companion_chat_id?,
         access_hash: state.identities.companion_chat_access_hash?,
+    })
+}
+
+fn community_from_state(state: &PersistedSetupState) -> Option<InputIdentity> {
+    Some(InputIdentity {
+        id: state.identities.community_chat_id?,
+        access_hash: state.identities.community_access_hash?,
     })
 }
 
