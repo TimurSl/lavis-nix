@@ -48,10 +48,25 @@ pub enum DialogPeer {
     Chat { id: i64 },
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum PeerKey {
+    User(i64),
+    Channel(i64),
+    Chat(i64),
+}
+
 impl DialogPeer {
     pub fn id(self) -> i64 {
         match self {
             Self::User { id, .. } | Self::Channel { id, .. } | Self::Chat { id } => id,
+        }
+    }
+
+    pub fn key(self) -> PeerKey {
+        match self {
+            Self::User { id, .. } => PeerKey::User(id),
+            Self::Channel { id, .. } => PeerKey::Channel(id),
+            Self::Chat { id } => PeerKey::Chat(id),
         }
     }
 }
@@ -201,6 +216,8 @@ pub fn plan_folder(
     capacity: FolderCapacity,
     recorded_id: Option<i32>,
 ) -> Result<FolderPlan, ProvisionError> {
+    let group_key = PeerKey::Channel(companion_chat_id);
+    let bot_key = PeerKey::User(companion_bot_id);
     let named = filters
         .iter()
         .filter(|folder| folder.title == COMPANION_FOLDER_TITLE)
@@ -241,11 +258,11 @@ pub fn plan_folder(
             folder
                 .included_peers
                 .iter()
-                .any(|peer| peer.id() == companion_chat_id)
+                .any(|peer| peer.key() == group_key)
                 && folder
                     .included_peers
                     .iter()
-                    .any(|peer| peer.id() == companion_bot_id)
+                    .any(|peer| peer.key() == bot_key)
         })
         .collect::<Vec<_>>();
     if candidates.len() == 1 {
@@ -266,7 +283,7 @@ pub fn plan_folder(
         folder
             .included_peers
             .iter()
-            .any(|peer| peer.id() == companion_chat_id || peer.id() == companion_bot_id)
+            .any(|peer| peer.key() == group_key || peer.key() == bot_key)
     }) {
         return Err(ProvisionError::FolderNameConflict);
     }
@@ -288,8 +305,8 @@ pub fn plan_folder(
     })
 }
 
-fn normalized_peer_set(peers: &[DialogPeer]) -> Option<BTreeSet<i64>> {
-    let set = peers.iter().map(|peer| peer.id()).collect::<BTreeSet<_>>();
+fn normalized_peer_set(peers: &[DialogPeer]) -> Option<BTreeSet<PeerKey>> {
+    let set = peers.iter().map(|peer| peer.key()).collect::<BTreeSet<_>>();
     (set.len() == peers.len()).then_some(set)
 }
 
@@ -445,7 +462,7 @@ pub async fn provision(
         {
             managed.push(DialogPeer::Channel { id, access_hash });
         }
-        managed.sort_unstable_by_key(|peer| peer.id());
+        managed.sort_unstable_by_key(|peer| peer.key());
         if normalized_peer_set(&managed).is_none() {
             return Err(ProvisionError::DialogFilters);
         }
@@ -499,13 +516,13 @@ fn merge_peers(
     for peer in managed {
         match existing
             .iter()
-            .position(|existing| existing.id() == peer.id())
+            .position(|existing| existing.key() == peer.key())
         {
             Some(index) => existing[index] = *peer,
             None => existing.push(*peer),
         }
     }
-    existing.sort_unstable_by_key(|peer| peer.id());
+    existing.sort_unstable_by_key(|peer| peer.key());
     Ok(())
 }
 
@@ -807,7 +824,10 @@ mod tests {
             id: 4,
             title: "Other".into(),
             regular: true,
-            included_peers: vec![DialogPeer::Chat { id: group }],
+            included_peers: vec![DialogPeer::Channel {
+                id: group,
+                access_hash: 1,
+            }],
             pinned_peers: vec![],
         }];
         assert_eq!(
@@ -895,19 +915,20 @@ mod tests {
     }
 
     fn folder(id: i32, regular: bool, included: Vec<i64>) -> DialogFolder {
+        let peers = included
+            .into_iter()
+            .map(|id| match id {
+                42 | 77 => DialogPeer::Channel { id, access_hash: 1 },
+                99 => DialogPeer::User { id, access_hash: 1 },
+                _ => DialogPeer::Chat { id },
+            })
+            .collect::<Vec<_>>();
         DialogFolder {
             id,
             title: COMPANION_FOLDER_TITLE.to_owned(),
             regular,
-            included_peers: included
-                .iter()
-                .copied()
-                .map(|id| DialogPeer::Chat { id })
-                .collect(),
-            pinned_peers: included
-                .into_iter()
-                .map(|id| DialogPeer::Chat { id })
-                .collect(),
+            included_peers: peers.clone(),
+            pinned_peers: peers,
         }
     }
 
@@ -996,6 +1017,132 @@ mod tests {
             &peers(&[42, 42, 99]),
             &peers(&[42, 99])
         ));
+    }
+
+    #[test]
+    fn same_numeric_id_in_each_peer_namespace_coexists() {
+        let peers = [
+            DialogPeer::User {
+                id: 42,
+                access_hash: 1,
+            },
+            DialogPeer::Channel {
+                id: 42,
+                access_hash: 2,
+            },
+            DialogPeer::Chat { id: 42 },
+        ];
+
+        assert_eq!(
+            normalized_peer_set(&peers),
+            Some(
+                [PeerKey::User(42), PeerKey::Channel(42), PeerKey::Chat(42),]
+                    .into_iter()
+                    .collect()
+            )
+        );
+    }
+
+    #[test]
+    fn duplicate_user_with_same_id_fails_closed() {
+        assert_eq!(
+            normalized_peer_set(&[
+                DialogPeer::User {
+                    id: 42,
+                    access_hash: 1,
+                },
+                DialogPeer::User {
+                    id: 42,
+                    access_hash: 2,
+                },
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn user_with_group_id_does_not_satisfy_workspace_adoption() {
+        let folder = DialogFolder {
+            id: 7,
+            title: COMPANION_FOLDER_TITLE.to_owned(),
+            regular: true,
+            included_peers: vec![
+                DialogPeer::User {
+                    id: 42,
+                    access_hash: 1,
+                },
+                DialogPeer::User {
+                    id: 99,
+                    access_hash: 2,
+                },
+            ],
+            pinned_peers: Vec::new(),
+        };
+
+        assert_eq!(
+            plan_folder(&[folder], 42, 99, capacity(), None),
+            Err(ProvisionError::FolderNameConflict)
+        );
+    }
+
+    #[test]
+    fn channel_with_bot_id_does_not_satisfy_bot_adoption() {
+        let folder = DialogFolder {
+            id: 7,
+            title: COMPANION_FOLDER_TITLE.to_owned(),
+            regular: true,
+            included_peers: vec![
+                DialogPeer::Channel {
+                    id: 42,
+                    access_hash: 1,
+                },
+                DialogPeer::Channel {
+                    id: 99,
+                    access_hash: 2,
+                },
+            ],
+            pinned_peers: Vec::new(),
+        };
+
+        assert_eq!(
+            plan_folder(&[folder], 42, 99, capacity(), None),
+            Err(ProvisionError::FolderNameConflict)
+        );
+    }
+
+    #[test]
+    fn merge_replaces_only_matching_typed_peer() {
+        let mut existing = vec![
+            DialogPeer::User {
+                id: 42,
+                access_hash: 1,
+            },
+            DialogPeer::Channel {
+                id: 42,
+                access_hash: 2,
+            },
+            DialogPeer::Chat { id: 42 },
+        ];
+
+        merge_peers(
+            &mut existing,
+            &[DialogPeer::User {
+                id: 42,
+                access_hash: 9,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(existing.len(), 3);
+        assert!(existing.contains(&DialogPeer::User {
+            id: 42,
+            access_hash: 9
+        }));
+        assert!(existing.contains(&DialogPeer::Channel {
+            id: 42,
+            access_hash: 2
+        }));
+        assert!(existing.contains(&DialogPeer::Chat { id: 42 }));
     }
 
     #[tokio::test]
@@ -1205,11 +1352,29 @@ mod tests {
         let filters = transport.filters.lock().unwrap();
         assert_eq!(
             normalized_peer_set(&filters[0].included_peers),
-            Some([42, 77, 99, 555].into_iter().collect())
+            Some(
+                [
+                    PeerKey::Channel(42),
+                    PeerKey::Channel(77),
+                    PeerKey::User(99),
+                    PeerKey::Chat(555),
+                ]
+                .into_iter()
+                .collect()
+            )
         );
         assert_eq!(
             normalized_peer_set(&filters[0].pinned_peers),
-            Some([42, 77, 99, 555].into_iter().collect())
+            Some(
+                [
+                    PeerKey::Channel(42),
+                    PeerKey::Channel(77),
+                    PeerKey::User(99),
+                    PeerKey::Chat(555),
+                ]
+                .into_iter()
+                .collect()
+            )
         );
     }
 
