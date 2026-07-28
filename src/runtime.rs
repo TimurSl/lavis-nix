@@ -861,7 +861,7 @@ impl SetupCoordinator {
             deadline: Instant::now() + SETUP_STAGE_TIMEOUT,
         };
         Response::plain(format!(
-            "📋 План настройки\n\nБудет создан бот @{} с именем «{}».\n\nНапишите confirm для подтверждения или cancel для отмены.",
+            "📋 План настройки\n\n• Создать companion-бота @{} с именем «{}».\n• Создать или восстановить приватный Lavis workspace.\n• Присоединить ваш Telegram-аккаунт к официальному публичному сообществу @lavis_userbot.\n• Добавить workspace, бота и сообщество в папку Lavis.\n\nНапишите confirm для подтверждения или cancel для отмены.",
             username.display(),
             crate::setup_telegram::DISPLAY_NAME
         ))
@@ -1567,7 +1567,10 @@ mod tests {
 
         let response = setup.handle_username_input("lavis_test_bot").await;
 
-        assert!(response.text.contains("confirm"));
+        assert_eq!(
+            response.text,
+            "📋 План настройки\n\n• Создать companion-бота @lavis_test_bot с именем «Lavis — really your userbot».\n• Создать или восстановить приватный Lavis workspace.\n• Присоединить ваш Telegram-аккаунт к официальному публичному сообществу @lavis_userbot.\n• Добавить workspace, бота и сообщество в папку Lavis.\n\nНапишите confirm для подтверждения или cancel для отмены."
+        );
         assert!(matches!(
             setup.phase,
             super::SetupPhase::AwaitingConfirmation { .. }

@@ -9,8 +9,9 @@ use grammers_client::{Client, message::InputMessage, tl};
 
 use crate::{
     setup_provision::{
-        self, AdminRights, BotIdentity, CommunityIdentity, DialogFolder, FolderCapacity,
-        ForumGroup, ForumTopic, ProvisionFuture, ProvisionResult, ProvisionTransport,
+        self, AdminRights, BotIdentity, CommunityIdentity, DialogFolder, DialogPeer,
+        FolderCapacity, ForumGroup, ForumTopic, ProvisionFuture, ProvisionResult,
+        ProvisionTransport,
     },
     setup_store::{PersistedSetupState, SetupStore},
 };
@@ -136,40 +137,6 @@ impl<'a> GrammersTransport<'a> {
             .map_err(|_| setup_provision::ProvisionError::GroupChanged)?
             .filter(|identity| identity.id == group.id)
             .ok_or(setup_provision::ProvisionError::GroupChanged)
-    }
-
-    fn input_peer(&self, id: i64) -> Result<tl::enums::InputPeer, setup_provision::ProvisionError> {
-        if let Some(group) = self
-            .group
-            .lock()
-            .map_err(|_| setup_provision::ProvisionError::DialogFilters)?
-            .as_ref()
-            .copied()
-            .filter(|group| group.id == id)
-        {
-            return Ok(input_peer_channel(group));
-        }
-        if let Some(bot) = self
-            .bot
-            .lock()
-            .map_err(|_| setup_provision::ProvisionError::DialogFilters)?
-            .as_ref()
-            .copied()
-            .filter(|bot| bot.id == id)
-        {
-            return Ok(input_peer_user(bot));
-        }
-        if let Some(community) = self
-            .community
-            .lock()
-            .map_err(|_| setup_provision::ProvisionError::DialogFilters)?
-            .as_ref()
-            .copied()
-            .filter(|community| community.id == id)
-        {
-            return Ok(input_peer_channel(community));
-        }
-        Err(setup_provision::ProvisionError::DialogFilters)
     }
 }
 
@@ -464,8 +431,7 @@ impl ProvisionTransport for GrammersTransport<'_> {
                 .await
             {
                 Ok(_) => Ok(()),
-                Err(error) if error.is("USER_ALREADY_PARTICIPANT") => Ok(()),
-                Err(_) => Err(setup_provision::ProvisionError::CommunityJoin),
+                Err(error) => classify_community_join_error(error.is("USER_ALREADY_PARTICIPANT")),
             }
         })
     }
@@ -478,42 +444,48 @@ impl ProvisionTransport for GrammersTransport<'_> {
                 .await
                 .map_err(|_| setup_provision::ProvisionError::DialogFilters)?;
             let tl::enums::messages::DialogFilters::Filters(filters) = filters;
-            Ok(filters
+            filters
                 .filters
                 .into_iter()
                 .filter_map(|filter| match filter {
-                    tl::enums::DialogFilter::Filter(filter) => Some(DialogFolder {
-                        id: filter.id,
-                        title: text_with_entities(&filter.title).to_owned(),
-                        regular: true,
-                        included_chat_ids: peer_ids(&filter.include_peers),
-                        pinned_chat_ids: peer_ids(&filter.pinned_peers),
-                    }),
-                    tl::enums::DialogFilter::Chatlist(filter) => Some(DialogFolder {
+                    tl::enums::DialogFilter::Filter(filter) => Some(
+                        dialog_peers(&filter.include_peers).and_then(|included_peers| {
+                            dialog_peers(&filter.pinned_peers).map(|pinned_peers| DialogFolder {
+                                id: filter.id,
+                                title: text_with_entities(&filter.title).to_owned(),
+                                regular: true,
+                                included_peers,
+                                pinned_peers,
+                            })
+                        }),
+                    ),
+                    tl::enums::DialogFilter::Chatlist(filter) => Some(Ok(DialogFolder {
                         id: filter.id,
                         title: text_with_entities(&filter.title).to_owned(),
                         regular: false,
-                        included_chat_ids: Vec::new(),
-                        pinned_chat_ids: Vec::new(),
-                    }),
+                        included_peers: Vec::new(),
+                        pinned_peers: Vec::new(),
+                    })),
                     tl::enums::DialogFilter::Default => None,
                 })
-                .collect())
+                .collect()
         })
     }
 
     fn update_dialog_filter<'a>(&'a self, folder: DialogFolder) -> ProvisionFuture<'a, ()> {
         Box::pin(async move {
             let peers = folder
-                .included_chat_ids
+                .included_peers
                 .iter()
-                .map(|id| self.input_peer(*id))
-                .collect::<Result<Vec<_>, _>>()?;
+                .copied()
+                .map(input_peer_from_dialog_peer)
+                .collect();
             let pinned_peers = folder
-                .pinned_chat_ids
+                .pinned_peers
                 .iter()
-                .map(|id| self.input_peer(*id))
-                .collect::<Result<Vec<_>, _>>()?;
+                .copied()
+                .map(input_peer_from_dialog_peer)
+                .collect();
             let filter = tl::types::DialogFilter {
                 contacts: false,
                 non_contacts: false,
@@ -647,15 +619,59 @@ fn app_config_folder_limit(config: &tl::enums::help::AppConfig, premium: bool) -
         .unwrap_or(0)
 }
 
-fn peer_ids(peers: &[tl::enums::InputPeer]) -> Vec<i64> {
+fn dialog_peers(
+    peers: &[tl::enums::InputPeer],
+) -> Result<Vec<DialogPeer>, setup_provision::ProvisionError> {
     peers
         .iter()
-        .filter_map(|peer| match peer {
-            tl::enums::InputPeer::Channel(peer) => Some(peer.channel_id),
-            tl::enums::InputPeer::User(peer) => Some(peer.user_id),
-            _ => None,
+        .map(|peer| match peer {
+            tl::enums::InputPeer::User(peer) => Ok(DialogPeer::User {
+                id: peer.user_id,
+                access_hash: peer.access_hash,
+            }),
+            tl::enums::InputPeer::Channel(peer) => Ok(DialogPeer::Channel {
+                id: peer.channel_id,
+                access_hash: peer.access_hash,
+            }),
+            tl::enums::InputPeer::Chat(peer) => Ok(DialogPeer::Chat { id: peer.chat_id }),
+            tl::enums::InputPeer::Empty
+            | tl::enums::InputPeer::PeerSelf
+            | tl::enums::InputPeer::UserFromMessage(_)
+            | tl::enums::InputPeer::ChannelFromMessage(_) => {
+                Err(setup_provision::ProvisionError::DialogFilters)
+            }
         })
         .collect()
+}
+
+fn input_peer_from_dialog_peer(peer: DialogPeer) -> tl::enums::InputPeer {
+    match peer {
+        DialogPeer::User { id, access_hash } => {
+            tl::enums::InputPeer::User(tl::types::InputPeerUser {
+                user_id: id,
+                access_hash,
+            })
+        }
+        DialogPeer::Channel { id, access_hash } => {
+            tl::enums::InputPeer::Channel(tl::types::InputPeerChannel {
+                channel_id: id,
+                access_hash,
+            })
+        }
+        DialogPeer::Chat { id } => {
+            tl::enums::InputPeer::Chat(tl::types::InputPeerChat { chat_id: id })
+        }
+    }
+}
+
+fn classify_community_join_error(
+    already_participant: bool,
+) -> Result<(), setup_provision::ProvisionError> {
+    if already_participant {
+        Ok(())
+    } else {
+        Err(setup_provision::ProvisionError::CommunityJoin)
+    }
 }
 
 async fn resolve_bot(client: &Client, username: &str) -> Result<InputIdentity, ProvisionError> {
@@ -830,8 +846,11 @@ fn minimum_rights() -> tl::types::ChatAdminRights {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProvisionError, map_provision_error};
-    use crate::setup_provision::ProvisionError as StateError;
+    use super::{
+        ProvisionError, classify_community_join_error, dialog_peers, input_peer_from_dialog_peer,
+        map_provision_error, tl,
+    };
+    use crate::setup_provision::{DialogPeer, ProvisionError as StateError};
 
     #[test]
     fn operation_categories_are_not_collapsed_into_dialog_filters() {
@@ -854,6 +873,72 @@ mod tests {
         assert_eq!(
             map_provision_error(StateError::DialogFilters),
             ProvisionError::DialogFilters
+        );
+    }
+
+    #[test]
+    fn dialog_peers_round_trip_without_losing_kind_or_access_hash() {
+        let input = vec![
+            tl::enums::InputPeer::User(tl::types::InputPeerUser {
+                user_id: 11,
+                access_hash: 101,
+            }),
+            tl::enums::InputPeer::Channel(tl::types::InputPeerChannel {
+                channel_id: 22,
+                access_hash: 202,
+            }),
+            tl::enums::InputPeer::Chat(tl::types::InputPeerChat { chat_id: 33 }),
+        ];
+
+        let owned = dialog_peers(&input).unwrap();
+        assert_eq!(
+            owned,
+            [
+                DialogPeer::User {
+                    id: 11,
+                    access_hash: 101
+                },
+                DialogPeer::Channel {
+                    id: 22,
+                    access_hash: 202
+                },
+                DialogPeer::Chat { id: 33 }
+            ]
+        );
+        assert_eq!(
+            owned
+                .into_iter()
+                .map(input_peer_from_dialog_peer)
+                .collect::<Vec<_>>(),
+            input
+        );
+    }
+
+    #[test]
+    fn unsupported_dialog_peer_fails_closed() {
+        assert_eq!(
+            dialog_peers(&[tl::enums::InputPeer::PeerSelf]),
+            Err(StateError::DialogFilters)
+        );
+    }
+
+    #[test]
+    fn dialog_peer_debug_redacts_access_hashes() {
+        let peer = DialogPeer::User {
+            id: 11,
+            access_hash: 987654321,
+        };
+        let debug = format!("{peer:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("987654321"));
+    }
+
+    #[test]
+    fn user_already_participant_is_the_only_join_error_treated_as_success() {
+        assert_eq!(classify_community_join_error(true), Ok(()));
+        assert_eq!(
+            classify_community_join_error(false),
+            Err(StateError::CommunityJoin)
         );
     }
 }

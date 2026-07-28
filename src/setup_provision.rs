@@ -4,7 +4,7 @@
 //! deliberately works with small owned identifiers so it can be tested without
 //! a Telegram connection and persist progress after every remote operation.
 
-use std::{collections::BTreeSet, future::Future, pin::Pin};
+use std::{collections::BTreeSet, fmt, future::Future, pin::Pin};
 
 use crate::setup_store::PersistedSetupState;
 
@@ -41,6 +41,39 @@ pub struct CommunityIdentity {
     pub megagroup: bool,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum DialogPeer {
+    User { id: i64, access_hash: i64 },
+    Channel { id: i64, access_hash: i64 },
+    Chat { id: i64 },
+}
+
+impl DialogPeer {
+    pub fn id(self) -> i64 {
+        match self {
+            Self::User { id, .. } | Self::Channel { id, .. } | Self::Chat { id } => id,
+        }
+    }
+}
+
+impl fmt::Debug for DialogPeer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::User { id, .. } => formatter
+                .debug_struct("User")
+                .field("id", id)
+                .field("access_hash", &"[REDACTED]")
+                .finish(),
+            Self::Channel { id, .. } => formatter
+                .debug_struct("Channel")
+                .field("id", id)
+                .field("access_hash", &"[REDACTED]")
+                .finish(),
+            Self::Chat { id } => formatter.debug_struct("Chat").field("id", id).finish(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AdminRights {
     pub manage_topics: bool,
@@ -63,8 +96,8 @@ pub struct DialogFolder {
     /// Only regular filters can be owned and repaired by Lavis. Shared
     /// chatlists are never rewritten, even when they share the display name.
     pub regular: bool,
-    pub included_chat_ids: Vec<i64>,
-    pub pinned_chat_ids: Vec<i64>,
+    pub included_peers: Vec<DialogPeer>,
+    pub pinned_peers: Vec<DialogPeer>,
 }
 
 /// Server-derived dialog filter constraints. This module deliberately does not
@@ -194,8 +227,8 @@ pub fn plan_folder(
                 id: recorded_id,
                 title: COMPANION_FOLDER_TITLE.to_owned(),
                 regular: true,
-                included_chat_ids: Vec::new(),
-                pinned_chat_ids: Vec::new(),
+                included_peers: Vec::new(),
+                pinned_peers: Vec::new(),
             },
         });
     }
@@ -205,8 +238,14 @@ pub fn plan_folder(
     let candidates = named
         .into_iter()
         .filter(|folder| {
-            folder.included_chat_ids.contains(&companion_chat_id)
-                && folder.included_chat_ids.contains(&companion_bot_id)
+            folder
+                .included_peers
+                .iter()
+                .any(|peer| peer.id() == companion_chat_id)
+                && folder
+                    .included_peers
+                    .iter()
+                    .any(|peer| peer.id() == companion_bot_id)
         })
         .collect::<Vec<_>>();
     if candidates.len() == 1 {
@@ -224,8 +263,10 @@ pub fn plan_folder(
         return Err(ProvisionError::FolderNameConflict);
     }
     if filters.iter().any(|folder| {
-        folder.included_chat_ids.contains(&companion_chat_id)
-            || folder.included_chat_ids.contains(&companion_bot_id)
+        folder
+            .included_peers
+            .iter()
+            .any(|peer| peer.id() == companion_chat_id || peer.id() == companion_bot_id)
     }) {
         return Err(ProvisionError::FolderNameConflict);
     }
@@ -241,18 +282,18 @@ pub fn plan_folder(
             id,
             title: COMPANION_FOLDER_TITLE.to_owned(),
             regular: true,
-            included_chat_ids: vec![companion_chat_id],
-            pinned_chat_ids: Vec::new(),
+            included_peers: Vec::new(),
+            pinned_peers: Vec::new(),
         },
     })
 }
 
-fn normalized_peer_set(peers: &[i64]) -> Option<BTreeSet<i64>> {
-    let set = peers.iter().copied().collect::<BTreeSet<_>>();
+fn normalized_peer_set(peers: &[DialogPeer]) -> Option<BTreeSet<i64>> {
+    let set = peers.iter().map(|peer| peer.id()).collect::<BTreeSet<_>>();
     (set.len() == peers.len()).then_some(set)
 }
 
-fn contains_expected_peers(actual: &[i64], expected: &[i64]) -> bool {
+fn contains_expected_peers(actual: &[DialogPeer], expected: &[DialogPeer]) -> bool {
     let Some(actual) = normalized_peer_set(actual) else {
         return false;
     };
@@ -384,20 +425,32 @@ pub async fn provision(
         state.identities.companion_folder_id = Some(folder_id);
         state.stages.folder_configured = false;
         persist(transport, state).await?;
-        let mut managed = vec![group.id, bot.id];
-        if let Some(community_id) = state.identities.community_chat_id {
-            managed.push(community_id);
+        let group_access_hash = group.access_hash.ok_or(ProvisionError::DialogFilters)?;
+        let mut managed = vec![
+            DialogPeer::Channel {
+                id: group.id,
+                access_hash: group_access_hash,
+            },
+            DialogPeer::User {
+                id: bot.id,
+                access_hash: bot.access_hash,
+            },
+        ];
+        if community_result.is_ok()
+            && state.stages.community_joined
+            && let (Some(id), Some(access_hash)) = (
+                state.identities.community_chat_id,
+                state.identities.community_access_hash,
+            )
+        {
+            managed.push(DialogPeer::Channel { id, access_hash });
         }
-        managed.sort_unstable();
+        managed.sort_unstable_by_key(|peer| peer.id());
         if normalized_peer_set(&managed).is_none() {
             return Err(ProvisionError::DialogFilters);
         }
-        folder.included_chat_ids.extend(managed.iter().copied());
-        folder.included_chat_ids.sort_unstable();
-        folder.included_chat_ids.dedup();
-        folder.pinned_chat_ids.extend(managed.iter().copied());
-        folder.pinned_chat_ids.sort_unstable();
-        folder.pinned_chat_ids.dedup();
+        merge_peers(&mut folder.included_peers, &managed)?;
+        merge_peers(&mut folder.pinned_peers, &managed)?;
         transport.update_dialog_filter(folder).await?;
         let mut order = filters
             .iter()
@@ -414,8 +467,8 @@ pub async fn provision(
                 folder.id == folder_id
                     && folder.title == COMPANION_FOLDER_TITLE
                     && folder.regular
-                    && contains_expected_peers(&folder.included_chat_ids, &managed)
-                    && contains_expected_peers(&folder.pinned_chat_ids, &managed)
+                    && contains_expected_peers(&folder.included_peers, &managed)
+                    && contains_expected_peers(&folder.pinned_peers, &managed)
             });
         if !verified {
             return Err(ProvisionError::DialogFilters);
@@ -434,6 +487,26 @@ pub async fn provision(
         Ok(()) => Ok(ProvisionResult::Completed),
         Err(error) => Ok(ProvisionResult::CompletedWithoutCommunity(error)),
     }
+}
+
+fn merge_peers(
+    existing: &mut Vec<DialogPeer>,
+    managed: &[DialogPeer],
+) -> Result<(), ProvisionError> {
+    if normalized_peer_set(existing).is_none() {
+        return Err(ProvisionError::DialogFilters);
+    }
+    for peer in managed {
+        match existing
+            .iter()
+            .position(|existing| existing.id() == peer.id())
+        {
+            Some(index) => existing[index] = *peer,
+            None => existing.push(*peer),
+        }
+    }
+    existing.sort_unstable_by_key(|peer| peer.id());
+    Ok(())
 }
 
 async fn onboard_community(
@@ -497,6 +570,8 @@ mod tests {
         topic: Option<ForumTopic>,
         start_fails: bool,
         community_fails: bool,
+        community_unavailable: bool,
+        join_failures: Mutex<usize>,
         update_failures: Mutex<usize>,
         saved_states: Mutex<Vec<PersistedSetupState>>,
     }
@@ -620,13 +695,18 @@ mod tests {
         ) -> ProvisionFuture<'a, Option<CommunityIdentity>> {
             Box::pin(async move {
                 self.call("get-community");
-                Ok(Some(community))
+                Ok((!self.community_unavailable).then_some(community))
             })
         }
         fn join_community<'a>(&'a self, community: CommunityIdentity) -> ProvisionFuture<'a, ()> {
             Box::pin(async move {
                 assert_eq!(community.id, 77);
                 self.call("join-community");
+                let mut failures = self.join_failures.lock().unwrap();
+                if *failures > 0 {
+                    *failures -= 1;
+                    return Err(ProvisionError::CommunityJoin);
+                }
                 Ok(())
             })
         }
@@ -638,8 +718,8 @@ mod tests {
         }
         fn update_dialog_filter<'a>(&'a self, folder: DialogFolder) -> ProvisionFuture<'a, ()> {
             Box::pin(async move {
-                assert!(folder.included_chat_ids.contains(&42));
-                assert!(folder.included_chat_ids.contains(&99));
+                assert!(folder.included_peers.iter().any(|peer| peer.id() == 42));
+                assert!(folder.included_peers.iter().any(|peer| peer.id() == 99));
                 let mut failures = self.update_failures.lock().unwrap();
                 if *failures > 0 {
                     *failures -= 1;
@@ -727,8 +807,8 @@ mod tests {
             id: 4,
             title: "Other".into(),
             regular: true,
-            included_chat_ids: vec![group],
-            pinned_chat_ids: vec![],
+            included_peers: vec![DialogPeer::Chat { id: group }],
+            pinned_peers: vec![],
         }];
         assert_eq!(
             plan_folder(
@@ -749,8 +829,8 @@ mod tests {
                 id,
                 title: id.to_string(),
                 regular: true,
-                included_chat_ids: vec![],
-                pinned_chat_ids: vec![],
+                included_peers: vec![],
+                pinned_peers: vec![],
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -771,8 +851,8 @@ mod tests {
                 id: 2,
                 title: "Other".into(),
                 regular: true,
-                included_chat_ids: vec![],
-                pinned_chat_ids: vec![],
+                included_peers: vec![],
+                pinned_peers: vec![],
             }],
             group,
             99,
@@ -789,8 +869,8 @@ mod tests {
             id: 9,
             title: COMPANION_FOLDER_TITLE.to_owned(),
             regular: false,
-            included_chat_ids: vec![],
-            pinned_chat_ids: vec![],
+            included_peers: vec![],
+            pinned_peers: vec![],
         };
         assert_eq!(
             plan_folder(
@@ -819,9 +899,23 @@ mod tests {
             id,
             title: COMPANION_FOLDER_TITLE.to_owned(),
             regular,
-            included_chat_ids: included.clone(),
-            pinned_chat_ids: included,
+            included_peers: included
+                .iter()
+                .copied()
+                .map(|id| DialogPeer::Chat { id })
+                .collect(),
+            pinned_peers: included
+                .into_iter()
+                .map(|id| DialogPeer::Chat { id })
+                .collect(),
         }
+    }
+
+    fn peers(ids: &[i64]) -> Vec<DialogPeer> {
+        ids.iter()
+            .copied()
+            .map(|id| DialogPeer::Chat { id })
+            .collect()
     }
 
     #[test]
@@ -878,18 +972,30 @@ mod tests {
 
     #[test]
     fn reversed_peer_order_passes_verification() {
-        assert!(contains_expected_peers(&[99, 77, 42], &[42, 77, 99]));
+        assert!(contains_expected_peers(
+            &peers(&[99, 77, 42]),
+            &peers(&[42, 77, 99])
+        ));
     }
 
     #[test]
     fn missing_expected_peer_fails_verification() {
-        assert!(!contains_expected_peers(&[42, 99], &[42, 77, 99]));
+        assert!(!contains_expected_peers(
+            &peers(&[42, 99]),
+            &peers(&[42, 77, 99])
+        ));
     }
 
     #[test]
     fn duplicate_managed_peer_ids_are_rejected() {
-        assert!(!contains_expected_peers(&[42, 99], &[42, 42, 99]));
-        assert!(!contains_expected_peers(&[42, 42, 99], &[42, 99]));
+        assert!(!contains_expected_peers(
+            &peers(&[42, 99]),
+            &peers(&[42, 42, 99])
+        ));
+        assert!(!contains_expected_peers(
+            &peers(&[42, 42, 99]),
+            &peers(&[42, 99])
+        ));
     }
 
     #[tokio::test]
@@ -972,7 +1078,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn already_participant_is_successful_and_idempotent() {
+    async fn persisted_successful_join_stage_is_idempotent() {
         let transport = Mock::default();
         let mut state = PersistedSetupState::default();
         assert_eq!(
@@ -980,6 +1086,80 @@ mod tests {
             Ok(ProvisionResult::Completed)
         );
         assert!(state.stages.community_joined);
+    }
+
+    #[tokio::test]
+    async fn failed_community_join_is_excluded_then_repair_adds_it() {
+        let transport = Mock {
+            join_failures: Mutex::new(1),
+            ..Mock::default()
+        };
+        let mut state = PersistedSetupState::default();
+
+        assert_eq!(
+            provision(&transport, &mut state, "lavis_test_bot").await,
+            Ok(ProvisionResult::CompletedWithoutCommunity(
+                ProvisionError::CommunityJoin
+            ))
+        );
+        assert_eq!(state.identities.community_chat_id, Some(77));
+        assert!(!state.stages.community_joined);
+        assert!(state.stages.companion_configured);
+        assert!(state.stages.folder_configured);
+        {
+            let filters = transport.filters.lock().unwrap();
+            assert_eq!(filters.len(), 1);
+            assert!(!filters[0].included_peers.iter().any(|peer| peer.id() == 77));
+            assert!(!filters[0].pinned_peers.iter().any(|peer| peer.id() == 77));
+        }
+
+        assert_eq!(
+            provision(&transport, &mut state, "lavis_test_bot").await,
+            Ok(ProvisionResult::Completed)
+        );
+        assert!(state.stages.community_joined);
+        let filters = transport.filters.lock().unwrap();
+        assert_eq!(filters.len(), 1);
+        assert!(filters[0].included_peers.iter().any(|peer| peer.id() == 77));
+        assert!(filters[0].pinned_peers.iter().any(|peer| peer.id() == 77));
+        let calls = transport.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.as_str() == "resolve-community")
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.as_str() == "join-community")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_recorded_community_remains_a_partial_core_success() {
+        let transport = Mock {
+            community_unavailable: true,
+            ..Mock::default()
+        };
+        let mut state = PersistedSetupState::default();
+        state.identities.community_chat_id = Some(77);
+        state.identities.community_access_hash = Some(2);
+        state.stages.community_joined = true;
+
+        assert_eq!(
+            provision(&transport, &mut state, "lavis_test_bot").await,
+            Ok(ProvisionResult::CompletedWithoutCommunity(
+                ProvisionError::CommunityUnavailable
+            ))
+        );
+        assert!(state.stages.folder_configured);
+        let filters = transport.filters.lock().unwrap();
+        assert_eq!(filters.len(), 1);
+        assert!(!filters[0].included_peers.iter().any(|peer| peer.id() == 77));
     }
 
     #[tokio::test]
@@ -1023,8 +1203,14 @@ mod tests {
             .await
             .unwrap();
         let filters = transport.filters.lock().unwrap();
-        assert_eq!(filters[0].included_chat_ids, [42, 77, 99, 555]);
-        assert_eq!(filters[0].pinned_chat_ids, [42, 77, 99, 555]);
+        assert_eq!(
+            normalized_peer_set(&filters[0].included_peers),
+            Some([42, 77, 99, 555].into_iter().collect())
+        );
+        assert_eq!(
+            normalized_peer_set(&filters[0].pinned_peers),
+            Some([42, 77, 99, 555].into_iter().collect())
+        );
     }
 
     #[tokio::test]
