@@ -319,7 +319,7 @@ struct FolderVerification {
     matches: bool,
     included_count: usize,
     pinned_count: usize,
-    missing_included: BTreeSet<PeerKey>,
+    missing_effective_membership: BTreeSet<PeerKey>,
     missing_pinned: BTreeSet<PeerKey>,
 }
 
@@ -345,22 +345,31 @@ fn verify_folder(
             matches: false,
             included_count: 0,
             pinned_count: 0,
-            missing_included: expected.clone(),
+            missing_effective_membership: expected.clone(),
             missing_pinned: expected,
         };
     };
-    let missing_included = missing_expected_peers(&folder.included_peers, &expected);
+    let effective_membership = folder
+        .included_peers
+        .iter()
+        .chain(&folder.pinned_peers)
+        .map(|peer| peer.key())
+        .collect::<BTreeSet<_>>();
+    let missing_effective_membership = expected
+        .difference(&effective_membership)
+        .copied()
+        .collect::<BTreeSet<_>>();
     let missing_pinned = missing_expected_peers(&folder.pinned_peers, &expected);
     FolderVerification {
         matches: folder.title == COMPANION_FOLDER_TITLE
             && folder.regular
             && normalized_peer_set(&folder.included_peers).is_some()
             && normalized_peer_set(&folder.pinned_peers).is_some()
-            && missing_included.is_empty()
+            && missing_effective_membership.is_empty()
             && missing_pinned.is_empty(),
         included_count: folder.included_peers.len(),
         pinned_count: folder.pinned_peers.len(),
-        missing_included,
+        missing_effective_membership,
         missing_pinned,
     }
 }
@@ -558,7 +567,7 @@ pub async fn provision(
             folder_id,
             included_peer_count = verification.included_count,
             pinned_peer_count = verification.pinned_count,
-            missing_included_peer_keys = ?verification.missing_included,
+            missing_effective_membership_peer_keys = ?verification.missing_effective_membership,
             missing_pinned_peer_keys = ?verification.missing_pinned,
             "Verified companion dialog filter"
         );
@@ -1112,26 +1121,83 @@ mod tests {
     }
 
     #[test]
-    fn missing_expected_peer_fails_verification() {
+    fn empty_included_with_all_managed_pinned_passes_verification() {
+        assert!(
+            verify_folder(
+                &[DialogFolder {
+                    id: 7,
+                    title: COMPANION_FOLDER_TITLE.to_owned(),
+                    regular: true,
+                    included_peers: vec![],
+                    pinned_peers: peers(&[42, 77, 99]),
+                }],
+                7,
+                &peers(&[42, 77, 99]),
+            )
+            .matches
+        );
+    }
+
+    #[test]
+    fn managed_included_but_unpinned_peer_fails_verification() {
         let verification = verify_folder(
             &[DialogFolder {
                 id: 7,
                 title: COMPANION_FOLDER_TITLE.to_owned(),
                 regular: true,
-                included_peers: peers(&[42, 99]),
+                included_peers: peers(&[42, 77, 99]),
                 pinned_peers: peers(&[42, 77]),
             }],
             7,
             &peers(&[42, 77, 99]),
         );
         assert!(!verification.matches);
-        assert_eq!(
-            verification.missing_included,
-            [PeerKey::Chat(77)].into_iter().collect()
-        );
+        assert_eq!(verification.missing_effective_membership, BTreeSet::new());
         assert_eq!(
             verification.missing_pinned,
             [PeerKey::Chat(99)].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn unpinned_user_included_coexists_with_managed_pinned_peers() {
+        assert!(
+            verify_folder(
+                &[DialogFolder {
+                    id: 7,
+                    title: COMPANION_FOLDER_TITLE.to_owned(),
+                    regular: true,
+                    included_peers: vec![DialogPeer::User {
+                        id: 100,
+                        access_hash: 1,
+                    }],
+                    pinned_peers: peers(&[42, 77, 99]),
+                }],
+                7,
+                &peers(&[42, 77, 99]),
+            )
+            .matches
+        );
+    }
+
+    #[test]
+    fn managed_peer_absent_from_both_fails_effective_membership() {
+        let verification = verify_folder(
+            &[DialogFolder {
+                id: 7,
+                title: COMPANION_FOLDER_TITLE.to_owned(),
+                regular: true,
+                included_peers: peers(&[42]),
+                pinned_peers: peers(&[99]),
+            }],
+            7,
+            &peers(&[42, 77, 99]),
+        );
+
+        assert!(!verification.matches);
+        assert_eq!(
+            verification.missing_effective_membership,
+            [PeerKey::Chat(77)].into_iter().collect()
         );
     }
 
