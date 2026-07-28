@@ -142,7 +142,11 @@ pub enum ProvisionError {
     CreateTopic,
     InviteBot,
     PromoteBot,
-    DialogFilters,
+    DialogFiltersRead,
+    DialogFilterDecode,
+    DialogFilterUpdate,
+    DialogFilterOrder,
+    DialogFilterVerify,
     FolderCapacity,
     FolderNameConflict,
     CommunityResolve,
@@ -310,14 +314,55 @@ fn normalized_peer_set(peers: &[DialogPeer]) -> Option<BTreeSet<PeerKey>> {
     (set.len() == peers.len()).then_some(set)
 }
 
-fn contains_expected_peers(actual: &[DialogPeer], expected: &[DialogPeer]) -> bool {
-    let Some(actual) = normalized_peer_set(actual) else {
-        return false;
+#[derive(Debug, Eq, PartialEq)]
+struct FolderVerification {
+    matches: bool,
+    included_count: usize,
+    pinned_count: usize,
+    missing_included: BTreeSet<PeerKey>,
+    missing_pinned: BTreeSet<PeerKey>,
+}
+
+fn missing_expected_peers(
+    actual: &[DialogPeer],
+    expected: &BTreeSet<PeerKey>,
+) -> BTreeSet<PeerKey> {
+    let actual = actual
+        .iter()
+        .map(|peer| peer.key())
+        .collect::<BTreeSet<_>>();
+    expected.difference(&actual).copied().collect()
+}
+
+fn verify_folder(
+    filters: &[DialogFolder],
+    folder_id: i32,
+    managed: &[DialogPeer],
+) -> FolderVerification {
+    let expected = normalized_peer_set(managed).unwrap_or_default();
+    let Some(folder) = filters.iter().find(|folder| folder.id == folder_id) else {
+        return FolderVerification {
+            matches: false,
+            included_count: 0,
+            pinned_count: 0,
+            missing_included: expected.clone(),
+            missing_pinned: expected,
+        };
     };
-    let Some(expected) = normalized_peer_set(expected) else {
-        return false;
-    };
-    expected.is_subset(&actual)
+    let missing_included = missing_expected_peers(&folder.included_peers, &expected);
+    let missing_pinned = missing_expected_peers(&folder.pinned_peers, &expected);
+    FolderVerification {
+        matches: folder.title == COMPANION_FOLDER_TITLE
+            && folder.regular
+            && normalized_peer_set(&folder.included_peers).is_some()
+            && normalized_peer_set(&folder.pinned_peers).is_some()
+            && missing_included.is_empty()
+            && missing_pinned.is_empty(),
+        included_count: folder.included_peers.len(),
+        pinned_count: folder.pinned_peers.len(),
+        missing_included,
+        missing_pinned,
+    }
 }
 
 pub async fn provision(
@@ -398,16 +443,25 @@ pub async fn provision(
         state.stages.forum_topic_created = true;
         persist(transport, state).await?;
     }
-    transport.invite_to_channel(group, bot_username).await?;
-    state.stages.bot_invited = true;
-    persist(transport, state).await?;
-    transport
-        .edit_admin(group, bot_username, AdminRights::MINIMUM)
-        .await?;
-    state.stages.bot_rights_configured = true;
-    persist(transport, state).await?;
+    if !state.stages.bot_invited {
+        transport.invite_to_channel(group, bot_username).await?;
+        state.stages.bot_invited = true;
+        persist(transport, state).await?;
+    }
+    if !state.stages.bot_rights_configured {
+        transport
+            .edit_admin(group, bot_username, AdminRights::MINIMUM)
+            .await?;
+        state.stages.bot_rights_configured = true;
+        persist(transport, state).await?;
+    }
     let community_result = onboard_community(transport, state).await;
     {
+        tracing::debug!(
+            operation_stage = "initial_read",
+            folder_id = ?state.identities.companion_folder_id,
+            "Read dialog filters for companion folder planning"
+        );
         let folder_capacity = transport.get_app_config().await?;
         let filters = transport.get_dialog_filters().await?;
         let plan = match plan_folder(
@@ -442,7 +496,9 @@ pub async fn provision(
         state.identities.companion_folder_id = Some(folder_id);
         state.stages.folder_configured = false;
         persist(transport, state).await?;
-        let group_access_hash = group.access_hash.ok_or(ProvisionError::DialogFilters)?;
+        let group_access_hash = group
+            .access_hash
+            .ok_or(ProvisionError::DialogFilterDecode)?;
         let mut managed = vec![
             DialogPeer::Channel {
                 id: group.id,
@@ -464,10 +520,19 @@ pub async fn provision(
         }
         managed.sort_unstable_by_key(|peer| peer.key());
         if normalized_peer_set(&managed).is_none() {
-            return Err(ProvisionError::DialogFilters);
+            return Err(ProvisionError::DialogFilterDecode);
         }
         merge_peers(&mut folder.included_peers, &managed)?;
         merge_peers(&mut folder.pinned_peers, &managed)?;
+        let managed_keys = managed.iter().map(|peer| peer.key()).collect::<Vec<_>>();
+        tracing::debug!(
+            operation_stage = "update",
+            folder_id,
+            managed_peer_keys = ?managed_keys,
+            included_peer_count = folder.included_peers.len(),
+            pinned_peer_count = folder.pinned_peers.len(),
+            "Updating companion dialog filter"
+        );
         transport.update_dialog_filter(folder).await?;
         let mut order = filters
             .iter()
@@ -475,20 +540,30 @@ pub async fn provision(
             .filter(|id| *id != folder_id)
             .collect::<Vec<_>>();
         order.push(folder_id);
+        tracing::debug!(
+            operation_stage = "order",
+            folder_id,
+            "Updating companion dialog filter order"
+        );
         transport.update_dialog_filters_order(order).await?;
-        let verified = transport
-            .get_dialog_filters()
-            .await?
-            .into_iter()
-            .any(|folder| {
-                folder.id == folder_id
-                    && folder.title == COMPANION_FOLDER_TITLE
-                    && folder.regular
-                    && contains_expected_peers(&folder.included_peers, &managed)
-                    && contains_expected_peers(&folder.pinned_peers, &managed)
-            });
-        if !verified {
-            return Err(ProvisionError::DialogFilters);
+        tracing::debug!(
+            operation_stage = "verification_read",
+            folder_id,
+            "Read dialog filters to verify companion folder"
+        );
+        let verified_filters = transport.get_dialog_filters().await?;
+        let verification = verify_folder(&verified_filters, folder_id, &managed);
+        tracing::debug!(
+            operation_stage = "verification_result",
+            folder_id,
+            included_peer_count = verification.included_count,
+            pinned_peer_count = verification.pinned_count,
+            missing_included_peer_keys = ?verification.missing_included,
+            missing_pinned_peer_keys = ?verification.missing_pinned,
+            "Verified companion dialog filter"
+        );
+        if !verification.matches {
+            return Err(ProvisionError::DialogFilterVerify);
         }
         state.stages.folder_configured = true;
         state.stages.companion_configured = true;
@@ -511,7 +586,7 @@ fn merge_peers(
     managed: &[DialogPeer],
 ) -> Result<(), ProvisionError> {
     if normalized_peer_set(existing).is_none() {
-        return Err(ProvisionError::DialogFilters);
+        return Err(ProvisionError::DialogFilterDecode);
     }
     for peer in managed {
         match existing
@@ -590,6 +665,9 @@ mod tests {
         community_unavailable: bool,
         join_failures: Mutex<usize>,
         update_failures: Mutex<usize>,
+        order_failures: Mutex<usize>,
+        dialog_filter_read_failure: Mutex<Option<(usize, ProvisionError)>>,
+        verification_update_ignored: bool,
         saved_states: Mutex<Vec<PersistedSetupState>>,
     }
     impl Mock {
@@ -730,6 +808,19 @@ mod tests {
         fn get_dialog_filters<'a>(&'a self) -> ProvisionFuture<'a, Vec<DialogFolder>> {
             Box::pin(async move {
                 self.call("filters");
+                let read_count = self
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|call| call.as_str() == "filters")
+                    .count();
+                let read_failure = *self.dialog_filter_read_failure.lock().unwrap();
+                if let Some((failure_read, error)) = read_failure
+                    && read_count == failure_read
+                {
+                    return Err(error);
+                }
                 Ok(self.filters.lock().unwrap().clone())
             })
         }
@@ -740,9 +831,13 @@ mod tests {
                 let mut failures = self.update_failures.lock().unwrap();
                 if *failures > 0 {
                     *failures -= 1;
-                    return Err(ProvisionError::DialogFilters);
+                    return Err(ProvisionError::DialogFilterUpdate);
                 }
                 drop(failures);
+                if self.verification_update_ignored {
+                    self.call("filter");
+                    return Ok(());
+                }
                 self.filters
                     .lock()
                     .unwrap()
@@ -756,6 +851,11 @@ mod tests {
             Box::pin(async move {
                 assert_eq!(order.len(), 1);
                 self.call("order");
+                let mut failures = self.order_failures.lock().unwrap();
+                if *failures > 0 {
+                    *failures -= 1;
+                    return Err(ProvisionError::DialogFilterOrder);
+                }
                 Ok(())
             })
         }
@@ -797,6 +897,8 @@ mod tests {
         let repair_calls = transport.calls.lock().unwrap().clone();
         assert!(!repair_calls.contains(&"resolve".to_owned()));
         assert!(!repair_calls.contains(&"start".to_owned()));
+        assert!(!repair_calls.contains(&"invite".to_owned()));
+        assert!(!repair_calls.contains(&"rights".to_owned()));
         assert!(repair_calls.contains(&"get-topic".to_owned()));
         assert!(repair_calls.contains(&"filters".to_owned()));
     }
@@ -993,30 +1095,50 @@ mod tests {
 
     #[test]
     fn reversed_peer_order_passes_verification() {
-        assert!(contains_expected_peers(
-            &peers(&[99, 77, 42]),
-            &peers(&[42, 77, 99])
-        ));
+        assert!(
+            verify_folder(
+                &[DialogFolder {
+                    id: 7,
+                    title: COMPANION_FOLDER_TITLE.to_owned(),
+                    regular: true,
+                    included_peers: peers(&[99, 77, 42]),
+                    pinned_peers: peers(&[99, 77, 42]),
+                }],
+                7,
+                &peers(&[42, 77, 99]),
+            )
+            .matches
+        );
     }
 
     #[test]
     fn missing_expected_peer_fails_verification() {
-        assert!(!contains_expected_peers(
-            &peers(&[42, 99]),
-            &peers(&[42, 77, 99])
-        ));
+        let verification = verify_folder(
+            &[DialogFolder {
+                id: 7,
+                title: COMPANION_FOLDER_TITLE.to_owned(),
+                regular: true,
+                included_peers: peers(&[42, 99]),
+                pinned_peers: peers(&[42, 77]),
+            }],
+            7,
+            &peers(&[42, 77, 99]),
+        );
+        assert!(!verification.matches);
+        assert_eq!(
+            verification.missing_included,
+            [PeerKey::Chat(77)].into_iter().collect()
+        );
+        assert_eq!(
+            verification.missing_pinned,
+            [PeerKey::Chat(99)].into_iter().collect()
+        );
     }
 
     #[test]
     fn duplicate_managed_peer_ids_are_rejected() {
-        assert!(!contains_expected_peers(
-            &peers(&[42, 99]),
-            &peers(&[42, 42, 99])
-        ));
-        assert!(!contains_expected_peers(
-            &peers(&[42, 42, 99]),
-            &peers(&[42, 99])
-        ));
+        let duplicate = peers(&[42, 42, 99]);
+        assert!(normalized_peer_set(&duplicate).is_none());
     }
 
     #[test]
@@ -1146,6 +1268,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dialog_filter_operations_preserve_their_error_categories() {
+        let mut malformed_peers = peers(&[42, 42]);
+        assert_eq!(
+            merge_peers(&mut malformed_peers, &peers(&[99])),
+            Err(ProvisionError::DialogFilterDecode)
+        );
+
+        let initial_read = Mock {
+            dialog_filter_read_failure: Mutex::new(Some((1, ProvisionError::DialogFiltersRead))),
+            ..Mock::default()
+        };
+        assert_eq!(
+            provision(
+                &initial_read,
+                &mut PersistedSetupState::default(),
+                "lavis_test_bot"
+            )
+            .await,
+            Err(ProvisionError::DialogFiltersRead)
+        );
+
+        let update = Mock {
+            update_failures: Mutex::new(1),
+            ..Mock::default()
+        };
+        assert_eq!(
+            provision(
+                &update,
+                &mut PersistedSetupState::default(),
+                "lavis_test_bot"
+            )
+            .await,
+            Err(ProvisionError::DialogFilterUpdate)
+        );
+
+        let order = Mock {
+            order_failures: Mutex::new(1),
+            ..Mock::default()
+        };
+        assert_eq!(
+            provision(
+                &order,
+                &mut PersistedSetupState::default(),
+                "lavis_test_bot"
+            )
+            .await,
+            Err(ProvisionError::DialogFilterOrder)
+        );
+
+        let verification_read = Mock {
+            dialog_filter_read_failure: Mutex::new(Some((2, ProvisionError::DialogFiltersRead))),
+            ..Mock::default()
+        };
+        assert_eq!(
+            provision(
+                &verification_read,
+                &mut PersistedSetupState::default(),
+                "lavis_test_bot"
+            )
+            .await,
+            Err(ProvisionError::DialogFiltersRead)
+        );
+
+        let verification = Mock {
+            verification_update_ignored: true,
+            ..Mock::default()
+        };
+        assert_eq!(
+            provision(
+                &verification,
+                &mut PersistedSetupState::default(),
+                "lavis_test_bot"
+            )
+            .await,
+            Err(ProvisionError::DialogFilterVerify)
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_invite_and_admin_stages_skip_only_completed_operations() {
+        let transport = Mock::default();
+        let mut state = PersistedSetupState::default();
+        provision(&transport, &mut state, "lavis_test_bot")
+            .await
+            .unwrap();
+
+        transport.calls.lock().unwrap().clear();
+        provision(&transport, &mut state, "lavis_test_bot")
+            .await
+            .unwrap();
+        assert!(
+            !transport
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call == "invite")
+        );
+        assert!(
+            !transport
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call == "rights")
+        );
+
+        state.stages.bot_invited = false;
+        transport.calls.lock().unwrap().clear();
+        provision(&transport, &mut state, "lavis_test_bot")
+            .await
+            .unwrap();
+        let calls = transport.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.as_str() == "invite")
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.as_str() == "rights")
+                .count(),
+            0
+        );
+        assert!(state.stages.bot_invited);
+        assert!(
+            transport
+                .saved_states
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|saved| saved.stages.bot_invited)
+        );
+    }
+
+    #[test]
+    fn peer_debug_output_redacts_access_hashes() {
+        let diagnostic = format!(
+            "{:?}",
+            DialogPeer::Channel {
+                id: 42,
+                access_hash: 987654321,
+            }
+        );
+        assert!(diagnostic.contains("[REDACTED]"));
+        assert!(!diagnostic.contains("987654321"));
+    }
+
+    #[tokio::test]
     async fn persisted_folder_id_survives_failure_and_repair_reuses_it() {
         let transport = Mock {
             update_failures: Mutex::new(1),
@@ -1154,7 +1428,7 @@ mod tests {
         let mut state = PersistedSetupState::default();
         assert_eq!(
             provision(&transport, &mut state, "lavis_test_bot").await,
-            Err(ProvisionError::DialogFilters)
+            Err(ProvisionError::DialogFilterUpdate)
         );
         assert_eq!(state.identities.companion_folder_id, Some(1000));
         assert!(!state.stages.folder_configured);
