@@ -34,7 +34,11 @@ pub enum ProvisionError {
     CreateTopic,
     InviteBot,
     PromoteBot,
-    DialogFilters,
+    DialogFiltersRead,
+    DialogFilterDecode,
+    DialogFilterUpdate,
+    DialogFilterOrder,
+    DialogFilterVerify,
     FolderCapacity,
     FolderNameConflict,
     CommunityResolve,
@@ -442,7 +446,12 @@ impl ProvisionTransport for GrammersTransport<'_> {
                 .client
                 .invoke(&tl::functions::messages::GetDialogFilters {})
                 .await
-                .map_err(|_| setup_provision::ProvisionError::DialogFilters)?;
+                .map_err(|error| match error {
+                    grammers_mtsender::InvocationError::Deserialize(_) => {
+                        setup_provision::ProvisionError::DialogFilterDecode
+                    }
+                    _ => setup_provision::ProvisionError::DialogFiltersRead,
+                })?;
             let tl::enums::messages::DialogFilters::Filters(filters) = filters;
             filters
                 .filters
@@ -513,7 +522,7 @@ impl ProvisionTransport for GrammersTransport<'_> {
                     filter: Some(tl::enums::DialogFilter::Filter(filter)),
                 })
                 .await
-                .map_err(|_| setup_provision::ProvisionError::DialogFilters)?;
+                .map_err(|_| setup_provision::ProvisionError::DialogFilterUpdate)?;
             Ok(())
         })
     }
@@ -523,7 +532,7 @@ impl ProvisionTransport for GrammersTransport<'_> {
             self.client
                 .invoke(&tl::functions::messages::UpdateDialogFiltersOrder { order })
                 .await
-                .map_err(|_| setup_provision::ProvisionError::DialogFilters)?;
+                .map_err(|_| setup_provision::ProvisionError::DialogFilterOrder)?;
             Ok(())
         })
     }
@@ -582,7 +591,11 @@ fn map_provision_error(error: setup_provision::ProvisionError) -> ProvisionError
         setup_provision::ProvisionError::CreateTopic => ProvisionError::CreateTopic,
         setup_provision::ProvisionError::InviteBot => ProvisionError::InviteBot,
         setup_provision::ProvisionError::PromoteBot => ProvisionError::PromoteBot,
-        setup_provision::ProvisionError::DialogFilters => ProvisionError::DialogFilters,
+        setup_provision::ProvisionError::DialogFiltersRead => ProvisionError::DialogFiltersRead,
+        setup_provision::ProvisionError::DialogFilterDecode => ProvisionError::DialogFilterDecode,
+        setup_provision::ProvisionError::DialogFilterUpdate => ProvisionError::DialogFilterUpdate,
+        setup_provision::ProvisionError::DialogFilterOrder => ProvisionError::DialogFilterOrder,
+        setup_provision::ProvisionError::DialogFilterVerify => ProvisionError::DialogFilterVerify,
     }
 }
 
@@ -638,7 +651,7 @@ fn dialog_peers(
             | tl::enums::InputPeer::PeerSelf
             | tl::enums::InputPeer::UserFromMessage(_)
             | tl::enums::InputPeer::ChannelFromMessage(_) => {
-                Err(setup_provision::ProvisionError::DialogFilters)
+                Err(setup_provision::ProvisionError::DialogFilterDecode)
             }
         })
         .collect()
@@ -853,7 +866,7 @@ mod tests {
     use crate::setup_provision::{DialogPeer, ProvisionError as StateError};
 
     #[test]
-    fn operation_categories_are_not_collapsed_into_dialog_filters() {
+    fn operation_categories_are_not_collapsed_into_dialog_filter_failures() {
         assert_eq!(
             map_provision_error(StateError::ResolveBot),
             ProvisionError::ResolveBot
@@ -871,8 +884,24 @@ mod tests {
             ProvisionError::PromoteBot
         );
         assert_eq!(
-            map_provision_error(StateError::DialogFilters),
-            ProvisionError::DialogFilters
+            map_provision_error(StateError::DialogFiltersRead),
+            ProvisionError::DialogFiltersRead
+        );
+        assert_eq!(
+            map_provision_error(StateError::DialogFilterDecode),
+            ProvisionError::DialogFilterDecode
+        );
+        assert_eq!(
+            map_provision_error(StateError::DialogFilterUpdate),
+            ProvisionError::DialogFilterUpdate
+        );
+        assert_eq!(
+            map_provision_error(StateError::DialogFilterOrder),
+            ProvisionError::DialogFilterOrder
+        );
+        assert_eq!(
+            map_provision_error(StateError::DialogFilterVerify),
+            ProvisionError::DialogFilterVerify
         );
     }
 
@@ -918,7 +947,7 @@ mod tests {
     fn unsupported_dialog_peer_fails_closed() {
         assert_eq!(
             dialog_peers(&[tl::enums::InputPeer::PeerSelf]),
-            Err(StateError::DialogFilters)
+            Err(StateError::DialogFilterDecode)
         );
     }
 
