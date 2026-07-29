@@ -5,7 +5,7 @@
 //! an encoding we cannot decompress and verify would make the inspection meaningless.
 
 use super::manifest::{
-    ExternalModuleDescriptor, validate_display_single_line, validate_manifest_at,
+    validate_display_single_line, validate_manifest_at, ExternalModuleDescriptor,
 };
 use serde::{Serialize, Serializer};
 use std::{
@@ -1225,24 +1225,22 @@ mod tests {
 
     #[test]
     fn failed_inspection_leaves_no_wrapper_and_cleanup_never_follows_symlinks() {
-        let root = root("cleanup");
+        let staging_root = root("cleanup");
         let config = InspectionConfig {
-            staging_root: root.clone(),
+            staging_root: staging_root.clone(),
             limits: limits(),
         };
         let mut random = TestRandom(1);
-        assert!(
-            inspect_pending(
-                &config,
-                AcquiredLmod::archive(vec![1, 2, 3]),
-                SystemTime::UNIX_EPOCH,
-                SystemTime::UNIX_EPOCH,
-                &mut random
-            )
-            .is_err()
-        );
-        assert!(fs::read_dir(&root).unwrap().next().is_none());
-        let stage = create_stage(&root, &mut random).unwrap();
+        assert!(inspect_pending(
+            &config,
+            AcquiredLmod::archive(vec![1, 2, 3]),
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
+            &mut random
+        )
+        .is_err());
+        assert!(fs::read_dir(&staging_root).unwrap().next().is_none());
+        let stage = create_stage(&staging_root, &mut random).unwrap();
         let wrapper = stage.path().unwrap().to_path_buf();
         let outside = root("outside");
         fs::create_dir_all(&outside).unwrap();
@@ -1251,7 +1249,7 @@ mod tests {
         assert!(stage.cleanup().is_err());
         assert!(outside.join("keep").exists());
         let _ = fs::remove_dir_all(&outside);
-        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&staging_root);
     }
 
     #[test]
@@ -1259,10 +1257,11 @@ mod tests {
         let root = root("marker-failure");
         let mut random = TestRandom(1);
         let stage = create_stage(&root, &mut random).unwrap();
-        assert!(
-            super::installer::write_stage_marker(stage.path().unwrap(), SystemTime::UNIX_EPOCH)
-                .is_err()
-        );
+        assert!(crate::external_modules::installer::write_stage_marker(
+            stage.path().unwrap(),
+            SystemTime::UNIX_EPOCH
+        )
+        .is_err());
         let wrapper = stage.path().unwrap().to_path_buf();
         stage.cleanup().unwrap();
         assert!(!wrapper.exists());

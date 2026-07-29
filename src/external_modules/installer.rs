@@ -7,7 +7,7 @@
 //! re-inspects a pending stage.
 
 use rustix::{
-    fs::{CWD, RenameFlags},
+    fs::{RenameFlags, CWD},
     io::Errno,
 };
 use serde::{Deserialize, Serialize};
@@ -336,10 +336,12 @@ mod tests {
         write_stage_marker(&wrapper, SystemTime::UNIX_EPOCH).unwrap();
         let payload = wrapper.join(STAGE_CHILD);
         fs::create_dir(&payload).unwrap();
-        fs::write(
-            payload.join("module.json"),
-            if invalid_manifest { b"{}" } else { b"{\"schema_version\":2,\"id\":\"test\",\"name\":\"Test\",\"version\":\"1\",\"author\":\"A\",\"entrypoint\":\"run\",\"commands\":[{\"name\":\"go\",\"summary_ru\":\"x\",\"description_ru\":\"x\",\"usage\":\"<value>\"}]}" },
-        ).unwrap();
+        let manifest: &[u8] = if invalid_manifest {
+            b"{}"
+        } else {
+            b"{\"schema_version\":2,\"id\":\"test\",\"name\":\"Test\",\"version\":\"1\",\"author\":\"A\",\"entrypoint\":\"run\",\"commands\":[{\"name\":\"go\",\"summary_ru\":\"x\",\"description_ru\":\"x\",\"usage\":\"<value>\"}]}"
+        };
+        fs::write(payload.join("module.json"), manifest).unwrap();
         fs::write(payload.join("run"), b"#!/bin/sh").unwrap();
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(payload.join("run"), fs::Permissions::from_mode(0o700)).unwrap();
