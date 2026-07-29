@@ -720,6 +720,18 @@ impl RuntimeState {
         edited: bool,
         authored_by_self: bool,
     ) -> Response {
+        match self.module_approvals.list_pending() {
+            Ok(pending) => tracing::debug!(
+                event = "external_module_approvals_swept",
+                pending = pending.len(),
+                "Swept expired external module approvals"
+            ),
+            Err(error) => tracing::warn!(
+                event = "external_module_approvals_sweep_failed",
+                error = %error,
+                "Could not sweep expired external module approvals"
+            ),
+        }
         match request {
             LmRequest::Overview | LmRequest::List => {
                 self.refresh_snapshot().await;
@@ -811,8 +823,19 @@ impl RuntimeState {
                 return Response::plain("⚠️ Пакет .lmod не прошёл безопасную проверку.".to_owned());
             }
         };
+        let prefix = self.prefix().to_owned();
         match self.module_approvals.issue(pending) {
-            Ok((id, plan)) => Response::plain(render_install_plan(&plan, id, self.prefix())),
+            Ok((id, _)) => match self.module_approvals.get(id) {
+                Ok(plan) => Response::plain(render_install_plan(plan, id, &prefix)),
+                Err(error) => {
+                    tracing::warn!(
+                        event = "external_module_approval_plan_unavailable",
+                        error = %error,
+                        "Issued external module approval could not be read back"
+                    );
+                    Response::plain("⚠️ Невозможно сохранить план установки.".to_owned())
+                }
+            },
             Err(_) => Response::plain("⚠️ Невозможно сохранить план установки.".to_owned()),
         }
     }
@@ -1758,8 +1781,9 @@ fn format_stats(
 #[cfg(test)]
 mod tests {
     use super::{
-        ProcStats, external_event_error_category, fastfetch_response, format_duration,
-        format_latency, format_stats, parse_memory_kib, parse_system_uptime,
+        EDITED_LM_STATE_CHANGE, ProcStats, bounded_list, external_event_error_category,
+        fastfetch_response, format_duration, format_latency, format_stats, lm_usage,
+        parse_memory_kib, parse_system_uptime,
     };
     use crate::response::Response;
     use crate::{
