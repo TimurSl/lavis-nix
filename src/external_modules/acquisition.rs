@@ -1,6 +1,9 @@
 //! Bounded acquisition of `.lmod` documents from Saved Messages only.
 
-use grammers_client::{Client, InvocationError, media::Media, session::types::PeerId};
+use grammers_client::{
+    Client, InvocationError, client::DownloadIter, media::Media, session::types::PeerId,
+};
+use std::future::Future;
 use thiserror::Error;
 
 use super::source_inspection::AcquiredLmod;
@@ -67,25 +70,50 @@ impl BoundedDocumentBytes {
     }
 }
 
+#[derive(Debug)]
 enum AggregateError<E> {
     Acquisition(AcquisitionError),
     Transport(E),
 }
 
-/// A synchronous adapter for tests and non-Telegram byte-stream boundaries.
-fn aggregate_document_chunks<E>(
+/// A transport-independent asynchronous byte-stream adapter. It is kept
+/// separate from Telegram message validation so its bounds are testable
+/// without a `Client`.
+trait DocumentChunkSource {
+    type Error;
+
+    fn next_chunk(&mut self) -> impl Future<Output = Result<Option<Vec<u8>>, Self::Error>> + '_;
+}
+
+async fn aggregate_document_chunks<S: DocumentChunkSource>(
     declared_size: Option<usize>,
     maximum: usize,
-    mut next: impl FnMut() -> Result<Option<Vec<u8>>, E>,
-) -> Result<Vec<u8>, AggregateError<E>> {
+    source: &mut S,
+) -> Result<Vec<u8>, AggregateError<S::Error>> {
     let mut aggregate =
         BoundedDocumentBytes::new(declared_size, maximum).map_err(AggregateError::Acquisition)?;
-    while let Some(chunk) = next().map_err(AggregateError::Transport)? {
+    while let Some(chunk) = source
+        .next_chunk()
+        .await
+        .map_err(AggregateError::Transport)?
+    {
         aggregate
             .push(&chunk)
             .map_err(AggregateError::Acquisition)?;
     }
     Ok(aggregate.finish())
+}
+
+struct TelegramDownload<'a> {
+    download: &'a mut DownloadIter,
+}
+
+impl DocumentChunkSource for TelegramDownload<'_> {
+    type Error = InvocationError;
+
+    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.download.next().await
+    }
 }
 
 /// Acquires one outgoing document from the account's Saved Messages. The
@@ -125,73 +153,106 @@ impl<'a> ModuleSourceAcquirer<'a> {
         if !document.name().is_some_and(|name| name.ends_with(".lmod")) {
             return Err(AcquisitionError::NotLmodDocument);
         }
-        let mut aggregate =
-            BoundedDocumentBytes::new(document.size(), self.limits.max_archive_bytes)?;
         let mut download = self.client.iter_download(&document);
-        while let Some(chunk) = download.next().await.map_err(AcquisitionError::Download)? {
-            aggregate.push(&chunk)?;
-        }
-        Ok(AcquiredLmod::archive(aggregate.finish()))
+        let mut chunks = TelegramDownload {
+            download: &mut download,
+        };
+        let bytes =
+            aggregate_document_chunks(document.size(), self.limits.max_archive_bytes, &mut chunks)
+                .await
+                .map_err(|error| match error {
+                    AggregateError::Acquisition(error) => error,
+                    AggregateError::Transport(error) => AcquisitionError::Download(error),
+                })?;
+        Ok(AcquiredLmod::archive(bytes))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::{cell::Cell, collections::VecDeque};
 
-    #[test]
-    fn missing_declared_size_allows_a_bounded_download() {
-        let mut chunks = [Some(vec![1, 2]), Some(vec![3]), None].into_iter();
+    struct TestChunks<E> {
+        reads: Cell<usize>,
+        chunks: VecDeque<Result<Option<Vec<u8>>, E>>,
+    }
+
+    impl<E> TestChunks<E> {
+        fn new(chunks: impl IntoIterator<Item = Result<Option<Vec<u8>>, E>>) -> Self {
+            Self {
+                reads: Cell::new(0),
+                chunks: chunks.into_iter().collect(),
+            }
+        }
+    }
+
+    impl<E> DocumentChunkSource for TestChunks<E> {
+        type Error = E;
+
+        async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, Self::Error> {
+            self.reads.set(self.reads.get() + 1);
+            self.chunks.pop_front().unwrap_or(Ok(None))
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_declared_size_allows_a_bounded_download() {
+        let mut chunks =
+            TestChunks::new([Ok::<_, ()>(Some(vec![1, 2])), Ok(Some(vec![3])), Ok(None)]);
         assert_eq!(
-            aggregate_document_chunks(None, 3, || Ok::<_, ()>(chunks.next().flatten())).unwrap(),
+            aggregate_document_chunks(None, 3, &mut chunks)
+                .await
+                .unwrap(),
             vec![1, 2, 3]
         );
     }
 
-    #[test]
-    fn declared_oversize_rejects_before_reader_is_consumed() {
-        let reads = Cell::new(0);
-        let result = aggregate_document_chunks(Some(4), 3, || {
-            reads.set(reads.get() + 1);
-            Ok::<_, ()>(Some(vec![1]))
-        });
+    #[tokio::test]
+    async fn declared_oversize_rejects_before_reader_is_consumed() {
+        let mut chunks = TestChunks::new([Ok::<_, ()>(Some(vec![1]))]);
+        let result = aggregate_document_chunks(Some(4), 3, &mut chunks).await;
         assert!(matches!(
             result,
             Err(AggregateError::Acquisition(
                 AcquisitionError::DeclaredSizeExceeded
             ))
         ));
-        assert_eq!(reads.get(), 0);
+        assert_eq!(chunks.reads.get(), 0);
     }
 
-    #[test]
-    fn exact_actual_limit_succeeds() {
-        let mut chunks = [Some(vec![1, 2]), Some(vec![3]), None].into_iter();
+    #[tokio::test]
+    async fn exact_actual_limit_succeeds() {
+        let mut chunks =
+            TestChunks::new([Ok::<_, ()>(Some(vec![1, 2])), Ok(Some(vec![3])), Ok(None)]);
         assert_eq!(
-            aggregate_document_chunks(Some(3), 3, || Ok::<_, ()>(chunks.next().flatten())).unwrap(),
+            aggregate_document_chunks(Some(3), 3, &mut chunks)
+                .await
+                .unwrap(),
             vec![1, 2, 3]
         );
     }
 
-    #[test]
-    fn actual_oversize_stops_without_consuming_the_remaining_stream() {
-        let reads = Cell::new(0);
-        let mut chunks = [Some(vec![1, 2]), Some(vec![3]), Some(vec![4]), None].into_iter();
-        let result = aggregate_document_chunks(None, 2, || {
-            reads.set(reads.get() + 1);
-            Ok::<_, ()>(chunks.next().flatten())
-        });
+    #[tokio::test]
+    async fn actual_oversize_stops_without_consuming_the_remaining_stream() {
+        let mut chunks = TestChunks::new([
+            Ok::<_, ()>(Some(vec![1, 2])),
+            Ok(Some(vec![3])),
+            Ok(Some(vec![4])),
+            Ok(None),
+        ]);
+        let result = aggregate_document_chunks(None, 2, &mut chunks).await;
         assert!(matches!(
             result,
             Err(AggregateError::Acquisition(AcquisitionError::SizeExceeded))
         ));
-        assert_eq!(reads.get(), 2);
+        assert_eq!(chunks.reads.get(), 2);
     }
 
-    #[test]
-    fn transport_errors_are_preserved() {
-        let result = aggregate_document_chunks::<&'static str>(None, 3, || Err("offline"));
+    #[tokio::test]
+    async fn transport_errors_are_preserved() {
+        let mut chunks = TestChunks::new([Err::<Option<Vec<u8>>, _>("offline")]);
+        let result = aggregate_document_chunks(None, 3, &mut chunks).await;
         assert!(matches!(result, Err(AggregateError::Transport("offline"))));
     }
 }
