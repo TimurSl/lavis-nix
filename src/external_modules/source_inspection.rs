@@ -5,7 +5,7 @@
 //! an encoding we cannot decompress and verify would make the inspection meaningless.
 
 use super::manifest::{
-    ExternalModuleDescriptor, validate_display_single_line, validate_manifest_at,
+    validate_display_single_line, validate_manifest_at, ExternalModuleDescriptor,
 };
 use serde::{Serialize, Serializer};
 use std::{
@@ -445,10 +445,11 @@ impl ValidatedStage {
         self.wrapper.take()
     }
 
-    pub(crate) fn cleanup(mut self) {
+    pub(crate) fn cleanup(mut self) -> Result<(), super::installer::StageCleanupError> {
         if let Some(path) = self.wrapper.take() {
-            let _ = remove_tree_no_follow(&path);
+            super::installer::cleanup_redeemed_stage(&path)?;
         }
+        Ok(())
     }
 }
 impl Drop for ValidatedStage {
@@ -469,8 +470,8 @@ impl PendingInspection {
         self.plan.archive.expanded_bytes
     }
 
-    pub(crate) fn cleanup(self) {
-        self.stage.cleanup();
+    pub(crate) fn cleanup(self) -> Result<(), super::installer::StageCleanupError> {
+        self.stage.cleanup()
     }
 }
 
@@ -526,7 +527,7 @@ fn inspect_pending(
     match result {
         Ok(plan) => Ok(PendingInspection { plan, stage }),
         Err(error) => {
-            stage.cleanup();
+            let _ = stage.cleanup();
             Err(error)
         }
     }
@@ -549,13 +550,25 @@ fn create_stage(
         let path = root.join(format!(".lmod-install-{}", hex(&nonce)));
         match fs::create_dir(&path) {
             Ok(()) => {
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-                    .map_err(|_| SourceInspectionError::Staging)?;
-                super::installer::write_stage_marker(&path, SystemTime::now())
-                    .map_err(|_| SourceInspectionError::Staging)?;
-                return Ok(ValidatedStage {
+                // Own the directory before any fallible post-create operation.
+                // Every setup failure below removes this exact path without
+                // following links, so an unmarked wrapper cannot leak.
+                let stage = ValidatedStage {
                     wrapper: Some(path),
-                });
+                };
+                if fs::set_permissions(stage.path()?, fs::Permissions::from_mode(0o700)).is_err() {
+                    if let Ok(path) = stage.path() {
+                        let _ = remove_tree_no_follow(path);
+                    }
+                    return Err(SourceInspectionError::Staging);
+                }
+                if super::installer::write_stage_marker(stage.path()?, SystemTime::now()).is_err() {
+                    if let Ok(path) = stage.path() {
+                        let _ = remove_tree_no_follow(path);
+                    }
+                    return Err(SourceInspectionError::Staging);
+                }
+                return Ok(stage);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(_) => return Err(SourceInspectionError::Staging),
@@ -965,4 +978,293 @@ fn sha256(data: &[u8]) -> ArchiveDigest {
         result[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
     }
     ArchiveDigest(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, os::unix::fs::MetadataExt};
+
+    #[derive(Clone)]
+    struct Entry {
+        name: String,
+        data: Vec<u8>,
+        flags: u16,
+        method: u16,
+        mode: u32,
+        expanded: u32,
+    }
+
+    fn put16(out: &mut Vec<u8>, value: u16) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn put32(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn zip(entries: &[Entry]) -> Vec<u8> {
+        let mut output = Vec::new();
+        let mut offsets = Vec::new();
+        for entry in entries {
+            offsets.push(output.len() as u32);
+            put32(&mut output, LOCAL);
+            put16(&mut output, 20);
+            put16(&mut output, entry.flags);
+            put16(&mut output, entry.method);
+            put32(&mut output, 0);
+            put32(&mut output, 0);
+            put32(&mut output, entry.data.len() as u32);
+            put32(&mut output, entry.expanded);
+            put16(&mut output, entry.name.len() as u16);
+            put16(&mut output, 0);
+            output.extend_from_slice(entry.name.as_bytes());
+            output.extend_from_slice(&entry.data);
+        }
+        let central_start = output.len() as u32;
+        for (entry, offset) in entries.iter().zip(offsets) {
+            put32(&mut output, CENTRAL);
+            put16(&mut output, 0x0314);
+            put16(&mut output, 20);
+            put16(&mut output, entry.flags);
+            put16(&mut output, entry.method);
+            put32(&mut output, 0);
+            put32(&mut output, 0);
+            put32(&mut output, entry.data.len() as u32);
+            put32(&mut output, entry.expanded);
+            put16(&mut output, entry.name.len() as u16);
+            put16(&mut output, 0);
+            put16(&mut output, 0);
+            put16(&mut output, 0);
+            put16(&mut output, 0);
+            put32(&mut output, entry.mode << 16);
+            put32(&mut output, offset);
+            output.extend_from_slice(entry.name.as_bytes());
+        }
+        let central_length = output.len() as u32 - central_start;
+        put32(&mut output, EOCD);
+        put16(&mut output, 0);
+        put16(&mut output, 0);
+        put16(&mut output, entries.len() as u16);
+        put16(&mut output, entries.len() as u16);
+        put32(&mut output, central_length);
+        put32(&mut output, central_start);
+        put16(&mut output, 0);
+        output
+    }
+
+    fn file(name: &str, data: &[u8]) -> Entry {
+        Entry {
+            name: name.into(),
+            data: data.into(),
+            flags: 0,
+            method: 0,
+            mode: 0o100644,
+            expanded: data.len() as u32,
+        }
+    }
+
+    fn manifest() -> Entry {
+        file(
+            "module.json",
+            br#"{"schema_version":2,"id":"test","name":"Test","version":"1","author":"A","entrypoint":"run","commands":[{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}]}"#,
+        )
+    }
+
+    fn valid_archive() -> Vec<u8> {
+        let mut run = file("run", b"#!/bin/sh");
+        run.mode = 0o100755;
+        zip(&[manifest(), run])
+    }
+
+    struct TestRandom(u8);
+
+    impl RandomSource for TestRandom {
+        fn fill(&mut self, bytes: &mut [u8]) -> Result<(), SourceInspectionError> {
+            bytes.fill(self.0);
+            self.0 = self.0.wrapping_add(1);
+            Ok(())
+        }
+    }
+
+    fn limits() -> InspectionLimits {
+        InspectionLimits {
+            max_archive_bytes: 100_000,
+            max_files: 4,
+            max_file_bytes: 10_000,
+            max_expanded_bytes: 20_000,
+            max_path_depth: 4,
+            max_path_bytes: 32,
+            max_compression_ratio: 10,
+        }
+    }
+
+    fn root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "lavis-source-inspection-{label}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        root
+    }
+
+    #[test]
+    fn zip_rejects_encryption_compression_paths_symlinks_and_unsafe_types() {
+        let mut encrypted = file("entry", b"x");
+        encrypted.flags = 1;
+        assert_eq!(
+            validate_entry(
+                &zip_entries(&zip(&[encrypted])).unwrap()[0],
+                &limits(),
+                &mut BTreeMap::new()
+            ),
+            Err(SourceInspectionError::EncryptedArchive)
+        );
+        let mut compressed = file("entry", b"x");
+        compressed.method = 8;
+        assert_eq!(
+            validate_entry(
+                &zip_entries(&zip(&[compressed])).unwrap()[0],
+                &limits(),
+                &mut BTreeMap::new()
+            ),
+            Err(SourceInspectionError::UnsupportedCompression)
+        );
+        for path in ["../escape", "/absolute", "a\\b", "a/./b", "a/../../b"] {
+            assert_eq!(
+                validate_entry(
+                    &zip_entries(&zip(&[file(path, b"")])).unwrap()[0],
+                    &limits(),
+                    &mut BTreeMap::new()
+                ),
+                Err(SourceInspectionError::UnsafePath)
+            );
+        }
+        let mut link = file("link", b"");
+        link.mode = 0o120777;
+        assert_eq!(
+            validate_entry(
+                &zip_entries(&zip(&[link])).unwrap()[0],
+                &limits(),
+                &mut BTreeMap::new()
+            ),
+            Err(SourceInspectionError::UnsafeEntryType)
+        );
+    }
+
+    #[test]
+    fn zip_and_archive_limits_and_root_manifest_are_enforced() {
+        let mut too_large = file("entry", b"x");
+        too_large.expanded = 10_001;
+        assert_eq!(
+            validate_entry(
+                &zip_entries(&zip(&[too_large])).unwrap()[0],
+                &limits(),
+                &mut BTreeMap::new()
+            ),
+            Err(SourceInspectionError::LimitExceeded)
+        );
+        let stage_root = root("limits");
+        let mut random = TestRandom(1);
+        let stage = create_stage(&stage_root, &mut random).unwrap();
+        let mut file_limit = limits();
+        file_limit.max_files = 1;
+        assert_eq!(
+            inspect_into(
+                stage.path().unwrap().join("payload").as_path(),
+                &file_limit,
+                &valid_archive()
+            ),
+            Err(SourceInspectionError::LimitExceeded)
+        );
+        assert_eq!(
+            inspect_into(
+                stage.path().unwrap().join("payload").as_path(),
+                &limits(),
+                &zip(&[file("nested/module.json", b"{}")])
+            ),
+            Err(SourceInspectionError::RootManifest)
+        );
+        stage.cleanup().unwrap();
+        let _ = fs::remove_dir(stage_root);
+    }
+
+    #[test]
+    fn plans_are_deterministic_and_staging_is_private_and_cleaned() {
+        let root = root("plans");
+        let config = InspectionConfig {
+            staging_root: root.clone(),
+            limits: limits(),
+        };
+        let mut random = TestRandom(1);
+        let first = inspect_pending(
+            &config,
+            AcquiredLmod::archive(valid_archive()),
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
+            &mut random,
+        )
+        .unwrap();
+        let second = inspect_pending(
+            &config,
+            AcquiredLmod::archive(valid_archive()),
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(9),
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10),
+            &mut random,
+        )
+        .unwrap();
+        assert_eq!(first.plan.fingerprint, second.plan.fingerprint);
+        assert_eq!(fs::metadata(&root).unwrap().mode() & 0o777, 0o700);
+        let wrapper = first.stage.path().unwrap().to_path_buf();
+        assert!(wrapper.join("owner.json").is_file());
+        first.cleanup().unwrap();
+        second.cleanup().unwrap();
+        assert!(!wrapper.exists());
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn failed_inspection_leaves_no_wrapper_and_cleanup_never_follows_symlinks() {
+        let root = root("cleanup");
+        let config = InspectionConfig {
+            staging_root: root.clone(),
+            limits: limits(),
+        };
+        let mut random = TestRandom(1);
+        assert!(inspect_pending(
+            &config,
+            AcquiredLmod::archive(vec![1, 2, 3]),
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
+            &mut random
+        )
+        .is_err());
+        assert!(fs::read_dir(&root).unwrap().next().is_none());
+        let stage = create_stage(&root, &mut random).unwrap();
+        let wrapper = stage.path().unwrap().to_path_buf();
+        let outside = root("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep"), b"x").unwrap();
+        std::os::unix::fs::symlink(&outside, wrapper.join("link")).unwrap();
+        assert!(stage.cleanup().is_err());
+        assert!(outside.join("keep").exists());
+        let _ = fs::remove_dir_all(&outside);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn marker_creation_failure_path_keeps_cleanup_owned_by_the_stage() {
+        let root = root("marker-failure");
+        let mut random = TestRandom(1);
+        let stage = create_stage(&root, &mut random).unwrap();
+        assert!(super::installer::write_stage_marker(
+            stage.path().unwrap(),
+            SystemTime::UNIX_EPOCH
+        )
+        .is_err());
+        let wrapper = stage.path().unwrap().to_path_buf();
+        stage.cleanup().unwrap();
+        assert!(!wrapper.exists());
+        let _ = fs::remove_dir(root);
+    }
 }

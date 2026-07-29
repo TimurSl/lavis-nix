@@ -7,7 +7,7 @@
 //! re-inspects a pending stage.
 
 use rustix::{
-    fs::{CWD, RenameFlags},
+    fs::{RenameFlags, CWD},
     io::Errno,
 };
 use serde::{Deserialize, Serialize};
@@ -58,11 +58,7 @@ pub(crate) enum InstallError {
         validation: ExternalError,
     },
     #[error("installed module manifest did not validate and target rollback failed")]
-    RollbackFailed {
-        #[source]
-        validation: ExternalError,
-        cleanup: TargetCleanupError,
-    },
+    TargetCleanup(#[source] TargetCleanupError),
 }
 
 /// A rollback failure for a target that was already made visible. This is
@@ -70,7 +66,16 @@ pub(crate) enum InstallError {
 #[derive(Debug, Error)]
 #[error("target rollback failed ({kind:?})")]
 pub(crate) struct TargetCleanupError {
+    #[source]
+    pub validation: ExternalError,
     pub kind: io::ErrorKind,
+}
+
+/// A successfully installed module and the descriptor validated after its
+/// no-replace rename. The runtime must use this descriptor directly.
+#[derive(Debug)]
+pub(crate) struct InstalledModule {
+    pub(crate) descriptor: super::manifest::ExternalModuleDescriptor,
 }
 
 /// The only marker schema accepted during abandoned-wrapper cleanup.
@@ -122,7 +127,7 @@ pub(crate) fn cleanup_abandoned_wrappers(
         if !is_plain_directory(&wrapper)? || read_stage_marker(&wrapper).is_err() {
             continue;
         }
-        if let Err(error) = remove_tree_no_follow(&wrapper) {
+        if let Err(error) = remove_marked_wrapper_no_follow(&wrapper) {
             failures.push(StageCleanupError {
                 wrapper,
                 kind: error.kind(),
@@ -151,7 +156,7 @@ pub(crate) fn install_staged_module(
     wrapper: &Path,
     install_root: &Path,
     module_id: &str,
-) -> Result<(), InstallError> {
+) -> Result<InstalledModule, InstallError> {
     validate_module_id(module_id).map_err(|_| InstallError::InvalidModuleId)?;
     if !is_plain_directory(wrapper)? {
         return Err(InstallError::UnsafeStage);
@@ -170,15 +175,18 @@ pub(crate) fn install_staged_module(
         Err(error) => return Err(map_rename_error(error)),
     }
 
-    if let Err(validation) = validate_manifest_at(&target.join("module.json"), Some(module_id)) {
-        return match remove_tree_no_follow(&target) {
-            Ok(()) => Err(InstallError::PostInstallValidationFailed { validation }),
-            Err(error) => Err(InstallError::RollbackFailed {
-                validation,
-                cleanup: TargetCleanupError { kind: error.kind() },
-            }),
-        };
-    }
+    let descriptor = match validate_manifest_at(&target.join("module.json"), Some(module_id)) {
+        Ok(descriptor) => descriptor,
+        Err(validation) => {
+            return match remove_tree_no_follow(&target) {
+                Ok(()) => Err(InstallError::PostInstallValidationFailed { validation }),
+                Err(error) => Err(InstallError::TargetCleanup(TargetCleanupError {
+                    validation,
+                    kind: error.kind(),
+                })),
+            };
+        }
+    };
 
     // After the child has moved, the wrapper contains only owner.json.  Its
     // cleanup is best effort: a successful atomic install remains successful.
@@ -189,15 +197,18 @@ pub(crate) fn install_staged_module(
             "Installed external module successfully but could not remove its empty staging wrapper"
         );
     }
-    Ok(())
+    Ok(InstalledModule { descriptor })
 }
 
 /// Removes only a redeemed wrapper. Other live approvals are never touched.
 pub(crate) fn cleanup_redeemed_stage(wrapper: &Path) -> Result<(), StageCleanupError> {
     if !matches!(is_plain_directory(wrapper), Ok(true)) || read_stage_marker(wrapper).is_err() {
-        return Ok(());
+        return Err(StageCleanupError {
+            wrapper: wrapper.to_path_buf(),
+            kind: io::ErrorKind::InvalidData,
+        });
     }
-    remove_tree_no_follow(wrapper).map_err(|error| StageCleanupError {
+    remove_marked_wrapper_no_follow(wrapper).map_err(|error| StageCleanupError {
         wrapper: wrapper.to_path_buf(),
         kind: error.kind(),
     })
@@ -233,11 +244,45 @@ fn is_plain_directory(path: &Path) -> Result<bool, InstallError> {
 
 fn remove_empty_wrapper(wrapper: &Path) -> io::Result<()> {
     let owner = wrapper.join(OWNER_FILE);
-    if fs::symlink_metadata(&owner)?.file_type().is_symlink() {
+    let metadata = fs::symlink_metadata(&owner)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "owner symlink"));
     }
+    let marker = fs::read(&owner)?;
     fs::remove_file(owner)?;
-    fs::remove_dir(wrapper)
+    match fs::remove_dir(wrapper) {
+        Ok(()) => Ok(()),
+        Err(remove_error) => {
+            // Restore the exact marker before reporting failure. Startup cleanup
+            // can then identify this wrapper even when a concurrent or stray
+            // file prevented removing the directory.
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(wrapper.join(OWNER_FILE))
+            {
+                Ok(mut file) => match file.write_all(&marker) {
+                    Ok(()) => Err(remove_error),
+                    Err(restore_error) => Err(restore_error),
+                },
+                Err(restore_error) => Err(restore_error),
+            }
+        }
+    }
+}
+
+/// Remove a known installer wrapper while preserving `owner.json` until every
+/// payload child has been removed. A failure before the final two operations
+/// leaves the marker intact for startup cleanup.
+fn remove_marked_wrapper_no_follow(wrapper: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(wrapper)? {
+        let entry = entry?;
+        if entry.file_name() == OWNER_FILE {
+            continue;
+        }
+        remove_tree_no_follow(&entry.path())?;
+    }
+    remove_empty_wrapper(wrapper)
 }
 
 fn remove_tree_no_follow(path: &Path) -> io::Result<()> {
@@ -275,6 +320,31 @@ fn remove_tree_no_follow(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
+
+    fn root(label: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("lavis-installer-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn wrapper(root: &Path, invalid_manifest: bool) -> std::path::PathBuf {
+        let wrapper = root.join(".lmod-install-test");
+        fs::create_dir(&wrapper).unwrap();
+        write_stage_marker(&wrapper, SystemTime::UNIX_EPOCH).unwrap();
+        let payload = wrapper.join(STAGE_CHILD);
+        fs::create_dir(&payload).unwrap();
+        fs::write(
+            payload.join("module.json"),
+            if invalid_manifest { b"{}" } else { b"{\"schema_version\":2,\"id\":\"test\",\"name\":\"Test\",\"version\":\"1\",\"author\":\"A\",\"entrypoint\":\"run\",\"commands\":[{\"name\":\"go\",\"summary_ru\":\"x\",\"description_ru\":\"x\",\"usage\":\"<value>\"}]}" },
+        ).unwrap();
+        fs::write(payload.join("run"), b"#!/bin/sh").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(payload.join("run"), fs::Permissions::from_mode(0o700)).unwrap();
+        wrapper
+    }
 
     #[test]
     fn owner_schema_rejects_unknown_fields() {
@@ -294,5 +364,97 @@ mod tests {
             map_rename_error(Errno::XDEV),
             InstallError::CrossDevice
         ));
+    }
+
+    #[test]
+    fn failed_empty_wrapper_removal_restores_its_marker() {
+        let wrapper = std::env::temp_dir().join(format!(
+            "lavis-installer-wrapper-cleanup-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&wrapper);
+        fs::create_dir(&wrapper).unwrap();
+        write_stage_marker(&wrapper, SystemTime::UNIX_EPOCH).unwrap();
+        fs::write(wrapper.join("prevents-removal"), b"x").unwrap();
+
+        assert!(remove_empty_wrapper(&wrapper).is_err());
+        assert!(wrapper.join(OWNER_FILE).is_file());
+        assert!(read_stage_marker(&wrapper).is_ok());
+
+        fs::remove_dir_all(&wrapper).unwrap();
+    }
+
+    #[test]
+    fn target_collision_preserves_marked_payload() {
+        let root = root("collision");
+        let wrapper = wrapper(&root, false);
+        let install_root = root.join("installed");
+        fs::create_dir(&install_root).unwrap();
+        fs::create_dir(install_root.join("test")).unwrap();
+        assert!(matches!(
+            install_staged_module(&wrapper, &install_root, "test"),
+            Err(InstallError::TargetExists)
+        ));
+        assert!(wrapper.join(OWNER_FILE).is_file());
+        assert!(wrapper.join(STAGE_CHILD).is_dir());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn validation_failure_rolls_back_target_and_retains_marker() {
+        let root = root("rollback");
+        let wrapper = wrapper(&root, true);
+        let install_root = root.join("installed");
+        fs::create_dir(&install_root).unwrap();
+        assert!(matches!(
+            install_staged_module(&wrapper, &install_root, "test"),
+            Err(InstallError::PostInstallValidationFailed { .. })
+        ));
+        assert!(!install_root.join("test").exists());
+        assert!(read_stage_marker(&wrapper).is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_failure_retains_validation_error() {
+        let root = root("rollback-failure");
+        let wrapper = wrapper(&root, true);
+        symlink(
+            "/does-not-matter",
+            wrapper.join(STAGE_CHILD).join("blocks-cleanup"),
+        )
+        .unwrap();
+        let install_root = root.join("installed");
+        fs::create_dir(&install_root).unwrap();
+        match install_staged_module(&wrapper, &install_root, "test") {
+            Err(InstallError::TargetCleanup(error)) => {
+                assert!(matches!(error.validation, ExternalError::MalformedManifest));
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn marker_symlinks_and_unknown_fields_are_rejected() {
+        let root = root("marker");
+        let wrapper = root.join(".lmod-install-marker");
+        fs::create_dir(&wrapper).unwrap();
+        fs::write(
+            wrapper.join(OWNER_FILE),
+            br#"{"format":1,"created_by":"lavis","created_at":1,"extra":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            read_stage_marker(&wrapper),
+            Err(InstallError::InvalidMarker)
+        ));
+        fs::remove_file(wrapper.join(OWNER_FILE)).unwrap();
+        symlink("/tmp", wrapper.join(OWNER_FILE)).unwrap();
+        assert!(matches!(
+            read_stage_marker(&wrapper),
+            Err(InstallError::InvalidMarker)
+        ));
+        let _ = fs::remove_dir_all(root);
     }
 }

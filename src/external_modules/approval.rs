@@ -285,11 +285,15 @@ impl<C: Clock, R: RandomSource> ApprovalStore<C, R> {
     }
 
     fn cleanup_pending(&self, approval_id: Option<ApprovalId>, pending: PendingInspection) {
-        tracing::warn!(
-            approval_id = ?approval_id,
-            "removing approval staging; cleanup is best effort"
-        );
-        pending.cleanup();
+        if let Err(error) = pending.cleanup() {
+            tracing::warn!(
+                event = "external_module_approval_stage_cleanup_failed",
+                approval_id = ?approval_id,
+                wrapper = %error.wrapper.display(),
+                error_kind = ?error.kind,
+                "approval was removed but its staging wrapper remains for startup cleanup"
+            );
+        }
     }
 
     fn fresh_id(&mut self) -> Result<ApprovalId, ApprovalError> {
@@ -323,8 +327,14 @@ fn is_expired(now: SystemTime, expires_at: SystemTime) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::external_modules::source_inspection::SourceInspectionError;
-    use std::collections::{BTreeMap, HashSet};
+    use crate::external_modules::source_inspection::{
+        AcquiredLmod, InspectionConfig, InspectionLimits, ModuleInspector, SourceInspectionError,
+    };
+    use std::{
+        cell::Cell,
+        collections::{BTreeMap, HashSet},
+        fs,
+    };
 
     struct SequenceRandom(Vec<[u8; APPROVAL_ID_BYTES]>);
 
@@ -334,6 +344,107 @@ mod tests {
             output.copy_from_slice(&bytes);
             Ok(())
         }
+    }
+
+    struct StageRandom;
+
+    impl RandomSource for StageRandom {
+        fn fill(&mut self, output: &mut [u8]) -> Result<(), SourceInspectionError> {
+            output.fill(1);
+            Ok(())
+        }
+    }
+
+    struct TestClock(Cell<SystemTime>);
+
+    impl Clock for TestClock {
+        fn now(&self) -> SystemTime {
+            self.0.get()
+        }
+    }
+
+    fn put16(output: &mut Vec<u8>, value: u16) {
+        output.extend_from_slice(&value.to_le_bytes());
+    }
+    fn put32(output: &mut Vec<u8>, value: u32) {
+        output.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn valid_archive() -> Vec<u8> {
+        let manifest = br#"{"schema_version":2,"id":"test","name":"Test","version":"1","author":"A","entrypoint":"run","commands":[{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}]}"#;
+        let entries = [
+            ("module.json", &manifest[..], 0o100644_u32),
+            ("run", &b"#!/bin/sh"[..], 0o100755_u32),
+        ];
+        let mut output = Vec::new();
+        let mut offsets = Vec::new();
+        for (name, data, _) in &entries {
+            offsets.push(output.len() as u32);
+            put32(&mut output, 0x0403_4b50);
+            put16(&mut output, 20);
+            put16(&mut output, 0);
+            put16(&mut output, 0);
+            put32(&mut output, 0);
+            put32(&mut output, 0);
+            put32(&mut output, data.len() as u32);
+            put32(&mut output, data.len() as u32);
+            put16(&mut output, name.len() as u16);
+            put16(&mut output, 0);
+            output.extend_from_slice(name.as_bytes());
+            output.extend_from_slice(data);
+        }
+        let central = output.len() as u32;
+        for ((name, data, mode), offset) in entries.iter().zip(offsets) {
+            put32(&mut output, 0x0201_4b50);
+            put16(&mut output, 0x0314);
+            put16(&mut output, 20);
+            put16(&mut output, 0);
+            put16(&mut output, 0);
+            put32(&mut output, 0);
+            put32(&mut output, 0);
+            put32(&mut output, data.len() as u32);
+            put32(&mut output, data.len() as u32);
+            put16(&mut output, name.len() as u16);
+            put16(&mut output, 0);
+            put16(&mut output, 0);
+            put16(&mut output, 0);
+            put16(&mut output, 0);
+            put32(&mut output, mode << 16);
+            put32(&mut output, offset);
+            output.extend_from_slice(name.as_bytes());
+        }
+        let length = output.len() as u32 - central;
+        put32(&mut output, 0x0605_4b50);
+        put16(&mut output, 0);
+        put16(&mut output, 0);
+        put16(&mut output, 2);
+        put16(&mut output, 2);
+        put32(&mut output, length);
+        put32(&mut output, central);
+        put16(&mut output, 0);
+        output
+    }
+
+    fn pending(root: &std::path::Path) -> PendingInspection {
+        let config = InspectionConfig {
+            staging_root: root.to_path_buf(),
+            limits: InspectionLimits::default(),
+        };
+        let mut inspector = ModuleInspector::new(&config, StageRandom);
+        inspector
+            .inspect(
+                AcquiredLmod::archive(valid_archive()),
+                SystemTime::UNIX_EPOCH,
+                SystemTime::UNIX_EPOCH,
+            )
+            .unwrap()
+    }
+
+    fn root(label: &str) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("lavis-approval-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        root
     }
 
     #[test]
@@ -389,5 +500,42 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH;
         assert!(is_expired(now, now));
         assert!(!is_expired(now, now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn issue_redeem_revoke_expiry_and_shutdown_release_real_stages() {
+        let root = root("lifecycle");
+        let clock = TestClock(Cell::new(SystemTime::UNIX_EPOCH));
+        let mut store = ApprovalStore::new(
+            clock,
+            SequenceRandom(vec![[2; 10], [3; 10], [4; 10], [5; 10]]),
+            DEFAULT_APPROVAL_TTL,
+            ApprovalLimits {
+                max_entries: 1,
+                max_pending_expanded_bytes: u64::MAX,
+            },
+        );
+        let (first_id, _) = store.issue(pending(&root)).unwrap();
+        assert_eq!(store.entries.len(), 1);
+        let redeemed = store.redeem(first_id).unwrap();
+        assert_eq!(store.pending_expanded_bytes, 0);
+        redeemed.cleanup().unwrap();
+        let (second_id, _) = store.issue(pending(&root)).unwrap();
+        assert!(store.revoke(second_id).unwrap());
+        assert_eq!(store.entries.len(), 0);
+        let (third_id, _) = store.issue(pending(&root)).unwrap();
+        store
+            .clock
+            .0
+            .set(SystemTime::UNIX_EPOCH + DEFAULT_APPROVAL_TTL);
+        assert_eq!(store.purge_expired().unwrap(), 1);
+        assert!(matches!(
+            store.get(third_id),
+            Err(ApprovalError::Unavailable)
+        ));
+        let (_, _) = store.issue(pending(&root)).unwrap();
+        assert_eq!(store.shutdown().unwrap(), 1);
+        assert_eq!(store.pending_expanded_bytes, 0);
+        let _ = fs::remove_dir_all(root);
     }
 }

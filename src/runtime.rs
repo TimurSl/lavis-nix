@@ -863,41 +863,43 @@ impl RuntimeState {
         let Some(wrapper) = pending.stage.take_wrapper() else {
             return Response::plain("⚠️ Проверенный пакет недоступен.".to_owned());
         };
-        let result = crate::external_modules::installer::install_staged_module(
+        let installed = match crate::external_modules::installer::install_staged_module(
             &wrapper,
             &installation.root,
             &module_id,
-        );
-        if let Err(error) = result {
-            if let Err(cleanup) =
-                crate::external_modules::installer::cleanup_redeemed_stage(&wrapper)
-            {
-                tracing::warn!(
-                    event = "external_module_redeemed_stage_cleanup_failed",
-                    wrapper = %cleanup.wrapper.display(),
-                    ?cleanup.kind,
-                    "Could not remove redeemed external module staging"
-                );
+        ) {
+            Ok(installed) => installed,
+            Err(error) => {
+                if let Err(cleanup) =
+                    crate::external_modules::installer::cleanup_redeemed_stage(&wrapper)
+                {
+                    tracing::warn!(
+                        event = "external_module_redeemed_stage_cleanup_failed",
+                        wrapper = %cleanup.wrapper.display(),
+                        ?cleanup.kind,
+                        "Could not remove redeemed external module staging"
+                    );
+                }
+                return match error {
+                    crate::external_modules::installer::InstallError::TargetCleanup(_) => {
+                        Response::plain("⚠️ Установка не завершена: откат цели не удался; проверьте каталог модулей вручную.".to_owned())
+                    }
+                    crate::external_modules::installer::InstallError::PostInstallValidationFailed { .. } => {
+                        Response::plain("⚠️ Установка не выполнена: финальная проверка не пройдена, цель удалена.".to_owned())
+                    }
+                    _ => Response::plain("⚠️ Установка не выполнена.".to_owned()),
+                };
             }
-            return match error {
-                crate::external_modules::installer::InstallError::RollbackFailed { .. } => {
-                    Response::plain("⚠️ Установка не завершена: откат цели не удался; проверьте каталог модулей вручную.".to_owned())
-                }
-                crate::external_modules::installer::InstallError::PostInstallValidationFailed { .. } => {
-                    Response::plain("⚠️ Установка не выполнена: финальная проверка не пройдена, цель удалена.".to_owned())
-                }
-                _ => Response::plain("⚠️ Установка не выполнена.".to_owned()),
-            };
-        }
-        let descriptor = match crate::external_modules::manifest::validate_manifest_at(&installation.root.join(&module_id).join("module.json"), Some(&module_id)) {
-            Ok(descriptor) => descriptor,
-            Err(_) => return Response::plain("⚠️ Установленный модуль не прошёл финальную проверку; цель сохранена для ручной проверки.".to_owned()),
         };
         if let Some(handle) = &self.external_manager {
             let mut manager = handle.lock().await;
-            let mut descriptors = manager.descriptors().to_vec();
-            descriptors.push(descriptor);
-            manager.set_descriptors(descriptors);
+            if !manager.register_installed_descriptor(installed.descriptor) {
+                tracing::warn!(
+                    event = "external_module_descriptor_registration_duplicate",
+                    module_id = %module_id,
+                    "Installed external module already has a registered descriptor"
+                );
+            }
         }
         self.refresh_snapshot().await;
         Response::plain(format!("✅ Модуль «{module_id}» установлен и выключен."))

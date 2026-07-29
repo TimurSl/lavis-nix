@@ -58,6 +58,17 @@ impl ExternalManager {
         &self.descriptors
     }
 
+    /// Registers a newly installed descriptor without changing process or
+    /// enabled-state ownership. A duplicate ID is rejected before mutation so
+    /// a stale runtime snapshot cannot create ambiguous command routing.
+    pub fn register_installed_descriptor(&mut self, descriptor: ExternalModuleDescriptor) -> bool {
+        if self.descriptor_by_id(&descriptor.id).is_some() {
+            return false;
+        }
+        self.descriptors.push(descriptor);
+        true
+    }
+
     pub fn descriptor_by_id(&self, id: &str) -> Option<&ExternalModuleDescriptor> {
         self.descriptors.iter().find(|d| d.id == id)
     }
@@ -459,13 +470,12 @@ mod tests {
     use crate::external_modules::manifest::{ExternalCommandDescriptor, ExternalModuleDescriptor};
     use std::path::PathBuf;
 
-    #[test]
-    fn discovered_but_not_running_module_is_disabled_with_descriptor_command_count() {
-        let descriptor = ExternalModuleDescriptor {
+    fn descriptor(id: &str, version: &str) -> ExternalModuleDescriptor {
+        ExternalModuleDescriptor {
             protocol_version: 2,
-            id: "sample".to_owned(),
+            id: id.to_owned(),
             display_name: "Sample".to_owned(),
-            version: "1.0".to_owned(),
+            version: version.to_owned(),
             author: "Author".to_owned(),
             entrypoint: PathBuf::from("run"),
             module_dir: PathBuf::new(),
@@ -480,12 +490,28 @@ mod tests {
                 usage: "run".to_owned(),
                 examples: vec![],
             }],
-        };
+        }
+    }
+
+    #[test]
+    fn discovered_but_not_running_module_is_disabled_with_descriptor_command_count() {
         let mut manager = ExternalManager::new();
-        manager.set_descriptors(vec![descriptor]);
+        manager.set_descriptors(vec![descriptor("sample", "1.0")]);
 
         let statuses = manager.statuses();
         assert_eq!(statuses[0].status, "установлен, выключен");
         assert_eq!(statuses[0].command_count, 1);
+    }
+
+    #[test]
+    fn installed_descriptor_registration_rejects_duplicates_without_starting_a_process() {
+        let mut manager = ExternalManager::new();
+        assert!(manager.register_installed_descriptor(descriptor("sample", "1.0")));
+        assert!(!manager.register_installed_descriptor(descriptor("sample", "2.0")));
+
+        assert_eq!(manager.descriptors().len(), 1);
+        assert_eq!(manager.descriptor_by_id("sample").unwrap().version, "1.0");
+        assert!(!manager.has_running_process("sample"));
+        assert!(manager.command_refs().is_empty());
     }
 }
