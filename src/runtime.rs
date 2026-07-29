@@ -198,6 +198,13 @@ pub(crate) struct RuntimeExecution {
     pub provision: Option<ProvisionRequest>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct MessageExecutionContext<'a> {
+    pub(crate) message: &'a Message,
+    pub(crate) edited: bool,
+    pub(crate) authored_by_self: bool,
+}
+
 impl From<Response> for RuntimeExecution {
     fn from(response: Response) -> Self {
         Self {
@@ -644,9 +651,7 @@ impl RuntimeState {
         action: &Action,
         message_id: i32,
         peer_id: PeerId,
-        message: &Message,
-        edited: bool,
-        authored_by_self: bool,
+        message_context: MessageExecutionContext<'_>,
     ) -> RuntimeExecution {
         self.recognized_commands = self.recognized_commands.saturating_add(1);
         let prefix = self.prefix().to_owned();
@@ -702,10 +707,7 @@ impl RuntimeState {
             Action::Alias(request) => self.execute_alias(request, &prefix).await,
             Action::Prefix(request) => self.execute_prefix(request).await,
             Action::Modules(request) => self.execute_modules(request, &prefix),
-            Action::Lm(request) => {
-                self.execute_lm(client, message, request, edited, authored_by_self)
-                    .await
-            }
+            Action::Lm(request) => self.execute_lm(client, message_context, request).await,
             Action::Setup(_) => unreachable!("setup actions return before response dispatch"),
             Action::External(invocation) => self.execute_external(invocation).await,
         }
@@ -715,10 +717,8 @@ impl RuntimeState {
     async fn execute_lm(
         &mut self,
         client: &Client,
-        message: &Message,
+        message_context: MessageExecutionContext<'_>,
         request: &LmRequest,
-        edited: bool,
-        authored_by_self: bool,
     ) -> Response {
         match self.module_approvals.list_pending() {
             Ok(pending) => tracing::debug!(
@@ -738,15 +738,20 @@ impl RuntimeState {
                 self.render_lm_list()
             }
             LmRequest::Invalid => Response::plain(lm_usage(self.prefix())),
-            LmRequest::Install | LmRequest::Confirm { .. } | LmRequest::Cancel { .. } if edited => {
+            LmRequest::Install | LmRequest::Confirm { .. } | LmRequest::Cancel { .. }
+                if message_context.edited =>
+            {
                 Response::plain(EDITED_LM_STATE_CHANGE.to_owned())
             }
             LmRequest::Install | LmRequest::Confirm { .. } | LmRequest::Cancel { .. }
-                if !self.is_lm_saved_message(message, authored_by_self) =>
+                if !self.is_lm_saved_message(message_context) =>
             {
                 Response::plain(LM_SAVED_MESSAGES_ONLY.to_owned())
             }
-            LmRequest::Install => self.inspect_module_install(client, message).await,
+            LmRequest::Install => {
+                self.inspect_module_install(client, message_context.message)
+                    .await
+            }
             LmRequest::Confirm { approval_id } => self.confirm_module_install(approval_id).await,
             LmRequest::Cancel { approval_id } => self.cancel_module_install(approval_id),
         }
@@ -779,13 +784,13 @@ impl RuntimeState {
         }
     }
 
-    fn is_lm_saved_message(&self, message: &Message, authored_by_self: bool) -> bool {
+    fn is_lm_saved_message(&self, message_context: MessageExecutionContext<'_>) -> bool {
         self.module_installation
             .as_ref()
             .is_some_and(|installation| {
-                authored_by_self
-                    && message.outgoing()
-                    && message.peer_id() == installation.saved_messages_peer
+                message_context.authored_by_self
+                    && message_context.message.outgoing()
+                    && message_context.message.peer_id() == installation.saved_messages_peer
             })
     }
 

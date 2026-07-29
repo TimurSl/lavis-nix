@@ -11,7 +11,10 @@ use tokio::task::JoinSet;
 use crate::{
     command::parse,
     commands::{Action, dispatch},
-    runtime::{CreatedEventDispatchResult, RuntimeState, invocation_error_category},
+    runtime::{
+        CreatedEventDispatchResult, MessageExecutionContext, RuntimeState,
+        invocation_error_category,
+    },
     setup_telegram::{ProvisionOutcome, ProvisionRequest},
 };
 
@@ -397,9 +400,11 @@ async fn process_update(
             &action,
             message_id,
             peer_id,
-            &message,
-            edited,
-            authored_by_self,
+            MessageExecutionContext {
+                message: &message,
+                edited,
+                authored_by_self,
+            },
         )
         .await;
     if let Some(request) = execution.provision

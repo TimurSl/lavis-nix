@@ -368,9 +368,7 @@ fn parse_lm_request(args: &str) -> LmRequest {
 }
 
 fn parse_lm_approval(mut tokens: std::str::SplitWhitespace<'_>) -> Option<ApprovalId> {
-    let Some(value) = tokens.next() else {
-        return None;
-    };
+    let value = tokens.next()?;
     if tokens.next().is_some() || !is_canonical_approval_id(value) {
         return None;
     }
