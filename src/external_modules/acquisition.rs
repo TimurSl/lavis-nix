@@ -116,7 +116,7 @@ impl DocumentChunkSource for TelegramDownload<'_> {
     }
 }
 
-/// Acquires one outgoing document from the account's Saved Messages. The
+/// Acquires one self-authored document from the account's Saved Messages. The
 /// message object is a fresh update snapshot; callers must not substitute an
 /// arbitrary message id or peer. Declared size is only a preflight: every
 /// downloaded chunk is counted before it is retained.
@@ -142,8 +142,13 @@ impl<'a> ModuleSourceAcquirer<'a> {
         &self,
         message: &grammers_client::message::Message,
     ) -> Result<AcquiredLmod, AcquisitionError> {
-        if !message.outgoing() || message.id() <= 0 || message.peer_id() != self.saved_messages_peer
-        {
+        if !is_fresh_self_authored_saved_message(
+            message.sender_id(),
+            message.outgoing(),
+            message.peer_id(),
+            message.id(),
+            self.saved_messages_peer,
+        ) {
             return Err(AcquisitionError::NotSavedMessage);
         }
         let media = message.media().ok_or(AcquisitionError::NotLmodDocument)?;
@@ -166,6 +171,21 @@ impl<'a> ModuleSourceAcquirer<'a> {
                 })?;
         Ok(AcquiredLmod::archive(bytes))
     }
+}
+
+fn is_fresh_self_authored_saved_message(
+    sender_id: Option<PeerId>,
+    outgoing: bool,
+    peer_id: PeerId,
+    message_id: i32,
+    saved_messages_peer: PeerId,
+) -> bool {
+    let authored_by_self = match sender_id {
+        Some(sender_id) if sender_id == PeerId::self_user() => outgoing,
+        Some(sender_id) => sender_id == saved_messages_peer,
+        None => false,
+    };
+    authored_by_self && message_id > 0 && peer_id == saved_messages_peer
 }
 
 #[cfg(test)]
@@ -194,6 +214,102 @@ mod tests {
             self.reads.set(self.reads.get() + 1);
             self.chunks.pop_front().unwrap_or(Ok(None))
         }
+    }
+
+    #[test]
+    fn acquisition_gate_accepts_concrete_self_sender_regardless_of_outgoing() {
+        let self_user_id = PeerId::user(1).unwrap();
+
+        assert!(is_fresh_self_authored_saved_message(
+            Some(self_user_id),
+            false,
+            self_user_id,
+            1,
+            self_user_id,
+        ));
+        assert!(is_fresh_self_authored_saved_message(
+            Some(self_user_id),
+            true,
+            self_user_id,
+            1,
+            self_user_id,
+        ));
+    }
+
+    #[test]
+    fn acquisition_gate_handles_self_sentinel_only_when_outgoing() {
+        let self_user_id = PeerId::user(1).unwrap();
+
+        assert!(is_fresh_self_authored_saved_message(
+            Some(PeerId::self_user()),
+            true,
+            self_user_id,
+            1,
+            self_user_id,
+        ));
+        assert!(!is_fresh_self_authored_saved_message(
+            Some(PeerId::self_user()),
+            false,
+            self_user_id,
+            1,
+            self_user_id,
+        ));
+    }
+
+    #[test]
+    fn acquisition_gate_rejects_missing_or_other_sender_regardless_of_outgoing() {
+        let self_user_id = PeerId::user(1).unwrap();
+        let other_user_id = PeerId::user(2).unwrap();
+
+        assert!(!is_fresh_self_authored_saved_message(
+            None,
+            false,
+            self_user_id,
+            1,
+            self_user_id,
+        ));
+        assert!(!is_fresh_self_authored_saved_message(
+            None,
+            true,
+            self_user_id,
+            1,
+            self_user_id,
+        ));
+        assert!(!is_fresh_self_authored_saved_message(
+            Some(other_user_id),
+            false,
+            self_user_id,
+            1,
+            self_user_id,
+        ));
+        assert!(!is_fresh_self_authored_saved_message(
+            Some(other_user_id),
+            true,
+            self_user_id,
+            1,
+            self_user_id,
+        ));
+    }
+
+    #[test]
+    fn acquisition_gate_rejects_wrong_peer_and_invalid_id() {
+        let self_user_id = PeerId::user(1).unwrap();
+        let other_user_id = PeerId::user(2).unwrap();
+
+        assert!(!is_fresh_self_authored_saved_message(
+            Some(self_user_id),
+            false,
+            other_user_id,
+            1,
+            self_user_id,
+        ));
+        assert!(!is_fresh_self_authored_saved_message(
+            Some(self_user_id),
+            false,
+            self_user_id,
+            0,
+            self_user_id,
+        ));
     }
 
     #[tokio::test]

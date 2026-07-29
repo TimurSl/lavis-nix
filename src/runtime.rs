@@ -811,9 +811,12 @@ impl RuntimeState {
         self.module_installation
             .as_ref()
             .is_some_and(|installation| {
-                message_context.authored_by_self
-                    && message_context.message.outgoing()
-                    && message_context.message.peer_id() == installation.saved_messages_peer
+                is_fresh_self_authored_saved_message(
+                    message_context.authored_by_self,
+                    message_context.message.peer_id(),
+                    message_context.message.id(),
+                    installation.saved_messages_peer,
+                )
             })
     }
 
@@ -821,21 +824,20 @@ impl RuntimeState {
         let Some(installation) = &self.module_installation else {
             return Response::plain("⚠️ Установка внешних модулей недоступна.".to_owned());
         };
-        let acquired =
-            match ModuleSourceAcquirer::new(
-                client,
-                installation.saved_messages_peer,
-                AcquisitionLimits::default(),
-            )
-            .acquire(message)
-            .await
-            {
-                Ok(acquired) => acquired,
-                Err(_) => return Response::plain(
-                    "⚠️ Прикрепите документ .lmod к новому исходящему сообщению в Saved Messages."
-                        .to_owned(),
-                ),
-            };
+        let acquired = match ModuleSourceAcquirer::new(
+            client,
+            installation.saved_messages_peer,
+            AcquisitionLimits::default(),
+        )
+        .acquire(message)
+        .await
+        {
+            Ok(acquired) => acquired,
+            Err(_) => return Response::plain(
+                "⚠️ Прикрепите документ .lmod к новому собственному сообщению в Saved Messages."
+                    .to_owned(),
+            ),
+        };
         let config = InspectionConfig {
             staging_root: installation.staging_root.clone(),
             limits: InspectionLimits::default(),
@@ -1094,6 +1096,15 @@ impl RuntimeState {
             )),
         }
     }
+}
+
+fn is_fresh_self_authored_saved_message(
+    authored_by_self: bool,
+    peer_id: PeerId,
+    message_id: i32,
+    saved_messages_peer: PeerId,
+) -> bool {
+    authored_by_self && message_id > 0 && peer_id == saved_messages_peer
 }
 
 fn lm_usage(prefix: &str) -> String {
@@ -1833,8 +1844,8 @@ fn format_stats(
 mod tests {
     use super::{
         EDITED_LM_STATE_CHANGE, ProcStats, bounded_list, external_event_error_category,
-        fastfetch_response, format_duration, format_latency, format_stats, lm_usage,
-        parse_memory_kib, parse_system_uptime,
+        fastfetch_response, format_duration, format_latency, format_stats,
+        is_fresh_self_authored_saved_message, lm_usage, parse_memory_kib, parse_system_uptime,
     };
     use crate::response::Response;
     use crate::{
@@ -2581,6 +2592,45 @@ for line in sys.stdin:
             EDITED_LM_STATE_CHANGE,
             "⚠️ Изменённые сообщения не могут изменять состояние установки."
         );
+    }
+
+    #[test]
+    fn lm_install_gate_accepts_self_authored_saved_message_when_outgoing_is_false() {
+        let self_user_id = PeerId::user(1).unwrap();
+        let outgoing = false;
+
+        assert!(!outgoing);
+        assert!(is_fresh_self_authored_saved_message(
+            true,
+            self_user_id,
+            1,
+            self_user_id,
+        ));
+    }
+
+    #[test]
+    fn lm_install_gate_rejects_nonfresh_wrong_peer_and_nonself_messages() {
+        let self_user_id = PeerId::user(1).unwrap();
+        let other_user_id = PeerId::user(2).unwrap();
+
+        assert!(!is_fresh_self_authored_saved_message(
+            true,
+            self_user_id,
+            0,
+            self_user_id,
+        ));
+        assert!(!is_fresh_self_authored_saved_message(
+            true,
+            other_user_id,
+            1,
+            self_user_id,
+        ));
+        assert!(!is_fresh_self_authored_saved_message(
+            false,
+            self_user_id,
+            1,
+            self_user_id,
+        ));
     }
 
     #[test]
