@@ -2110,7 +2110,7 @@ mod tests {
             runtime.execute_modules(&crate::commands::ModulesRequest::Overview, runtime.prefix());
         assert!(overview.text.starts_with("🧩 Модули Lavis: 3\n\n"));
         assert!(overview.text.contains("🦀fastfetch"));
-        assert!(overview.text.contains("Команды (8)"));
+        assert!(overview.text.contains("Команды (9)"));
         assert_eq!(overview.entities.len(), 2);
         assert_eq!(
             runtime.execute_modules(&crate::commands::ModulesRequest::Invalid, runtime.prefix(),),
@@ -2128,7 +2128,7 @@ mod tests {
             "🧩 Модули Lavis: 3\n\n"
         );
         let body = String::from_utf16(&units[offset..offset + length]).unwrap();
-        assert!(body.contains("Команды (8)"));
+        assert!(body.contains("Команды (9)"));
         let grammers_client::tl::enums::MessageEntity::Blockquote(provenance) =
             &overview.entities[1]
         else {
