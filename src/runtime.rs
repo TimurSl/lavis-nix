@@ -1,11 +1,11 @@
 use std::{
     collections::VecDeque,
     path::PathBuf,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use futures_util::future::join_all;
-use grammers_client::{Client, tl};
+use grammers_client::{Client, message::Message, tl};
 use grammers_session::types::PeerId;
 
 use crate::{
@@ -13,17 +13,22 @@ use crate::{
     bot_api::{BotApi, HttpBotApi},
     command::Command,
     commands::{
-        Action, AliasRequest, ExternalInvocation, ModulesRequest, PrefixRequest, SetupRequest,
+        Action, AliasRequest, ExternalInvocation, LmRequest, ModulesRequest, PrefixRequest, SetupRequest,
         dispatch,
     },
     error::ExternalError,
     external_modules::manager::{ExternalManagerHandle, ExternalRuntimeSnapshot},
     external_modules::{
+        acquisition::{AcquisitionLimits, ModuleSourceAcquirer},
+        approval::{
+            DEFAULT_APPROVAL_TTL, ApprovalError, ApprovalId, ApprovalLimits, ApprovalStore,
+        },
         events::{
             EventScope, module_can_receive_created_event, opaque_message_ref,
             validate_reaction_action,
         },
         protocol::{EventAction, MessageCreatedEvent},
+        source_inspection::{InspectionConfig, InspectionLimits, ModuleInspector, OsRandom, SystemClock},
     },
     fastfetch::{self, FastfetchInputError, FastfetchProfileError, FastfetchResult},
     help::{render_modules_overview_with_external, render_with_external},
@@ -46,7 +51,21 @@ pub struct RuntimeState {
     setup_notification_ids: VecDeque<(PeerId, i32)>,
     setup_edit_fallback_sources: VecDeque<(PeerId, i32)>,
     setup: Option<SetupCoordinator>,
+    module_installation: Option<ModuleInstallation>,
+    module_approvals: ApprovalStore<SystemClock, OsRandom>,
 }
+
+struct ModuleInstallation {
+    root: PathBuf,
+    staging_root: PathBuf,
+    saved_messages_peer: PeerId,
+}
+
+const MODULE_APPROVAL_LIMIT: usize = 8;
+const MODULE_APPROVAL_BYTES: u64 = 128 * 1024 * 1024;
+const EDITED_LM_STATE_CHANGE: &str = "⚠️ Изменённые сообщения не могут изменять состояние установки.";
+const LM_SAVED_MESSAGES_ONLY: &str =
+    "⚠️ Установка модулей доступна только из нового собственного сообщения в Saved Messages.";
 
 const MAX_EXPECTED_SELF_EDITS: usize = 128;
 const SETUP_STAGE_TIMEOUT: Duration = Duration::from_secs(90);
@@ -204,6 +223,16 @@ impl RuntimeState {
             setup_notification_ids: VecDeque::new(),
             setup_edit_fallback_sources: VecDeque::new(),
             setup: None,
+            module_installation: None,
+            module_approvals: ApprovalStore::new(
+                SystemClock,
+                OsRandom,
+                DEFAULT_APPROVAL_TTL,
+                ApprovalLimits {
+                    max_entries: MODULE_APPROVAL_LIMIT,
+                    max_pending_expanded_bytes: MODULE_APPROVAL_BYTES,
+                },
+            ),
         }
     }
 
@@ -306,6 +335,34 @@ impl RuntimeState {
     pub async fn set_external_manager(&mut self, handle: ExternalManagerHandle) {
         self.external_snapshot = handle.snapshot().await;
         self.external_manager = Some(handle);
+    }
+
+    pub fn configure_module_installation(
+        &mut self,
+        root: PathBuf,
+        staging_root: PathBuf,
+        self_user_id: PeerId,
+    ) {
+        self.module_installation = Some(ModuleInstallation {
+            root,
+            staging_root,
+            saved_messages_peer: self_user_id,
+        });
+    }
+
+    pub fn shutdown_module_approvals(&mut self) {
+        match self.module_approvals.shutdown() {
+            Ok(removed) => tracing::debug!(
+                event = "external_module_approvals_shutdown",
+                removed,
+                "Removed pending external module approvals"
+            ),
+            Err(error) => tracing::warn!(
+                event = "external_module_approvals_shutdown_failed",
+                error = %error,
+                "Could not fully shut down external module approvals"
+            ),
+        }
     }
 
     pub fn external_manager(&self) -> Option<&ExternalManagerHandle> {
@@ -584,6 +641,9 @@ impl RuntimeState {
         action: &Action,
         message_id: i32,
         peer_id: PeerId,
+        message: &Message,
+        edited: bool,
+        authored_by_self: bool,
     ) -> RuntimeExecution {
         self.recognized_commands = self.recognized_commands.saturating_add(1);
         let prefix = self.prefix().to_owned();
@@ -639,10 +699,173 @@ impl RuntimeState {
             Action::Alias(request) => self.execute_alias(request, &prefix).await,
             Action::Prefix(request) => self.execute_prefix(request).await,
             Action::Modules(request) => self.execute_modules(request, &prefix),
+            Action::Lm(request) => {
+                self.execute_lm(client, message, request, edited, authored_by_self)
+                    .await
+            }
             Action::Setup(_) => unreachable!("setup actions return before response dispatch"),
             Action::External(invocation) => self.execute_external(invocation).await,
         }
         .into()
+    }
+
+    async fn execute_lm(
+        &mut self,
+        client: &Client,
+        message: &Message,
+        request: &LmRequest,
+        edited: bool,
+        authored_by_self: bool,
+    ) -> Response {
+        match request {
+            LmRequest::Overview | LmRequest::List => {
+                self.refresh_snapshot().await;
+                self.render_lm_list()
+            }
+            LmRequest::Invalid => Response::plain(lm_usage(self.prefix())),
+            LmRequest::Install | LmRequest::Confirm { .. } | LmRequest::Cancel { .. } if edited => {
+                Response::plain(EDITED_LM_STATE_CHANGE.to_owned())
+            }
+            LmRequest::Install | LmRequest::Confirm { .. } | LmRequest::Cancel { .. }
+                if !self.is_lm_saved_message(message, authored_by_self) =>
+            {
+                Response::plain(LM_SAVED_MESSAGES_ONLY.to_owned())
+            }
+            LmRequest::Install => self.inspect_module_install(client, message).await,
+            LmRequest::Confirm { approval_id } => self.confirm_module_install(approval_id).await,
+            LmRequest::Cancel { approval_id } => self.cancel_module_install(approval_id),
+        }
+    }
+
+    fn render_lm_list(&self) -> Response {
+        let statuses = self
+            .external_snapshot
+            .module_statuses
+            .iter()
+            .map(|module| {
+                format!(
+                    "• {}\n  ID: {}\n  Версия: {}\n  Статус: {}\n  Автор: {}\n  Команд: {}",
+                    module.display_name,
+                    module.id,
+                    module.version,
+                    module.status,
+                    module.author,
+                    module.command_count,
+                )
+            })
+            .collect::<Vec<_>>();
+        if statuses.is_empty() {
+            Response::plain(format!(
+                "📦 Внешние модули не установлены.\n\nЧтобы установить модуль, прикрепите .lmod к сообщению:\n{}lm install",
+                self.prefix()
+            ))
+        } else {
+            Response::plain(format!("📦 Внешние модули\n\n{}", statuses.join("\n\n")))
+        }
+    }
+
+    fn is_lm_saved_message(&self, message: &Message, authored_by_self: bool) -> bool {
+        self.module_installation.as_ref().is_some_and(|installation| {
+            authored_by_self
+                && message.outgoing()
+                && message.peer_id() == installation.saved_messages_peer
+        })
+    }
+
+    async fn inspect_module_install(&mut self, client: &Client, message: &Message) -> Response {
+        let Some(installation) = &self.module_installation else {
+            return Response::plain("⚠️ Установка внешних модулей недоступна.".to_owned());
+        };
+        let acquired = match ModuleSourceAcquirer::new(
+            client,
+            installation.saved_messages_peer,
+            AcquisitionLimits::default(),
+        )
+        .acquire(message)
+        .await
+        {
+            Ok(acquired) => acquired,
+            Err(_) => return Response::plain("⚠️ Прикрепите документ .lmod к новому исходящему сообщению в Saved Messages.".to_owned()),
+        };
+        let config = InspectionConfig { staging_root: installation.staging_root.clone(), limits: InspectionLimits::default() };
+        let now = SystemTime::now();
+        let pending = match ModuleInspector::new(&config, OsRandom).inspect(
+            acquired,
+            now,
+            now + DEFAULT_APPROVAL_TTL,
+        ) {
+            Ok(pending) => pending,
+            Err(_) => return Response::plain("⚠️ Пакет .lmod не прошёл безопасную проверку.".to_owned()),
+        };
+        match self.module_approvals.issue(pending) {
+            Ok((id, plan)) => Response::plain(render_install_plan(&plan, id, self.prefix())),
+            Err(_) => Response::plain("⚠️ Невозможно сохранить план установки.".to_owned()),
+        }
+    }
+
+    async fn confirm_module_install(&mut self, supplied: &crate::commands::ApprovalId) -> Response {
+        let Ok(id) = ApprovalId::parse(supplied.as_str()) else {
+            return Response::plain("⚠️ ApprovalId недействителен или истёк.".to_owned());
+        };
+        let Some(installation) = &self.module_installation else {
+            return Response::plain("⚠️ Установка внешних модулей недоступна.".to_owned());
+        };
+        let pending = match self.module_approvals.redeem(id) {
+            Ok(pending) => pending,
+            Err(ApprovalError::Unavailable | ApprovalError::InvalidId) => return Response::plain("⚠️ ApprovalId недействителен или истёк.".to_owned()),
+            Err(_) => return Response::plain("⚠️ План установки недоступен.".to_owned()),
+        };
+        let module_id = pending.plan.module_id.clone();
+        let Some(wrapper) = pending.stage.take_wrapper() else {
+            return Response::plain("⚠️ Проверенный пакет недоступен.".to_owned());
+        };
+        let result = crate::external_modules::installer::install_staged_module(
+            &wrapper,
+            &installation.root,
+            &module_id,
+        );
+        if let Err(error) = result {
+            if let Err(cleanup) = crate::external_modules::installer::cleanup_redeemed_stage(&wrapper) {
+                tracing::warn!(
+                    event = "external_module_redeemed_stage_cleanup_failed",
+                    wrapper = %cleanup.wrapper.display(),
+                    ?cleanup.kind,
+                    "Could not remove redeemed external module staging"
+                );
+            }
+            return match error {
+                crate::external_modules::installer::InstallError::RollbackFailed { .. } => {
+                    Response::plain("⚠️ Установка не завершена: откат цели не удался; проверьте каталог модулей вручную.".to_owned())
+                }
+                crate::external_modules::installer::InstallError::PostInstallValidationFailed { .. } => {
+                    Response::plain("⚠️ Установка не выполнена: финальная проверка не пройдена, цель удалена.".to_owned())
+                }
+                _ => Response::plain("⚠️ Установка не выполнена.".to_owned()),
+            };
+        }
+        let descriptor = match crate::external_modules::manifest::validate_manifest_at(&installation.root.join(&module_id).join("module.json"), Some(&module_id)) {
+            Ok(descriptor) => descriptor,
+            Err(_) => return Response::plain("⚠️ Установленный модуль не прошёл финальную проверку; цель сохранена для ручной проверки.".to_owned()),
+        };
+        if let Some(handle) = &self.external_manager {
+            let mut manager = handle.lock().await;
+            let mut descriptors = manager.descriptors().to_vec();
+            descriptors.push(descriptor);
+            manager.set_descriptors(descriptors);
+        }
+        self.refresh_snapshot().await;
+        Response::plain(format!("✅ Модуль «{module_id}» установлен и выключен."))
+    }
+
+    fn cancel_module_install(&mut self, supplied: &crate::commands::ApprovalId) -> Response {
+        match ApprovalId::parse(supplied.as_str()) {
+            Ok(id) => match self.module_approvals.revoke(id) {
+                Ok(true) => Response::plain("✅ План установки отменён.".to_owned()),
+                Ok(false) => Response::plain("⚠️ ApprovalId недействителен или истёк.".to_owned()),
+                Err(_) => Response::plain("⚠️ План установки недоступен.".to_owned()),
+            },
+            Err(_) => Response::plain("⚠️ ApprovalId недействителен или истёк.".to_owned()),
+        }
     }
 
     async fn execute_setup(
@@ -779,6 +1002,60 @@ impl RuntimeState {
             )),
         }
     }
+}
+
+fn lm_usage(prefix: &str) -> String {
+    format!(
+        "⚠️ Использование:\n{prefix}lm\n{prefix}lm list\n{prefix}lm install\n{prefix}lm confirm <ApprovalId>\n{prefix}lm cancel <ApprovalId>"
+    )
+}
+
+fn bounded_list(values: &[String]) -> String {
+    const MAX_ITEMS: usize = 8;
+    const MAX_VALUE_CHARS: usize = 96;
+    if values.is_empty() {
+        return "нет".to_owned();
+    }
+    let mut rendered = values
+        .iter()
+        .take(MAX_ITEMS)
+        .map(|value| value.chars().take(MAX_VALUE_CHARS).collect::<String>())
+        .collect::<Vec<_>>();
+    if values.len() > MAX_ITEMS {
+        rendered.push(format!("ещё {}", values.len() - MAX_ITEMS));
+    }
+    rendered.join(", ")
+}
+
+fn render_install_plan(
+    plan: &crate::external_modules::source_inspection::ModuleInstallPlan,
+    approval_id: ApprovalId,
+    prefix: &str,
+) -> String {
+    let source = match &plan.source_identity {
+        crate::external_modules::source_inspection::SourceIdentity::Archive => "архив .lmod".to_owned(),
+        crate::external_modules::source_inspection::SourceIdentity::PinnedRepository(repository) => {
+            format!("репозиторий {} @ {}", repository.repository(), repository.revision())
+        }
+    };
+    format!(
+        "📋 План установки\n\nИсточник: {source}\nМодуль: {} v{}\nПротокол: {}\nТочка входа: {}\nКоманда по умолчанию: {}\nSHA-256: {}\nОтпечаток: {}\nАрхив: {} Байт, файлов: {}, сжато: {} Байт, распаковано: {} Байт\nВозможности: {}\nПодписки: {}\nДействия: {}\nПредупреждения: {}\n\nApprovalId: {approval_id}\nПодтвердите: {prefix}lm confirm {approval_id}\nОтменить: {prefix}lm cancel {approval_id}\nСрок действия: 10 минут.",
+        plan.module_id,
+        plan.module_version,
+        plan.protocol_version,
+        plan.entrypoint,
+        plan.default_command.as_deref().unwrap_or("нет"),
+        plan.archive_digest.as_hex(),
+        plan.fingerprint,
+        plan.archive.archive_bytes,
+        plan.archive.file_count,
+        plan.archive.compressed_bytes,
+        plan.archive.expanded_bytes,
+        bounded_list(&plan.capabilities),
+        bounded_list(&plan.subscriptions),
+        bounded_list(&plan.actions),
+        bounded_list(&plan.warnings.iter().map(|warning| format!("{warning:?}")).collect::<Vec<_>>()),
+    )
 }
 
 impl SetupCoordinator {
@@ -2174,5 +2451,26 @@ for line in sys.stdin:
         assert!(output.contains("Memory: 10.4 MiB RSS"));
         assert!(output.contains("Commands: 2"));
         assert!(output.contains("Version: 0.1.0"));
+    }
+
+    #[test]
+    fn module_install_lists_are_bounded_and_state_change_text_is_exact() {
+        let values = (0..10).map(|index| format!("value-{index}")).collect::<Vec<_>>();
+        assert_eq!(
+            bounded_list(&values),
+            "value-0, value-1, value-2, value-3, value-4, value-5, value-6, value-7, ещё 2"
+        );
+        assert_eq!(
+            EDITED_LM_STATE_CHANGE,
+            "⚠️ Изменённые сообщения не могут изменять состояние установки."
+        );
+    }
+
+    #[test]
+    fn lm_usage_lists_each_supported_form() {
+        assert_eq!(
+            lm_usage("."),
+            "⚠️ Использование:\n.lm\n.lm list\n.lm install\n.lm confirm <ApprovalId>\n.lm cancel <ApprovalId>"
+        );
     }
 }

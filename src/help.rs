@@ -310,6 +310,8 @@ fn render_command_card(command: &CommandDefinition, prefix: &str) -> RenderedHel
         fastfetch_primary(prefix, command, module.name)
     } else if command.name == "alias" {
         alias_primary(prefix, command, module.name)
+    } else if command.name == "lm" {
+        lm_primary(prefix, command, module.name)
     } else {
         generic_command_primary(command, prefix, module.name)
     };
@@ -347,6 +349,15 @@ fn fastfetch_primary(prefix: &str, command: &CommandDefinition, module_name: &st
 fn alias_primary(prefix: &str, command: &CommandDefinition, module_name: &str) -> String {
     format!(
         "{}\n\nИспользование: {prefix}{}\nМодуль: {module_name}\nРиск: {}\n\nПримеры:\n{prefix}alias list\n{prefix}alias add sys fastfetch --logo arch\n{prefix}alias show sys\n{prefix}alias del sys\n\nПсевдонимы позволяют вызывать канонические команды под другим именем с заранее заданными аргументами. Канонические команды имеют приоритет над псевдонимами: псевдоним не может переопределить встроенную команду с тем же именем. Псевдонимы постоянны и сохраняются между сессиями.",
+        command.description_ru,
+        command.usage,
+        risk_label(command.risk)
+    )
+}
+
+fn lm_primary(prefix: &str, command: &CommandDefinition, module_name: &str) -> String {
+    format!(
+        "{}\n\nИспользование: {prefix}{}\nМодуль: {module_name}\nРиск: {}\n\nПорядок установки:\n1. {prefix}lm list — показать установленные внешние модули.\n2. Прикрепите файл .lmod к сообщению в Saved Messages (Избранное).\n3. {prefix}lm install — берёт прикреплённый .lmod из Saved Messages и выполняет inspection; код при этом не запускается.\n4. Проверьте показанный план inspection, источник, хэш, возможности и предупреждения.\n5. {prefix}lm confirm <approval-id> — установить ровно проверенный пакет, либо {prefix}lm cancel <approval-id> — отменить проверку.\n\nApprovalId — полный одноразовый Crockford Base32 идентификатор в форме XXXX-XXXX-XXXX-XXXX. Сокращения, изменение регистра и лишние аргументы отклоняются. ApprovalId привязан к проверенному пакету и плану, действует ровно 10 минут и не может быть использован повторно.\n\nПосле установки модуль остаётся disabled и не запускается автоматически. ⚠️ Внешний модуль — это исполняемый код без системной песочницы. Inspection снижает риск подмены пакета, но не делает непроверенный код безопасным. Подтверждайте только понятный вам код и доверенный источник.",
         command.description_ru,
         command.usage,
         risk_label(command.risk)
@@ -439,6 +450,7 @@ fn risk_label(risk: CommandRisk) -> &'static str {
         CommandRisk::RestrictedProcess => "ограниченный процесс",
         CommandRisk::ArbitraryProcess => "произвольный процесс",
         CommandRisk::Privileged => "привилегированная операция",
+        CommandRisk::ExternalCodeInstall => "установка внешнего кода",
     }
 }
 
@@ -509,7 +521,7 @@ mod tests {
         assert!(
             response
                 .text
-                .starts_with("🛠 Справка Lavis: 3 модулей, 8 команд")
+                .starts_with("🛠 Справка Lavis: 3 модулей, 9 команд")
         );
         assert!(response.text.find("🧩 core").unwrap() < response.text.find("🖥 system").unwrap());
         assert!(response.text.contains("🦀fastfetch"));
@@ -670,7 +682,7 @@ mod tests {
     async fn modules_overview_matches_help_registry_counts() {
         let rendered = render_modules_overview(".");
         assert!(rendered.response.text.contains("Модули: "));
-        assert!(rendered.response.text.contains("Команды (8)"));
+        assert!(rendered.response.text.contains("Команды (9)"));
         assert!(rendered.response.text.contains(".modules"));
         assert_eq!(rendered.response.entities.len(), 2);
         let grammers_client::tl::enums::MessageEntity::Blockquote(primary) =
@@ -788,6 +800,34 @@ mod tests {
         assert!(response.text.starts_with("🛠 🦀setup"));
         assert!(response.text.contains("🦀setup lavis_example_bot"));
         assert!(response.text.contains("Риск: привилегированная операция"));
+    }
+
+    #[tokio::test]
+    async fn lm_help_describes_the_full_review_and_confirmation_flow() {
+        let response = render(
+            &HelpRequest::Topic("lm".to_owned()),
+            "🦀",
+            &aliases().await,
+        )
+        .response;
+
+        assert!(response.text.starts_with("📦 🦀lm"));
+        assert!(response.text.contains("🦀lm list"));
+        assert!(response.text.contains("🦀lm install"));
+        assert!(!response.text.contains("🦀lm install <source>"));
+        assert!(response.text.contains("🦀lm confirm <approval-id>"));
+        assert!(response.text.contains("🦀lm cancel <approval-id>"));
+        assert!(response.text.contains("Saved Messages"));
+        assert!(response.text.contains(".lmod"));
+        assert!(response.text.contains("inspection"));
+        assert!(response.text.contains("ApprovalId"));
+        assert!(response.text.contains("XXXX-XXXX-XXXX-XXXX"));
+        assert!(response.text.contains("ровно 10 минут"));
+        assert!(response.text.contains("disabled"));
+        assert!(response.text.contains("не запускается автоматически"));
+        assert!(response.text.contains("исполняемый код без системной песочницы"));
+        assert!(response.text.contains("не может быть использовано повторно"));
+        assert!(response.text.contains("Риск: установка внешнего кода"));
     }
 
     #[tokio::test]

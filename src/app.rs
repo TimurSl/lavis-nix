@@ -223,6 +223,29 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
         let module_root = config::ConfigPaths::data_dir_with(&environment)
             .context("failed to determine data directory")?
             .join(external_modules::MODULE_DIR_NAME);
+        fs::create_dir_all(&module_root)
+            .context("failed to create external module root")?;
+        let module_root_metadata = fs::symlink_metadata(&module_root)
+            .context("failed to inspect external module root")?;
+        if !module_root_metadata.file_type().is_dir() || module_root_metadata.file_type().is_symlink() {
+            anyhow::bail!("external module root is not a safe directory");
+        }
+        let module_staging_root = module_root
+            .parent()
+            .context("external module root has no parent")?
+            .join("module-staging");
+        fs::create_dir_all(&module_staging_root)
+            .context("failed to create external module staging root")?;
+        let cleanup_failures = external_modules::installer::cleanup_abandoned_wrappers(&module_staging_root)
+            .context("failed to clean abandoned external module staging")?;
+        for failure in cleanup_failures {
+            tracing::warn!(
+                event = "external_module_staging_cleanup_failed",
+                wrapper = %failure.wrapper.display(),
+                ?failure.kind,
+                "Could not remove abandoned external module staging"
+            );
+        }
 
         let descriptors = external_modules::manifest::discover_modules(&module_root)
             .unwrap_or_else(|error| {
@@ -257,6 +280,7 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
                 .context("failed to determine companion token path")?,
             self_user_id,
         );
+        runtime.configure_module_installation(module_root, module_staging_root, self_user_id);
         runtime.set_external_manager(handle).await;
 
         let run_result = {
@@ -264,6 +288,7 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
             updates::run(&mut stream, self_user_id, client_ref.client(), &mut runtime).await
         };
 
+        runtime.shutdown_module_approvals();
         drop(stream);
         run_result
     }

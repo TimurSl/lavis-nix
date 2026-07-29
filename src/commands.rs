@@ -11,6 +11,7 @@ pub enum CommandKind {
     Prefix,
     Modules,
     Setup,
+    Lm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +21,7 @@ pub enum CommandRisk {
     RestrictedProcess,
     ArbitraryProcess,
     Privileged,
+    ExternalCodeInstall,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,7 +38,7 @@ pub struct CommandDefinition {
     pub module: ModuleId,
 }
 
-const COMMAND_SPECS: [CommandDefinition; 8] = [
+const COMMAND_SPECS: [CommandDefinition; 9] = [
     CommandDefinition {
         kind: CommandKind::Help,
         name: "help",
@@ -101,6 +103,24 @@ const COMMAND_SPECS: [CommandDefinition; 8] = [
         ],
         risk: CommandRisk::Privileged,
         icon: "🛠",
+        aliasable: false,
+        module: ModuleId::Core,
+    },
+    CommandDefinition {
+        kind: CommandKind::Lm,
+        name: "lm",
+        usage: "lm [list|install|confirm <approval-id>|cancel <approval-id>]",
+        summary_ru: "Проверить и установить внешний модуль",
+        description_ru: "Показывает внешние модули или запускает проверяемую установку с отдельным подтверждением.",
+        examples: &[
+            "lm",
+            "lm list",
+            "lm install",
+            "lm confirm <approval-id>",
+            "lm cancel <approval-id>",
+        ],
+        risk: CommandRisk::ExternalCodeInstall,
+        icon: "📦",
         aliasable: false,
         module: ModuleId::Core,
     },
@@ -191,6 +211,7 @@ pub enum Action {
     Prefix(PrefixRequest),
     Modules(ModulesRequest),
     Setup(SetupRequest),
+    Lm(LmRequest),
     External(ExternalInvocation),
 }
 
@@ -230,6 +251,7 @@ impl Action {
             Self::Prefix(_) => "prefix",
             Self::Modules(_) => "modules",
             Self::Setup(_) => "setup",
+            Self::Lm(_) => "lm",
             Self::External(_invocation) => {
                 // Safe bounded string: module_id and command_name are validated ASCII
                 // This is never user-controlled free text
@@ -251,6 +273,7 @@ pub fn dispatch(command: &Command) -> Option<Action> {
         CommandKind::Prefix => Some(Action::Prefix(parse_prefix_request(&command.args))),
         CommandKind::Modules => Some(Action::Modules(parse_modules_request(&command.args))),
         CommandKind::Setup => Some(Action::Setup(parse_setup_request(&command.args))),
+        CommandKind::Lm => Some(Action::Lm(parse_lm_request(&command.args))),
     }
 }
 
@@ -272,6 +295,31 @@ pub enum SetupRequest {
     Status,
     Repair,
     Cancel,
+    Invalid,
+}
+
+/// A syntactically valid, canonical approval identifier.
+///
+/// Integration contract: the install runtime must issue and accept the unchanged
+/// 19-character uppercase Crockford Base32 value in `XXXX-XXXX-XXXX-XXXX`
+/// form exposed through `as_str()`. This command layer intentionally does not
+/// depend on the runtime approval type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalId(String);
+
+impl ApprovalId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LmRequest {
+    Overview,
+    List,
+    Install,
+    Confirm { approval_id: ApprovalId },
+    Cancel { approval_id: ApprovalId },
     Invalid,
 }
 
@@ -298,6 +346,54 @@ fn parse_setup_request(args: &str) -> SetupRequest {
         "cancel" => SetupRequest::Cancel,
         username => SetupRequest::Username(username.to_owned()),
     }
+}
+
+fn parse_lm_request(args: &str) -> LmRequest {
+    let mut tokens = args.split_whitespace();
+    let Some(operation) = tokens.next() else {
+        return LmRequest::Overview;
+    };
+
+    match operation {
+        "list" if tokens.next().is_none() => LmRequest::List,
+        "install" if tokens.next().is_none() => LmRequest::Install,
+        "confirm" => parse_lm_approval(tokens)
+            .map(|approval_id| LmRequest::Confirm { approval_id })
+            .unwrap_or(LmRequest::Invalid),
+        "cancel" => parse_lm_approval(tokens)
+            .map(|approval_id| LmRequest::Cancel { approval_id })
+            .unwrap_or(LmRequest::Invalid),
+        _ => LmRequest::Invalid,
+    }
+}
+
+fn parse_lm_approval(mut tokens: std::str::SplitWhitespace<'_>) -> Option<ApprovalId> {
+    let Some(value) = tokens.next() else {
+        return None;
+    };
+    if tokens.next().is_some() || !is_canonical_approval_id(value) {
+        return None;
+    }
+    Some(ApprovalId(value.to_owned()))
+}
+
+fn is_canonical_approval_id(value: &str) -> bool {
+    value.len() == 19
+        && value
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| match index {
+                4 | 9 | 14 => byte == b'-',
+                _ => matches!(
+                    byte,
+                    b'0'..=b'9'
+                        | b'A'..=b'H'
+                        | b'J'..=b'K'
+                        | b'M'..=b'N'
+                        | b'P'..=b'T'
+                        | b'V'..=b'Z'
+                ),
+            })
 }
 
 fn parse_prefix_request(args: &str) -> PrefixRequest {
@@ -353,8 +449,8 @@ fn parse_help_request(args: &str) -> HelpRequest {
 #[cfg(test)]
 mod tests {
     use super::{
-        Action, AliasRequest, CommandKind, CommandRisk, HelpRequest, ModulesRequest, SetupRequest,
-        command_by_kind, command_by_name, commands, dispatch, module_for_command,
+        Action, AliasRequest, CommandKind, CommandRisk, HelpRequest, LmRequest, ModulesRequest,
+        SetupRequest, command_by_kind, command_by_name, commands, dispatch, module_for_command,
     };
     use crate::command::Command;
     use crate::modules::{
@@ -450,6 +546,7 @@ mod tests {
                 "ping",
                 "prefix",
                 "setup",
+                "lm",
                 "stats",
                 "fastfetch",
                 "alias"
@@ -510,7 +607,7 @@ mod tests {
                     .iter()
                     .any(|module| module.id == definition.module)
             );
-            if matches!(definition.name, "alias" | "prefix" | "setup") {
+            if matches!(definition.name, "alias" | "prefix" | "setup" | "lm") {
                 assert!(!definition.aliasable);
                 continue;
             }
@@ -524,7 +621,7 @@ mod tests {
             commands_for_module(ModuleId::Core)
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
-            ["help", "modules", "ping", "prefix", "setup", "stats"]
+            ["help", "modules", "ping", "prefix", "setup", "lm", "stats"]
         );
         assert_eq!(
             commands_for_module(ModuleId::System)
@@ -614,6 +711,10 @@ mod tests {
         assert_eq!(setup.risk, CommandRisk::Privileged);
         assert_eq!(setup.module, ModuleId::Core);
         assert!(!setup.aliasable);
+        let lm = command_by_kind(CommandKind::Lm).unwrap();
+        assert_eq!(lm.risk, CommandRisk::ExternalCodeInstall);
+        assert_eq!(lm.module, ModuleId::Core);
+        assert!(!lm.aliasable);
     }
 
     #[test]
@@ -685,6 +786,55 @@ mod tests {
             setup("candidate extra"),
             Some(Action::Setup(SetupRequest::Invalid))
         );
+    }
+
+    #[test]
+    fn parses_lm_requests_with_full_canonical_approval_ids_only() {
+        let lm = |args: &str| {
+            dispatch(&Command {
+                name: "lm".to_owned(),
+                args: args.to_owned(),
+            })
+        };
+        let approval = "0123-4567-89AB-CDEF";
+
+        assert_eq!(lm(" \t"), Some(Action::Lm(LmRequest::Overview)));
+        assert_eq!(lm("list"), Some(Action::Lm(LmRequest::List)));
+        assert_eq!(
+            lm("install"),
+            Some(Action::Lm(LmRequest::Install))
+        );
+
+        let Some(Action::Lm(LmRequest::Confirm { approval_id })) =
+            lm(&format!("confirm {approval}"))
+        else {
+            panic!("expected canonical confirmation request");
+        };
+        assert_eq!(approval_id.as_str(), approval);
+
+        let Some(Action::Lm(LmRequest::Cancel { approval_id })) =
+            lm(&format!("cancel {approval}"))
+        else {
+            panic!("expected canonical cancellation request");
+        };
+        assert_eq!(approval_id.as_str(), approval);
+
+        for invalid in [
+            "list extra",
+            "install https://example.invalid/module.lmod",
+            "install extra",
+            "confirm",
+            "cancel",
+            "confirm 0123-4567-89AB-CDE",
+            "cancel 0123-4567-89AB-CDEFF",
+            "confirm 0123-4567-89ab-CDEF",
+            "cancel 0123-4567-89AI-CDEF",
+            "confirm 0123456789ABCDEF",
+            "confirm 0123-4567-89AB-CDEF extra",
+            "unknown",
+        ] {
+            assert_eq!(lm(invalid), Some(Action::Lm(LmRequest::Invalid)), "{invalid}");
+        }
     }
 
     #[test]
