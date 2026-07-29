@@ -58,6 +58,17 @@ impl ExternalManager {
         &self.descriptors
     }
 
+    /// Registers a newly installed descriptor without changing process or
+    /// enabled-state ownership. A duplicate ID is rejected before mutation so
+    /// a stale runtime snapshot cannot create ambiguous command routing.
+    pub fn register_installed_descriptor(&mut self, descriptor: ExternalModuleDescriptor) -> bool {
+        if self.descriptor_by_id(&descriptor.id).is_some() {
+            return false;
+        }
+        self.descriptors.push(descriptor);
+        true
+    }
+
     pub fn descriptor_by_id(&self, id: &str) -> Option<&ExternalModuleDescriptor> {
         self.descriptors.iter().find(|d| d.id == id)
     }
@@ -76,18 +87,18 @@ impl ExternalManager {
     pub fn statuses(&self) -> Vec<ExternalModuleStatus> {
         let mut statuses = Vec::new();
         for desc in &self.descriptors {
-            let (status_label, command_count) = if let Some(proc) = self
+            let status_label = if let Some(proc) = self
                 .processes
                 .get(&desc.id)
                 .and_then(|proc| proc.try_lock().ok())
             {
                 match proc.status() {
-                    ProcessStatus::Running => ("активен", proc.descriptor().commands.len()),
-                    ProcessStatus::Failed | ProcessStatus::Crashed => ("ошибка", 0),
-                    ProcessStatus::Terminated => ("остановлен", 0),
+                    ProcessStatus::Running => "активен",
+                    ProcessStatus::Failed | ProcessStatus::Crashed => "ошибка",
+                    ProcessStatus::Terminated => "остановлен",
                 }
             } else {
-                ("не запущен", 0)
+                "установлен, выключен"
             };
             statuses.push(ExternalModuleStatus {
                 id: desc.id.clone(),
@@ -99,7 +110,7 @@ impl ExternalManager {
                     .iter()
                     .map(|c| c.as_str().to_owned())
                     .collect(),
-                command_count,
+                command_count: desc.commands.len(),
                 status: status_label,
             });
         }
@@ -298,6 +309,7 @@ impl ExternalManager {
 pub struct ExternalRuntimeSnapshot {
     pub command_refs: Vec<ExternalCommandRef>,
     pub descriptors: Vec<ExternalModuleDescriptor>,
+    pub module_statuses: Vec<ExternalModuleStatus>,
     pub active_commands: std::collections::HashSet<String>,
     pub active_defaults: std::collections::HashMap<String, String>,
 }
@@ -310,6 +322,7 @@ impl ExternalRuntimeSnapshot {
     pub fn from_manager(manager: &ExternalManager) -> Self {
         let command_refs = manager.command_refs();
         let descriptors = manager.descriptors().to_vec();
+        let module_statuses = manager.statuses();
         let active_commands = command_refs
             .iter()
             .map(|r| format!("{}.{}", r.module_id, r.command_name))
@@ -330,6 +343,7 @@ impl ExternalRuntimeSnapshot {
         Self {
             command_refs,
             descriptors,
+            module_statuses,
             active_commands,
             active_defaults,
         }
@@ -447,5 +461,57 @@ impl ExternalManagerHandle {
         process
             .execute_with_entities(command_name, arguments, argument_entities)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ExternalManager;
+    use crate::external_modules::manifest::{ExternalCommandDescriptor, ExternalModuleDescriptor};
+    use std::path::PathBuf;
+
+    fn descriptor(id: &str, version: &str) -> ExternalModuleDescriptor {
+        ExternalModuleDescriptor {
+            protocol_version: 2,
+            id: id.to_owned(),
+            display_name: "Sample".to_owned(),
+            version: version.to_owned(),
+            author: "Author".to_owned(),
+            entrypoint: PathBuf::from("run"),
+            module_dir: PathBuf::new(),
+            capabilities: vec![],
+            default_command: None,
+            subscriptions: vec![],
+            actions: vec![],
+            commands: vec![ExternalCommandDescriptor {
+                name: "run".to_owned(),
+                summary_ru: "run".to_owned(),
+                description_ru: "run".to_owned(),
+                usage: "run".to_owned(),
+                examples: vec![],
+            }],
+        }
+    }
+
+    #[test]
+    fn discovered_but_not_running_module_is_disabled_with_descriptor_command_count() {
+        let mut manager = ExternalManager::new();
+        manager.set_descriptors(vec![descriptor("sample", "1.0")]);
+
+        let statuses = manager.statuses();
+        assert_eq!(statuses[0].status, "установлен, выключен");
+        assert_eq!(statuses[0].command_count, 1);
+    }
+
+    #[test]
+    fn installed_descriptor_registration_rejects_duplicates_without_starting_a_process() {
+        let mut manager = ExternalManager::new();
+        assert!(manager.register_installed_descriptor(descriptor("sample", "1.0")));
+        assert!(!manager.register_installed_descriptor(descriptor("sample", "2.0")));
+
+        assert_eq!(manager.descriptors().len(), 1);
+        assert_eq!(manager.descriptor_by_id("sample").unwrap().version, "1.0");
+        assert!(!manager.has_running_process("sample"));
+        assert!(manager.command_refs().is_empty());
     }
 }

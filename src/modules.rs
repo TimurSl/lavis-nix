@@ -354,6 +354,11 @@ mod tests {
                     assert_eq!(command.module, ModuleId::Core);
                     assert!(!command.aliasable);
                 }
+                CommandRisk::ExternalCodeInstall => {
+                    assert_eq!(command.name, "lm");
+                    assert_eq!(command.module, ModuleId::Core);
+                    assert!(!command.aliasable);
+                }
             }
         }
     }

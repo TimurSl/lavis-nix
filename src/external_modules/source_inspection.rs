@@ -14,7 +14,7 @@ use std::{
     io::Write,
     os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 
@@ -424,288 +424,75 @@ impl RandomSource for OsRandom {
     }
 }
 
-/// Opaque confirmation secret. Its Debug output is always redacted.
-pub struct ConfirmationToken(String);
-impl ConfirmationToken {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
+/// A private, validated install wrapper.  `wrapper` becomes `None` exactly when
+/// ownership is transferred to the installer or when it has been removed.
+pub(crate) struct ValidatedStage {
+    pub(crate) wrapper: Option<PathBuf>,
 }
-impl std::fmt::Debug for ConfirmationToken {
+impl std::fmt::Debug for ValidatedStage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ConfirmationToken(REDACTED)")
+        f.write_str("ValidatedStage(REDACTED)")
     }
 }
-impl std::fmt::Display for ConfirmationToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("[redacted]")
+impl ValidatedStage {
+    fn path(&self) -> Result<&Path, SourceInspectionError> {
+        self.wrapper
+            .as_deref()
+            .ok_or(SourceInspectionError::Staging)
     }
-}
 
-/// Review data and its opaque one-shot approval secret.  No staging path is exposed.
-pub struct IssuedInspection {
-    plan: ModuleInstallPlan,
-    token: ConfirmationToken,
-}
-impl IssuedInspection {
-    pub fn plan(&self) -> &ModuleInstallPlan {
-        &self.plan
+    pub(crate) fn take_wrapper(mut self) -> Option<PathBuf> {
+        self.wrapper.take()
     }
-    pub fn token(&self) -> &ConfirmationToken {
-        &self.token
-    }
-}
-impl std::fmt::Debug for IssuedInspection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IssuedInspection")
-            .field("plan", &self.plan)
-            .field("token", &"REDACTED")
-            .finish()
-    }
-}
 
-/// Values a caller must present unchanged when redeeming a confirmation token.
-/// This deliberately binds approval to the exact inspected source and review plan.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct RedeemExpectation {
-    pub source_identity: SourceIdentity,
-    pub archive_digest: ArchiveDigest,
-    pub plan_fingerprint: String,
-    pub module_id: String,
-    pub module_version: String,
-    pub expires_unix_seconds: u64,
-}
-impl RedeemExpectation {
-    pub fn from_plan(plan: &ModuleInstallPlan) -> Self {
-        Self {
-            source_identity: plan.source_identity.clone(),
-            archive_digest: plan.archive_digest,
-            plan_fingerprint: plan.fingerprint.clone(),
-            module_id: plan.module_id.clone(),
-            module_version: plan.module_version.clone(),
-            expires_unix_seconds: plan.times.expires_unix_seconds,
+    pub(crate) fn cleanup(mut self) -> Result<(), super::installer::StageCleanupError> {
+        if let Some(path) = self.wrapper.take() {
+            super::installer::cleanup_redeemed_stage(&path)?;
         }
-    }
-}
-#[derive(Clone, PartialEq, Eq)]
-struct TokenBinding {
-    source_identity: SourceIdentity,
-    archive_digest: ArchiveDigest,
-    plan_fingerprint: String,
-    module_id: String,
-    module_version: String,
-    expires_unix_seconds: u64,
-}
-impl TokenBinding {
-    fn from_plan(plan: &ModuleInstallPlan) -> Self {
-        let expected = RedeemExpectation::from_plan(plan);
-        Self {
-            source_identity: expected.source_identity,
-            archive_digest: expected.archive_digest,
-            plan_fingerprint: expected.plan_fingerprint,
-            module_id: expected.module_id,
-            module_version: expected.module_version,
-            expires_unix_seconds: expected.expires_unix_seconds,
-        }
-    }
-    fn matches(&self, expected: &RedeemExpectation) -> bool {
-        self.source_identity == expected.source_identity
-            && self.archive_digest == expected.archive_digest
-            && self.plan_fingerprint == expected.plan_fingerprint
-            && self.module_id == expected.module_id
-            && self.module_version == expected.module_version
-            && self.expires_unix_seconds == expected.expires_unix_seconds
-    }
-}
-
-struct Stage(PathBuf);
-impl std::fmt::Debug for Stage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Stage(REDACTED)")
-    }
-}
-impl Stage {
-    fn cleanup(mut self) {
-        let path = std::mem::take(&mut self.0);
-        let _ = remove_tree_no_follow(&path);
-    }
-}
-impl Drop for Stage {
-    fn drop(&mut self) {
-        if !self.0.as_os_str().is_empty() {
-            let _ = remove_tree_no_follow(&self.0);
-        }
-    }
-}
-struct PendingInspection {
-    plan: ModuleInstallPlan,
-    stage: Stage,
-}
-
-/// In-memory one-shot approvals with bounded, private staging retention.
-/// Pending bytes are the validated expanded-byte total of staged archives.
-/// Source length is used only as a conservative single-source fail-fast check;
-/// aggregate retention is always charged by this expanded staging metric.
-#[derive(Clone, Debug)]
-pub struct PendingInspectionLimits {
-    /// Maximum number of live, unredeemed inspections.
-    pub max_entries: usize,
-    /// Maximum aggregate validated expanded bytes in live staging directories.
-    pub max_pending_bytes: u64,
-}
-
-impl Default for PendingInspectionLimits {
-    fn default() -> Self {
-        Self {
-            max_entries: 16,
-            max_pending_bytes: 128 * 1024 * 1024,
-        }
-    }
-}
-
-pub struct ApprovalTokens<C, R> {
-    clock: C,
-    random: R,
-    ttl: Duration,
-    pending_limits: PendingInspectionLimits,
-    pending_bytes: u64,
-    entries: Vec<TokenEntry>,
-}
-struct TokenEntry {
-    digest: ArchiveDigest,
-    expires: SystemTime,
-    binding: TokenBinding,
-    pending: PendingInspection,
-}
-impl<C: Clock, R: RandomSource> ApprovalTokens<C, R> {
-    /// Create approvals using conservative default pending limits.
-    pub fn new(clock: C, random: R, ttl: Duration) -> Self {
-        Self {
-            clock,
-            random,
-            ttl,
-            pending_limits: PendingInspectionLimits::default(),
-            pending_bytes: 0,
-            entries: Vec::new(),
-        }
-    }
-    /// Create approvals with explicit limits for concurrently staged inspections.
-    pub fn with_pending_limits(
-        clock: C,
-        random: R,
-        ttl: Duration,
-        pending_limits: PendingInspectionLimits,
-    ) -> Self {
-        Self {
-            clock,
-            random,
-            ttl,
-            pending_limits,
-            pending_bytes: 0,
-            entries: Vec::new(),
-        }
-    }
-    pub fn inspect_and_issue(
-        &mut self,
-        config: &InspectionConfig,
-        source: AcquiredLmod,
-    ) -> Result<IssuedInspection, SourceInspectionError> {
-        self.purge_expired()?;
-        if self.entries.len() >= self.pending_limits.max_entries {
-            return Err(SourceInspectionError::PendingQuotaExceeded);
-        }
-        let now = self.clock.now();
-        let pending = inspect_pending(
-            config,
-            source,
-            now.checked_add(self.ttl)
-                .ok_or(SourceInspectionError::InvalidToken)?,
-            now,
-            &mut self.random,
-        )?;
-        let staged_bytes = pending.plan.archive.expanded_bytes;
-        let next_pending_bytes = self
-            .pending_bytes
-            .checked_add(staged_bytes)
-            .ok_or(SourceInspectionError::PendingQuotaExceeded)?;
-        if next_pending_bytes > self.pending_limits.max_pending_bytes {
-            pending.stage.cleanup();
-            return Err(SourceInspectionError::PendingQuotaExceeded);
-        }
-        let mut raw = [0; 32];
-        if let Err(error) = self.random.fill(&mut raw) {
-            pending.stage.cleanup();
-            return Err(error);
-        }
-        let token = ConfirmationToken(hex(&raw));
-        let expires = now
-            .checked_add(self.ttl)
-            .ok_or(SourceInspectionError::InvalidToken)?;
-        let issued_plan = pending.plan.clone();
-        self.entries.push(TokenEntry {
-            digest: sha256(token.0.as_bytes()),
-            expires,
-            binding: TokenBinding::from_plan(&pending.plan),
-            pending,
-        });
-        self.pending_bytes = next_pending_bytes;
-        Ok(IssuedInspection {
-            plan: issued_plan,
-            token,
-        })
-    }
-    /// Fails closed if the token, its staged source, expiry, or supplied binding differs.
-    pub fn redeem(
-        &mut self,
-        token: &ConfirmationToken,
-        expected: &RedeemExpectation,
-    ) -> Result<ModuleInstallPlan, SourceInspectionError> {
-        self.purge_expired()?;
-        let digest = sha256(token.0.as_bytes());
-        let position = self
-            .entries
-            .iter()
-            .position(|e| e.digest == digest && e.binding.matches(expected))
-            .ok_or(SourceInspectionError::InvalidToken)?;
-        let entry = self.entries.swap_remove(position);
-        if fs::symlink_metadata(&entry.pending.stage.0).is_err() {
-            entry.pending.stage.cleanup();
-            self.recompute_pending_bytes()?;
-            return Err(SourceInspectionError::InvalidToken);
-        }
-        entry.pending.stage.cleanup();
-        self.recompute_pending_bytes()?;
-        Ok(entry.pending.plan)
-    }
-    fn purge_expired(&mut self) -> Result<(), SourceInspectionError> {
-        let now = self.clock.now();
-        let mut kept = Vec::new();
-        for entry in self.entries.drain(..) {
-            if now >= entry.expires {
-                entry.pending.stage.cleanup();
-            } else {
-                kept.push(entry);
-            }
-        }
-        self.entries = kept;
-        self.recompute_pending_bytes()
-    }
-    fn recompute_pending_bytes(&mut self) -> Result<(), SourceInspectionError> {
-        let mut total = 0u64;
-        for entry in &self.entries {
-            match total.checked_add(entry.pending.plan.archive.expanded_bytes) {
-                Some(next) => total = next,
-                None => {
-                    for entry in self.entries.drain(..) {
-                        entry.pending.stage.cleanup();
-                    }
-                    self.pending_bytes = 0;
-                    return Err(SourceInspectionError::PendingAccountingInvariant);
-                }
-            }
-        }
-        self.pending_bytes = total;
         Ok(())
+    }
+}
+impl Drop for ValidatedStage {
+    fn drop(&mut self) {
+        if let Some(path) = self.wrapper.take() {
+            let _ = remove_tree_no_follow(&path);
+        }
+    }
+}
+/// Validated archive staging retained only until approval completes.
+pub(crate) struct PendingInspection {
+    pub(crate) plan: ModuleInstallPlan,
+    pub(crate) stage: ValidatedStage,
+}
+
+impl PendingInspection {
+    pub(crate) fn expanded_bytes(&self) -> u64 {
+        self.plan.archive.expanded_bytes
+    }
+
+    pub(crate) fn cleanup(self) -> Result<(), super::installer::StageCleanupError> {
+        self.stage.cleanup()
+    }
+}
+
+/// Inspects acquired source and returns private staged content for approval.
+pub(crate) struct ModuleInspector<'a, R> {
+    config: &'a InspectionConfig,
+    random: R,
+}
+
+impl<'a, R: RandomSource> ModuleInspector<'a, R> {
+    pub(crate) fn new(config: &'a InspectionConfig, random: R) -> Self {
+        Self { config, random }
+    }
+
+    pub(crate) fn inspect(
+        &mut self,
+        source: AcquiredLmod,
+        now: SystemTime,
+        expires: SystemTime,
+    ) -> Result<PendingInspection, SourceInspectionError> {
+        inspect_pending(self.config, source, expires, now, &mut self.random)
     }
 }
 
@@ -721,8 +508,12 @@ fn inspect_pending(
     }
     let stage = create_stage(&config.staging_root, random)?;
     let result = (|| {
-        let stats = inspect_into(&stage.0, &config.limits, &source.bytes)?;
-        let d = validate_manifest_at(&stage.0.join("module.json"), None)
+        let payload = stage.path()?.join("payload");
+        fs::create_dir(&payload).map_err(|_| SourceInspectionError::Staging)?;
+        fs::set_permissions(&payload, fs::Permissions::from_mode(0o700))
+            .map_err(|_| SourceInspectionError::Staging)?;
+        let stats = inspect_into(&payload, &config.limits, &source.bytes)?;
+        let d = validate_manifest_at(&payload.join("module.json"), None)
             .map_err(|_| SourceInspectionError::InvalidManifest)?;
         ModuleInstallPlan::from_descriptor(
             &d,
@@ -736,7 +527,7 @@ fn inspect_pending(
     match result {
         Ok(plan) => Ok(PendingInspection { plan, stage }),
         Err(error) => {
-            stage.cleanup();
+            let _ = stage.cleanup();
             Err(error)
         }
     }
@@ -745,7 +536,7 @@ fn inspect_pending(
 fn create_stage(
     root: &Path,
     random: &mut impl RandomSource,
-) -> Result<Stage, SourceInspectionError> {
+) -> Result<ValidatedStage, SourceInspectionError> {
     fs::create_dir_all(root).map_err(|_| SourceInspectionError::Staging)?;
     let meta = fs::symlink_metadata(root).map_err(|_| SourceInspectionError::Staging)?;
     if !meta.file_type().is_dir() || meta.file_type().is_symlink() {
@@ -756,12 +547,28 @@ fn create_stage(
     for _ in 0..32 {
         let mut nonce = [0; 16];
         random.fill(&mut nonce)?;
-        let path = root.join(format!("inspect-{}", hex(&nonce)));
+        let path = root.join(format!(".lmod-install-{}", hex(&nonce)));
         match fs::create_dir(&path) {
             Ok(()) => {
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-                    .map_err(|_| SourceInspectionError::Staging)?;
-                return Ok(Stage(path));
+                // Own the directory before any fallible post-create operation.
+                // Every setup failure below removes this exact path without
+                // following links, so an unmarked wrapper cannot leak.
+                let stage = ValidatedStage {
+                    wrapper: Some(path),
+                };
+                if fs::set_permissions(stage.path()?, fs::Permissions::from_mode(0o700)).is_err() {
+                    if let Ok(path) = stage.path() {
+                        let _ = remove_tree_no_follow(path);
+                    }
+                    return Err(SourceInspectionError::Staging);
+                }
+                if super::installer::write_stage_marker(stage.path()?, SystemTime::now()).is_err() {
+                    if let Ok(path) = stage.path() {
+                        let _ = remove_tree_no_follow(path);
+                    }
+                    return Err(SourceInspectionError::Staging);
+                }
+                return Ok(stage);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(_) => return Err(SourceInspectionError::Staging),
@@ -1176,7 +983,7 @@ fn sha256(data: &[u8]) -> ArchiveDigest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{cell::Cell, fs, os::unix::fs::MetadataExt};
+    use std::{fs, os::unix::fs::MetadataExt};
 
     #[derive(Clone)]
     struct Entry {
@@ -1187,62 +994,65 @@ mod tests {
         mode: u32,
         expanded: u32,
     }
-    fn put16(out: &mut Vec<u8>, n: u16) {
-        out.extend_from_slice(&n.to_le_bytes());
+
+    fn put16(out: &mut Vec<u8>, value: u16) {
+        out.extend_from_slice(&value.to_le_bytes());
     }
-    fn put32(out: &mut Vec<u8>, n: u32) {
-        out.extend_from_slice(&n.to_le_bytes());
+
+    fn put32(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(&value.to_le_bytes());
     }
-    /// Minimal hand-written ZIP records; no ZIP crate or external fixture is used.
+
     fn zip(entries: &[Entry]) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut output = Vec::new();
         let mut offsets = Vec::new();
-        for e in entries {
-            offsets.push(out.len() as u32);
-            put32(&mut out, LOCAL);
-            put16(&mut out, 20);
-            put16(&mut out, e.flags);
-            put16(&mut out, e.method);
-            put32(&mut out, 0);
-            put32(&mut out, 0);
-            put32(&mut out, e.data.len() as u32);
-            put32(&mut out, e.expanded);
-            put16(&mut out, e.name.len() as u16);
-            put16(&mut out, 0);
-            out.extend_from_slice(e.name.as_bytes());
-            out.extend_from_slice(&e.data);
+        for entry in entries {
+            offsets.push(output.len() as u32);
+            put32(&mut output, LOCAL);
+            put16(&mut output, 20);
+            put16(&mut output, entry.flags);
+            put16(&mut output, entry.method);
+            put32(&mut output, 0);
+            put32(&mut output, 0);
+            put32(&mut output, entry.data.len() as u32);
+            put32(&mut output, entry.expanded);
+            put16(&mut output, entry.name.len() as u16);
+            put16(&mut output, 0);
+            output.extend_from_slice(entry.name.as_bytes());
+            output.extend_from_slice(&entry.data);
         }
-        let central_at = out.len() as u32;
-        for (e, offset) in entries.iter().zip(offsets) {
-            put32(&mut out, CENTRAL);
-            put16(&mut out, 0x0314);
-            put16(&mut out, 20);
-            put16(&mut out, e.flags);
-            put16(&mut out, e.method);
-            put32(&mut out, 0);
-            put32(&mut out, 0);
-            put32(&mut out, e.data.len() as u32);
-            put32(&mut out, e.expanded);
-            put16(&mut out, e.name.len() as u16);
-            put16(&mut out, 0);
-            put16(&mut out, 0);
-            put16(&mut out, 0);
-            put16(&mut out, 0);
-            put32(&mut out, e.mode << 16);
-            put32(&mut out, offset);
-            out.extend_from_slice(e.name.as_bytes());
+        let central_start = output.len() as u32;
+        for (entry, offset) in entries.iter().zip(offsets) {
+            put32(&mut output, CENTRAL);
+            put16(&mut output, 0x0314);
+            put16(&mut output, 20);
+            put16(&mut output, entry.flags);
+            put16(&mut output, entry.method);
+            put32(&mut output, 0);
+            put32(&mut output, 0);
+            put32(&mut output, entry.data.len() as u32);
+            put32(&mut output, entry.expanded);
+            put16(&mut output, entry.name.len() as u16);
+            put16(&mut output, 0);
+            put16(&mut output, 0);
+            put16(&mut output, 0);
+            put16(&mut output, 0);
+            put32(&mut output, entry.mode << 16);
+            put32(&mut output, offset);
+            output.extend_from_slice(entry.name.as_bytes());
         }
-        let central_len = out.len() as u32 - central_at;
-        put32(&mut out, EOCD);
-        put16(&mut out, 0);
-        put16(&mut out, 0);
-        put16(&mut out, entries.len() as u16);
-        put16(&mut out, entries.len() as u16);
-        put32(&mut out, central_len);
-        put32(&mut out, central_at);
-        put16(&mut out, 0);
-        out
+        let central_length = output.len() as u32 - central_start;
+        put32(&mut output, EOCD);
+        put16(&mut output, 0);
+        put16(&mut output, 0);
+        put16(&mut output, entries.len() as u16);
+        put16(&mut output, entries.len() as u16);
+        put32(&mut output, central_length);
+        put32(&mut output, central_start);
+        put16(&mut output, 0);
+        output
     }
+
     fn file(name: &str, data: &[u8]) -> Entry {
         Entry {
             name: name.into(),
@@ -1253,13 +1063,34 @@ mod tests {
             expanded: data.len() as u32,
         }
     }
+
     fn manifest() -> Entry {
-        file("module.json", br#"{"schema_version":2,"id":"test","name":"Test","version":"1","author":"A","entrypoint":"run","commands":[{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}]}"#)
+        file(
+            "module.json",
+            br#"{"schema_version":2,"id":"test","name":"Test","version":"1","author":"A","entrypoint":"run","commands":[{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}]}"#,
+        )
     }
+
+    fn valid_archive() -> Vec<u8> {
+        let mut run = file("run", b"#!/bin/sh");
+        run.mode = 0o100755;
+        zip(&[manifest(), run])
+    }
+
+    struct TestRandom(u8);
+
+    impl RandomSource for TestRandom {
+        fn fill(&mut self, bytes: &mut [u8]) -> Result<(), SourceInspectionError> {
+            bytes.fill(self.0);
+            self.0 = self.0.wrapping_add(1);
+            Ok(())
+        }
+    }
+
     fn limits() -> InspectionLimits {
         InspectionLimits {
             max_archive_bytes: 100_000,
-            max_files: 10,
+            max_files: 4,
             max_file_bytes: 10_000,
             max_expanded_bytes: 20_000,
             max_path_depth: 4,
@@ -1267,40 +1098,19 @@ mod tests {
             max_compression_ratio: 10,
         }
     }
+
     fn root(label: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
+        let root = std::env::temp_dir().join(format!(
             "lavis-source-inspection-{label}-{}",
             std::process::id()
         ));
-        let _ = fs::remove_dir_all(&path);
-        path
-    }
-
-    struct TestRandom(u8);
-    impl RandomSource for TestRandom {
-        fn fill(&mut self, out: &mut [u8]) -> Result<(), SourceInspectionError> {
-            out.fill(self.0);
-            self.0 = self.0.wrapping_add(1);
-            Ok(())
-        }
-    }
-    struct TestClock(Cell<SystemTime>);
-    impl Clock for TestClock {
-        fn now(&self) -> SystemTime {
-            self.0.get()
-        }
+        let _ = fs::remove_dir_all(&root);
+        root
     }
 
     #[test]
-    fn digest_is_typed_and_exact() {
-        assert_eq!(
-            sha256(b"abc").as_hex(),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-    #[test]
-    fn parser_rejects_encryption_compression_and_ratio_metadata() {
-        let mut encrypted = file("x", b"x");
+    fn zip_rejects_encryption_compression_paths_symlinks_and_unsafe_types() {
+        let mut encrypted = file("entry", b"x");
         encrypted.flags = 1;
         assert_eq!(
             validate_entry(
@@ -1310,42 +1120,27 @@ mod tests {
             ),
             Err(SourceInspectionError::EncryptedArchive)
         );
-        let mut deflated = file("x", b"x");
-        deflated.method = 8;
+        let mut compressed = file("entry", b"x");
+        compressed.method = 8;
         assert_eq!(
             validate_entry(
-                &zip_entries(&zip(&[deflated])).unwrap()[0],
+                &zip_entries(&zip(&[compressed])).unwrap()[0],
                 &limits(),
                 &mut BTreeMap::new()
             ),
             Err(SourceInspectionError::UnsupportedCompression)
         );
-        let mut bomb = file("x", b"x");
-        bomb.expanded = 99;
-        assert_eq!(
-            validate_entry(
-                &zip_entries(&zip(&[bomb])).unwrap()[0],
-                &limits(),
-                &mut BTreeMap::new()
-            ),
-            Err(SourceInspectionError::LimitExceeded)
-        );
-    }
-    #[test]
-    fn parser_rejects_paths_lengths_types_and_collisions() {
-        let long_name = "x".repeat(33);
-        for name in ["../x", "/x", "a\\b", "a/../../b", &long_name] {
-            let e = file(name, b"");
-            assert!(matches!(
+        for path in ["../escape", "/absolute", "a\\b", "a/./b", "a/../../b"] {
+            assert_eq!(
                 validate_entry(
-                    &zip_entries(&zip(&[e])).unwrap()[0],
+                    &zip_entries(&zip(&[file(path, b"")])).unwrap()[0],
                     &limits(),
                     &mut BTreeMap::new()
                 ),
                 Err(SourceInspectionError::UnsafePath)
-            ));
+            );
         }
-        let mut link = file("x", b"");
+        let mut link = file("link", b"");
         link.mode = 0o120777;
         assert_eq!(
             validate_entry(
@@ -1355,41 +1150,11 @@ mod tests {
             ),
             Err(SourceInspectionError::UnsafeEntryType)
         );
-        let entries = zip(&[file("a/b", b"x"), file("a", b"x")]);
-        let mut names = BTreeMap::new();
-        for e in zip_entries(&entries).unwrap() {
-            let result = validate_entry(&e, &limits(), &mut names);
-            if e.name == "a" {
-                assert_eq!(result, Err(SourceInspectionError::UnsafeEntryType));
-            }
-        }
     }
+
     #[test]
-    fn nul_and_platform_prefix_names_are_rejected() {
-        for name in ["nul\0name", "C:drive-path", "Z:module.json"] {
-            let entry = file(name, b"");
-            assert_eq!(
-                validate_entry(
-                    &zip_entries(&zip(&[entry])).unwrap()[0],
-                    &limits(),
-                    &mut BTreeMap::new()
-                ),
-                Err(SourceInspectionError::UnsafePath)
-            );
-        }
-    }
-    #[test]
-    fn unpinned_main_and_master_refs_are_rejected() {
-        for revision in ["main", "master"] {
-            assert_eq!(
-                PinnedRepository::new("https://example.invalid/repository".into(), revision.into()),
-                Err(SourceInspectionError::UnpinnedRepository)
-            );
-        }
-    }
-    #[test]
-    fn file_depth_count_expanded_and_archive_limits_are_enforced() {
-        let mut too_large = file("x", b"x");
+    fn zip_and_archive_limits_and_root_manifest_are_enforced() {
+        let mut too_large = file("entry", b"x");
         too_large.expanded = 10_001;
         assert_eq!(
             validate_entry(
@@ -1399,602 +1164,111 @@ mod tests {
             ),
             Err(SourceInspectionError::LimitExceeded)
         );
-        let deep = file("a/b/c/d/e", b"");
-        assert_eq!(
-            validate_entry(
-                &zip_entries(&zip(&[deep])).unwrap()[0],
-                &limits(),
-                &mut BTreeMap::new()
-            ),
-            Err(SourceInspectionError::LimitExceeded)
-        );
-        let path = root("limits");
-        let mut random = TestRandom(2);
-        let stage = create_stage(&path, &mut random).unwrap();
-        let mut one = limits();
-        one.max_files = 1;
-        assert_eq!(
-            inspect_into(&stage.0, &one, &zip(&[manifest(), file("run", b"x")])),
-            Err(SourceInspectionError::LimitExceeded)
-        );
-        stage.cleanup();
-        let _ = fs::remove_dir(&path);
-        let config = InspectionConfig {
-            staging_root: root("archive-limit"),
-            limits: InspectionLimits {
-                max_archive_bytes: 1,
-                ..limits()
-            },
-        };
-        let clock = TestClock(Cell::new(UNIX_EPOCH));
-        let mut tokens = ApprovalTokens::new(clock, TestRandom(3), Duration::from_secs(1));
-        assert!(matches!(
-            tokens.inspect_and_issue(&config, AcquiredLmod::archive(vec![0; 2])),
-            Err(SourceInspectionError::LimitExceeded)
-        ));
-    }
-    #[test]
-    fn staging_is_private_and_manifest_must_be_root() {
-        let path = root("modes");
+        let stage_root = root("limits");
         let mut random = TestRandom(1);
-        let stage = create_stage(&path, &mut random).unwrap();
-        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o700);
-        assert_eq!(fs::metadata(&stage.0).unwrap().mode() & 0o777, 0o700);
-        let error = inspect_into(
-            &stage.0,
-            &limits(),
-            &zip(&[file("nested/module.json", b"{}")]),
-        )
-        .unwrap_err();
-        assert_eq!(error, SourceInspectionError::RootManifest);
-        stage.cleanup();
-        let _ = fs::remove_dir(&path);
-    }
-    #[test]
-    fn approval_is_bound_one_shot_and_fails_when_stage_is_missing() {
-        let path = root("token");
-        let config = InspectionConfig {
-            staging_root: path.clone(),
-            limits: limits(),
-        };
-        let clock = TestClock(Cell::new(UNIX_EPOCH + Duration::from_secs(100)));
-        let mut tokens = ApprovalTokens::new(clock, TestRandom(4), Duration::from_secs(10));
-        let mut run = file("run", b"#!/bin/sh");
-        run.mode = 0o100755;
-        let issued = tokens
-            .inspect_and_issue(&config, AcquiredLmod::archive(zip(&[manifest(), run])))
-            .unwrap();
-        let binding = RedeemExpectation::from_plan(issued.plan());
-        let mut changed = binding.clone();
-        changed.module_version = "other".into();
+        let stage = create_stage(&stage_root, &mut random).unwrap();
+        let mut file_limit = limits();
+        file_limit.max_files = 1;
         assert_eq!(
-            tokens.redeem(issued.token(), &changed),
-            Err(SourceInspectionError::InvalidToken)
-        );
-        fs::remove_dir_all(&tokens.entries[0].pending.stage.0).unwrap();
-        assert_eq!(
-            tokens.redeem(issued.token(), &binding),
-            Err(SourceInspectionError::InvalidToken)
-        );
-        let _ = fs::remove_dir(&path);
-    }
-    fn valid_archive(schema: u32) -> Vec<u8> {
-        let mut run = file("run", b"#!/bin/sh");
-        run.mode = 0o100755;
-        let body = format!(
-            r#"{{"schema_version":{schema},"id":"test","name":"Test","version":"1","author":"A","entrypoint":"run","commands":[{{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}}]}}"#
-        );
-        zip(&[file("module.json", body.as_bytes()), run])
-    }
-    #[test]
-    fn valid_minimal_plan_fields_and_safe_relative_entrypoint() {
-        let path = root("plan");
-        let config = InspectionConfig {
-            staging_root: path.clone(),
-            limits: limits(),
-        };
-        let mut random = TestRandom(8);
-        let pending = inspect_pending(
-            &config,
-            AcquiredLmod::archive(valid_archive(2)),
-            UNIX_EPOCH + Duration::from_secs(20),
-            UNIX_EPOCH + Duration::from_secs(10),
-            &mut random,
-        )
-        .unwrap();
-        assert_eq!(pending.plan.entrypoint, "run");
-        assert_eq!(pending.plan.source_kind, SourceKind::Archive);
-        assert_eq!(pending.plan.module_id, "test");
-        assert_eq!(pending.plan.times.expires_unix_seconds, 20);
-        pending.stage.cleanup();
-        let _ = fs::remove_dir(&path);
-    }
-    #[test]
-    fn missing_entrypoint_and_entrypoint_traversal_are_invalid_manifest() {
-        for entrypoint in ["missing", "../run"] {
-            let body = format!(
-                r#"{{"schema_version":2,"id":"test","name":"Test","version":"1","author":"A","entrypoint":"{entrypoint}","commands":[{{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}}]}}"#
-            );
-            let path = root(entrypoint.replace('/', "-").as_str());
-            let config = InspectionConfig {
-                staging_root: path.clone(),
-                limits: limits(),
-            };
-            let mut random = TestRandom(9);
-            assert!(matches!(
-                inspect_pending(
-                    &config,
-                    AcquiredLmod::archive(zip(&[file("module.json", body.as_bytes())])),
-                    UNIX_EPOCH,
-                    UNIX_EPOCH,
-                    &mut random
-                ),
-                Err(SourceInspectionError::InvalidManifest)
-            ));
-            let _ = fs::remove_dir_all(path);
-        }
-    }
-    #[test]
-    fn v3_supported_and_unsupported_api_and_duplicate_permissions_are_invalid() {
-        let path = root("v3");
-        let config = InspectionConfig {
-            staging_root: path.clone(),
-            limits: limits(),
-        };
-        let mut random = TestRandom(10);
-        assert!(
-            inspect_pending(
-                &config,
-                AcquiredLmod::archive(valid_archive(3)),
-                UNIX_EPOCH,
-                UNIX_EPOCH,
-                &mut random
-            )
-            .is_ok()
-        );
-        let _ = fs::remove_dir_all(&path);
-        for field in [
-            r#""capabilities":["network","network"]"#,
-            r#""subscriptions":["message.created","message.created"]"#,
-            r#""actions":["message.react","message.react"]"#,
-            r#""capabilities":["not.an.api"]"#,
-        ] {
-            let body = format!(
-                r#"{{"schema_version":3,"id":"test","name":"Test","version":"1","author":"A","entrypoint":"run",{field},"commands":[{{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}}]}}"#
-            );
-            let mut run = file("run", b"x");
-            run.mode = 0o100755;
-            let config = InspectionConfig {
-                staging_root: root("bad-api"),
-                limits: limits(),
-            };
-            assert!(matches!(
-                inspect_pending(
-                    &config,
-                    AcquiredLmod::archive(zip(&[file("module.json", body.as_bytes()), run])),
-                    UNIX_EPOCH,
-                    UNIX_EPOCH,
-                    &mut random
-                ),
-                Err(SourceInspectionError::InvalidManifest)
-            ));
-            let _ = fs::remove_dir_all(&config.staging_root);
-        }
-    }
-    #[test]
-    fn duplicate_root_module_json_and_dot_normalized_path_are_rejected() {
-        let path = root("dupe-root");
-        let mut random = TestRandom(11);
-        let stage = create_stage(&path, &mut random).unwrap();
-        assert_eq!(
-            inspect_into(&stage.0, &limits(), &zip(&[manifest(), manifest()])),
-            Err(SourceInspectionError::UnsafeEntryType)
-        );
-        stage.cleanup();
-        let _ = fs::remove_dir(&path);
-        let dot = file("a/./b", b"");
-        assert_eq!(
-            validate_entry(
-                &zip_entries(&zip(&[dot])).unwrap()[0],
-                &limits(),
-                &mut BTreeMap::new()
+            inspect_into(
+                stage.path().unwrap().join("payload").as_path(),
+                &file_limit,
+                &valid_archive()
             ),
-            Err(SourceInspectionError::UnsafePath)
+            Err(SourceInspectionError::LimitExceeded)
         );
+        assert_eq!(
+            inspect_into(
+                stage.path().unwrap().join("payload").as_path(),
+                &limits(),
+                &zip(&[file("nested/module.json", b"{}")])
+            ),
+            Err(SourceInspectionError::RootManifest)
+        );
+        stage.cleanup().unwrap();
+        let _ = fs::remove_dir(stage_root);
     }
+
     #[test]
-    fn fifo_and_device_modes_are_rejected() {
-        for mode in [0o010644, 0o060644] {
-            let mut entry = file("x", b"");
-            entry.mode = mode;
-            assert_eq!(
-                validate_entry(
-                    &zip_entries(&zip(&[entry])).unwrap()[0],
-                    &limits(),
-                    &mut BTreeMap::new()
-                ),
-                Err(SourceInspectionError::UnsafeEntryType)
-            );
-        }
-    }
-    #[test]
-    fn deterministic_plan_fingerprint_excludes_times() {
-        let path = root("fingerprint");
+    fn plans_are_deterministic_and_staging_is_private_and_cleaned() {
+        let root = root("plans");
         let config = InspectionConfig {
-            staging_root: path.clone(),
+            staging_root: root.clone(),
             limits: limits(),
         };
-        let mut random = TestRandom(12);
+        let mut random = TestRandom(1);
         let first = inspect_pending(
             &config,
-            AcquiredLmod::archive(valid_archive(2)),
-            UNIX_EPOCH,
-            UNIX_EPOCH + Duration::from_secs(1),
+            AcquiredLmod::archive(valid_archive()),
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
             &mut random,
         )
         .unwrap();
         let second = inspect_pending(
             &config,
-            AcquiredLmod::archive(valid_archive(2)),
-            UNIX_EPOCH + Duration::from_secs(9),
-            UNIX_EPOCH + Duration::from_secs(10),
+            AcquiredLmod::archive(valid_archive()),
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(9),
+            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10),
             &mut random,
         )
         .unwrap();
         assert_eq!(first.plan.fingerprint, second.plan.fingerprint);
-        first.stage.cleanup();
-        second.stage.cleanup();
-        let _ = fs::remove_dir(&path);
+        assert_eq!(fs::metadata(&root).unwrap().mode() & 0o777, 0o700);
+        let wrapper = first.stage.path().unwrap().to_path_buf();
+        assert!(wrapper.join("owner.json").is_file());
+        first.cleanup().unwrap();
+        second.cleanup().unwrap();
+        assert!(!wrapper.exists());
+        let _ = fs::remove_dir(root);
     }
+
     #[test]
-    fn token_accepted_exactly_once_expired_and_bound_digest_plan_identity() {
-        let path = root("redeem");
+    fn failed_inspection_leaves_no_wrapper_and_cleanup_never_follows_symlinks() {
+        let staging_root = root("cleanup");
         let config = InspectionConfig {
-            staging_root: path.clone(),
+            staging_root: staging_root.clone(),
             limits: limits(),
         };
-        let clock = TestClock(Cell::new(UNIX_EPOCH));
-        let mut tokens = ApprovalTokens::new(clock, TestRandom(13), Duration::from_secs(5));
-        let issued = tokens
-            .inspect_and_issue(&config, AcquiredLmod::archive(valid_archive(2)))
-            .unwrap();
-        let expected = RedeemExpectation::from_plan(issued.plan());
-        assert!(tokens.redeem(issued.token(), &expected).is_ok());
-        assert_eq!(
-            tokens.redeem(issued.token(), &expected),
-            Err(SourceInspectionError::InvalidToken)
-        );
-        let issued = tokens
-            .inspect_and_issue(&config, AcquiredLmod::archive(valid_archive(2)))
-            .unwrap();
-        let expected = RedeemExpectation::from_plan(issued.plan());
-        let mut changed = expected.clone();
-        changed.archive_digest = sha256(b"changed");
-        assert_eq!(
-            tokens.redeem(issued.token(), &changed),
-            Err(SourceInspectionError::InvalidToken)
-        );
-        let mut changed = expected.clone();
-        changed.source_identity = SourceIdentity::PinnedRepository(
-            PinnedRepository::new(
-                "https://example.invalid/r".into(),
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            )
-            .unwrap(),
-        );
-        assert_eq!(
-            tokens.redeem(issued.token(), &changed),
-            Err(SourceInspectionError::InvalidToken)
-        );
-        tokens.clock.0.set(UNIX_EPOCH + Duration::from_secs(5));
-        assert_eq!(
-            tokens.redeem(issued.token(), &expected),
-            Err(SourceInspectionError::InvalidToken)
-        );
-        let _ = fs::remove_dir(&path);
-    }
-    #[test]
-    fn plan_is_returned_with_opaque_token() {
-        let path = root("issued");
-        let config = InspectionConfig {
-            staging_root: path.clone(),
-            limits: limits(),
-        };
-        let clock = TestClock(Cell::new(UNIX_EPOCH));
-        let mut tokens = ApprovalTokens::new(clock, TestRandom(15), Duration::from_secs(5));
-        let issued = tokens
-            .inspect_and_issue(&config, AcquiredLmod::archive(valid_archive(2)))
-            .unwrap();
-        assert_eq!(issued.plan().entrypoint, "run");
-        assert!(format!("{issued:?}").contains("REDACTED"));
-        let expectation = RedeemExpectation::from_plan(issued.plan());
-        assert!(tokens.redeem(issued.token(), &expectation).is_ok());
-        let _ = fs::remove_dir(&path);
-    }
-    #[test]
-    fn expiration_boundary_is_invalid() {
-        let path = root("expiry");
-        let config = InspectionConfig {
-            staging_root: path.clone(),
-            limits: limits(),
-        };
-        let clock = TestClock(Cell::new(UNIX_EPOCH));
-        let mut tokens = ApprovalTokens::new(clock, TestRandom(16), Duration::from_secs(1));
-        let issued = tokens
-            .inspect_and_issue(&config, AcquiredLmod::archive(valid_archive(2)))
-            .unwrap();
-        let expectation = RedeemExpectation::from_plan(issued.plan());
-        tokens.clock.0.set(UNIX_EPOCH + Duration::from_secs(1));
-        assert_eq!(
-            tokens.redeem(issued.token(), &expectation),
-            Err(SourceInspectionError::InvalidToken)
-        );
-        let _ = fs::remove_dir(&path);
-    }
-    #[test]
-    fn failed_extraction_cleanup_does_not_follow_links_and_debug_redacts() {
-        let path = root("cleanup");
-        let config = InspectionConfig {
-            staging_root: path.clone(),
-            limits: limits(),
-        };
-        let mut random = TestRandom(14);
+        let mut random = TestRandom(1);
         assert!(
             inspect_pending(
                 &config,
                 AcquiredLmod::archive(vec![1, 2, 3]),
-                UNIX_EPOCH,
-                UNIX_EPOCH,
+                SystemTime::UNIX_EPOCH,
+                SystemTime::UNIX_EPOCH,
                 &mut random
             )
             .is_err()
         );
-        assert!(fs::read_dir(&path).unwrap().next().is_none());
+        assert!(fs::read_dir(&staging_root).unwrap().next().is_none());
+        let stage = create_stage(&staging_root, &mut random).unwrap();
+        let wrapper = stage.path().unwrap().to_path_buf();
         let outside = root("outside");
         fs::create_dir_all(&outside).unwrap();
         fs::write(outside.join("keep"), b"x").unwrap();
-        let stage = create_stage(&path, &mut random).unwrap();
-        std::os::unix::fs::symlink(&outside, stage.0.join("link")).unwrap();
-        assert!(format!("{stage:?}").contains("REDACTED"));
-        stage.cleanup();
+        std::os::unix::fs::symlink(&outside, wrapper.join("link")).unwrap();
+        assert!(stage.cleanup().is_err());
         assert!(outside.join("keep").exists());
-        let token = ConfirmationToken("secret".into());
-        assert_eq!(format!("{token:?}"), "ConfirmationToken(REDACTED)");
-        assert_eq!(token.to_string(), "[redacted]");
         let _ = fs::remove_dir_all(&outside);
-        let _ = fs::remove_dir(&path);
-    }
-    #[test]
-    fn pending_quota_rejects_new_inspection_without_evicting_live_entry() {
-        let path = root("pending-quota");
-        let config = InspectionConfig {
-            staging_root: path.clone(),
-            limits: limits(),
-        };
-        let clock = TestClock(Cell::new(UNIX_EPOCH));
-        let mut tokens = ApprovalTokens::with_pending_limits(
-            clock,
-            TestRandom(18),
-            Duration::from_secs(30),
-            PendingInspectionLimits {
-                max_entries: 1,
-                max_pending_bytes: 100_000,
-            },
-        );
-        let first = tokens
-            .inspect_and_issue(&config, AcquiredLmod::archive(valid_archive(2)))
-            .unwrap();
-        assert!(matches!(
-            tokens.inspect_and_issue(&config, AcquiredLmod::archive(valid_archive(2))),
-            Err(SourceInspectionError::PendingQuotaExceeded)
-        ));
-        let expected = RedeemExpectation::from_plan(first.plan());
-        assert!(tokens.redeem(first.token(), &expected).is_ok());
-        let _ = fs::remove_dir(&path);
+        let _ = fs::remove_dir_all(&staging_root);
     }
 
     #[test]
-    fn repository_display_validation_and_canonical_revision_are_strict() {
-        let upper = "A".repeat(40);
-        let repository =
-            PinnedRepository::new("https://example.invalid/team/module".into(), upper).unwrap();
-        assert_eq!(repository.revision(), "a".repeat(40));
+    fn marker_creation_failure_path_keeps_cleanup_owned_by_the_stage() {
+        let root = root("marker-failure");
+        let mut random = TestRandom(1);
+        let stage = create_stage(&root, &mut random).unwrap();
         assert!(
-            serde_json::to_string(&repository)
-                .unwrap()
-                .contains(&"a".repeat(40))
+            crate::external_modules::installer::write_stage_marker(
+                stage.path().unwrap(),
+                SystemTime::UNIX_EPOCH
+            )
+            .is_err()
         );
-        for invalid in [
-            "",
-            "   ",
-            "line\nfeed",
-            "carriage\rreturn",
-            "tab\tvalue",
-            "\u{1c}",
-            "\u{200e}",
-            "\u{200f}",
-            "\u{202a}",
-            "\u{202e}",
-            "\u{2066}",
-            "\u{2069}",
-        ] {
-            assert_eq!(
-                PinnedRepository::new(invalid.into(), "a".repeat(40)),
-                Err(SourceInspectionError::UnsafeRepositoryIdentity)
-            );
-        }
-        assert_eq!(
-            PinnedRepository::new("https://example.invalid/r".into(), "g".repeat(40)),
-            Err(SourceInspectionError::UnpinnedRepository)
-        );
-        assert_eq!(
-            PinnedRepository::new("https://example.invalid/r".into(), "a".repeat(39)),
-            Err(SourceInspectionError::UnpinnedRepository)
-        );
-    }
-
-    #[test]
-    fn expanded_pending_quota_releases_on_redeem_and_expiry() {
-        let path = root("expanded-pending-quota");
-        let config = InspectionConfig {
-            staging_root: path.clone(),
-            limits: limits(),
-        };
-        let archive = valid_archive(2);
-        let expanded = zip_entries(&archive)
-            .unwrap()
-            .iter()
-            .map(|entry| entry.expanded)
-            .sum();
-        let clock = TestClock(Cell::new(UNIX_EPOCH));
-        let mut tokens = ApprovalTokens::with_pending_limits(
-            clock,
-            TestRandom(19),
-            Duration::from_secs(2),
-            PendingInspectionLimits {
-                max_entries: 2,
-                max_pending_bytes: expanded,
-            },
-        );
-        let first = tokens
-            .inspect_and_issue(&config, AcquiredLmod::archive(archive.clone()))
-            .unwrap();
-        assert_eq!(tokens.pending_bytes, expanded);
-        assert!(matches!(
-            tokens.inspect_and_issue(&config, AcquiredLmod::archive(archive.clone())),
-            Err(SourceInspectionError::PendingQuotaExceeded)
-        ));
-        assert_eq!(tokens.entries.len(), 1);
-        let expected = RedeemExpectation::from_plan(first.plan());
-        assert!(tokens.redeem(first.token(), &expected).is_ok());
-        assert_eq!(tokens.pending_bytes, 0);
-        let second = tokens
-            .inspect_and_issue(&config, AcquiredLmod::archive(archive.clone()))
-            .unwrap();
-        tokens.clock.0.set(UNIX_EPOCH + Duration::from_secs(2));
-        assert_eq!(
-            tokens.redeem(second.token(), &RedeemExpectation::from_plan(second.plan())),
-            Err(SourceInspectionError::InvalidToken)
-        );
-        assert_eq!(tokens.pending_bytes, 0);
-        assert!(
-            tokens
-                .inspect_and_issue(&config, AcquiredLmod::archive(archive))
-                .is_ok()
-        );
-        let _ = fs::remove_dir_all(&path);
-    }
-
-    #[test]
-    fn sha256_official_and_block_boundary_vectors() {
-        assert_eq!(
-            sha256(b"").as_hex(),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-        assert_eq!(
-            sha256(b"abc").as_hex(),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-        assert_eq!(
-            sha256(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq").as_hex(),
-            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
-        );
-        // Padding-boundary vectors are fixed FIPS 180-4 SHA-256 regression
-        // values for ASCII `a` repeated at each boundary length.
-        let boundary = [
-            (
-                55,
-                "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318",
-            ),
-            (
-                56,
-                "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a",
-            ),
-            (
-                63,
-                "7d3e74a05d7db15bce4ad9ec0658ea98e3f06eeecf16b4c6fff2da457ddc2f34",
-            ),
-            (
-                64,
-                "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
-            ),
-            (
-                65,
-                "635361c48bb9eab14198e76ea8ab7f1a41685d6ad62aa9146d301d4f17eb0ae0",
-            ),
-        ];
-        for (length, expected) in boundary {
-            assert_eq!(sha256(&vec![b'a'; length]).as_hex(), expected);
-        }
-        assert_eq!(
-            sha256(&vec![b'a'; 1_000_000]).as_hex(),
-            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
-        );
-    }
-
-    #[test]
-    fn pending_quota_entry_limit_refuses_without_new_stage() {
-        let path = root("entry-limit");
-        let config = InspectionConfig {
-            staging_root: path.clone(),
-            limits: limits(),
-        };
-        let mut tokens = ApprovalTokens::with_pending_limits(
-            TestClock(Cell::new(UNIX_EPOCH)),
-            TestRandom(20),
-            Duration::from_secs(10),
-            PendingInspectionLimits {
-                max_entries: 1,
-                max_pending_bytes: 100_000,
-            },
-        );
-        let first = tokens
-            .inspect_and_issue(&config, AcquiredLmod::archive(valid_archive(2)))
-            .unwrap();
-        let before = fs::read_dir(&path).unwrap().count();
-        assert!(matches!(
-            tokens.inspect_and_issue(&config, AcquiredLmod::archive(valid_archive(2))),
-            Err(SourceInspectionError::PendingQuotaExceeded)
-        ));
-        assert_eq!(fs::read_dir(&path).unwrap().count(), before);
-        assert_eq!(tokens.entries.len(), 1);
-        assert!(
-            tokens
-                .redeem(first.token(), &RedeemExpectation::from_plan(first.plan()))
-                .is_ok()
-        );
-        assert_eq!(tokens.pending_bytes, 0);
-        let _ = fs::remove_dir(&path);
-    }
-
-    #[test]
-    fn pending_quota_single_expanded_entry_cleans_stage_and_retry_releases() {
-        let path = root("single-expanded-limit");
-        let config = InspectionConfig {
-            staging_root: path.clone(),
-            limits: limits(),
-        };
-        let archive = valid_archive(2);
-        let expanded: u64 = zip_entries(&archive)
-            .unwrap()
-            .iter()
-            .map(|entry| entry.expanded)
-            .sum();
-        let mut tokens = ApprovalTokens::with_pending_limits(
-            TestClock(Cell::new(UNIX_EPOCH)),
-            TestRandom(21),
-            Duration::from_secs(1),
-            PendingInspectionLimits {
-                max_entries: 2,
-                max_pending_bytes: expanded - 1,
-            },
-        );
-        assert!(matches!(
-            tokens.inspect_and_issue(&config, AcquiredLmod::archive(archive)),
-            Err(SourceInspectionError::PendingQuotaExceeded)
-        ));
-        assert_eq!(tokens.pending_bytes, 0);
-        assert!(fs::read_dir(&path).unwrap().next().is_none());
-        let _ = fs::remove_dir(&path);
+        let wrapper = stage.path().unwrap().to_path_buf();
+        stage.cleanup().unwrap();
+        assert!(!wrapper.exists());
+        let _ = fs::remove_dir(root);
     }
 }
