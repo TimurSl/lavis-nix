@@ -852,6 +852,21 @@ impl RuntimeState {
         let Some(installation) = &self.module_installation else {
             return Response::plain("⚠️ Установка внешних модулей недоступна.".to_owned());
         };
+        let module_id = match self.module_approvals.get(id) {
+            Ok(plan) => plan.module_id.clone(),
+            Err(ApprovalError::Unavailable | ApprovalError::InvalidId) => {
+                return Response::plain("⚠️ ApprovalId недействителен или истёк.".to_owned());
+            }
+            Err(_) => return Response::plain("⚠️ План установки недоступен.".to_owned()),
+        };
+        if let Some(handle) = &self.external_manager {
+            let manager = handle.lock().await;
+            if manager.descriptor_by_id(&module_id).is_some() {
+                return Response::plain(format!(
+                    "⚠️ Модуль «{module_id}» уже зарегистрирован; установка не начата."
+                ));
+            }
+        }
         let pending = match self.module_approvals.redeem(id) {
             Ok(pending) => pending,
             Err(ApprovalError::Unavailable | ApprovalError::InvalidId) => {
@@ -859,7 +874,6 @@ impl RuntimeState {
             }
             Err(_) => return Response::plain("⚠️ План установки недоступен.".to_owned()),
         };
-        let module_id = pending.plan.module_id.clone();
         let Some(wrapper) = pending.stage.take_wrapper() else {
             return Response::plain("⚠️ Проверенный пакет недоступен.".to_owned());
         };
@@ -892,13 +906,20 @@ impl RuntimeState {
             }
         };
         if let Some(handle) = &self.external_manager {
-            let mut manager = handle.lock().await;
-            if !manager.register_installed_descriptor(installed.descriptor) {
+            let registered = {
+                let mut manager = handle.lock().await;
+                manager.register_installed_descriptor(installed.descriptor)
+            };
+            if !registered {
                 tracing::warn!(
                     event = "external_module_descriptor_registration_duplicate",
                     module_id = %module_id,
                     "Installed external module already has a registered descriptor"
                 );
+                self.refresh_snapshot().await;
+                return Response::plain(format!(
+                    "⚠️ Модуль «{module_id}» установлен, но не зарегистрирован из-за конфликтующего описания."
+                ));
             }
         }
         self.refresh_snapshot().await;

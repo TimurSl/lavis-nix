@@ -8,6 +8,9 @@ use std::{
     time::Instant,
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 pub mod aliases;
 pub mod auth;
 pub mod bot_api;
@@ -235,8 +238,7 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
             .parent()
             .context("external module root has no parent")?
             .join("module-staging");
-        fs::create_dir_all(&module_staging_root)
-            .context("failed to create external module staging root")?;
+        prepare_module_staging_root(&module_staging_root)?;
         let cleanup_failures =
             external_modules::installer::cleanup_abandoned_wrappers(&module_staging_root)
                 .context("failed to clean abandoned external module staging")?;
@@ -625,8 +627,49 @@ async fn initialize_dialog_cache(client: &grammers_client::Client) -> anyhow::Re
     Ok(())
 }
 
+fn prepare_module_staging_root(path: &Path) -> anyhow::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+                anyhow::bail!("external module staging root is not a safe directory");
+            }
+            #[cfg(unix)]
+            if metadata.permissions().mode() & 0o077 != 0 {
+                anyhow::bail!("external module staging root has insecure permissions");
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(path).context("failed to create external module staging root")?;
+        }
+        Err(error) => return Err(error).context("failed to inspect external module staging root"),
+    }
+
+    let metadata =
+        fs::symlink_metadata(path).context("failed to verify external module staging root")?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        anyhow::bail!("external module staging root is not a safe directory");
+    }
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .context("failed to secure external module staging root")?;
+        if fs::metadata(path)
+            .context("failed to verify external module staging root permissions")?
+            .permissions()
+            .mode()
+            & 0o777
+            != 0o700
+        {
+            anyhow::bail!("external module staging root permissions are not secure");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::prepare_module_staging_root;
     use super::{
         AuthorizationOutcome, CliCommand, ClientError, NONINTERACTIVE_LOGOUT,
         NONINTERACTIVE_MISSING_CREDENTIALS, authorization_failure,
@@ -638,6 +681,9 @@ mod tests {
         fs,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[cfg(unix)]
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     #[test]
     fn accepts_only_documented_cli_forms() {
@@ -672,6 +718,36 @@ mod tests {
             .is_err()
         );
         assert!(parse_cli(vec![OsString::from("unknown")]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_root_is_private_and_rejects_symlinks_and_insecure_directories() {
+        let directory = std::env::temp_dir().join(format!(
+            "lavis-staging-root-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let staging_root = directory.join("staging");
+        prepare_module_staging_root(&staging_root).unwrap();
+        assert_eq!(
+            fs::metadata(&staging_root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let insecure = directory.join("insecure");
+        fs::create_dir(&insecure).unwrap();
+        fs::set_permissions(&insecure, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(prepare_module_staging_root(&insecure).is_err());
+
+        let target = directory.join("target");
+        fs::create_dir(&target).unwrap();
+        let link = directory.join("link");
+        symlink(&target, &link).unwrap();
+        assert!(prepare_module_staging_root(&link).is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
