@@ -7,7 +7,7 @@
 //! re-inspects a pending stage.
 
 use rustix::{
-    fs::{RenameFlags, CWD},
+    fs::{CWD, RenameFlags},
     io::Errno,
 };
 use serde::{Deserialize, Serialize};

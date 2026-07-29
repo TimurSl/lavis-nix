@@ -5,7 +5,7 @@
 //! an encoding we cannot decompress and verify would make the inspection meaningless.
 
 use super::manifest::{
-    validate_display_single_line, validate_manifest_at, ExternalModuleDescriptor,
+    ExternalModuleDescriptor, validate_display_single_line, validate_manifest_at,
 };
 use serde::{Serialize, Serializer};
 use std::{
@@ -1231,14 +1231,16 @@ mod tests {
             limits: limits(),
         };
         let mut random = TestRandom(1);
-        assert!(inspect_pending(
-            &config,
-            AcquiredLmod::archive(vec![1, 2, 3]),
-            SystemTime::UNIX_EPOCH,
-            SystemTime::UNIX_EPOCH,
-            &mut random
-        )
-        .is_err());
+        assert!(
+            inspect_pending(
+                &config,
+                AcquiredLmod::archive(vec![1, 2, 3]),
+                SystemTime::UNIX_EPOCH,
+                SystemTime::UNIX_EPOCH,
+                &mut random
+            )
+            .is_err()
+        );
         assert!(fs::read_dir(&staging_root).unwrap().next().is_none());
         let stage = create_stage(&staging_root, &mut random).unwrap();
         let wrapper = stage.path().unwrap().to_path_buf();
@@ -1257,11 +1259,13 @@ mod tests {
         let root = root("marker-failure");
         let mut random = TestRandom(1);
         let stage = create_stage(&root, &mut random).unwrap();
-        assert!(crate::external_modules::installer::write_stage_marker(
-            stage.path().unwrap(),
-            SystemTime::UNIX_EPOCH
-        )
-        .is_err());
+        assert!(
+            crate::external_modules::installer::write_stage_marker(
+                stage.path().unwrap(),
+                SystemTime::UNIX_EPOCH
+            )
+            .is_err()
+        );
         let wrapper = stage.path().unwrap().to_path_buf();
         stage.cleanup().unwrap();
         assert!(!wrapper.exists());
