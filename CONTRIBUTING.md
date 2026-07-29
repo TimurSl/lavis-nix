@@ -1,67 +1,123 @@
 # Участие в разработке Lavis
 
-Lavis — небольшой, статически типизированный и безопасный по умолчанию Telegram userbot на Rust и Nix. Вносите минимальные связные изменения, добавляйте тесты для изменённого поведения и обновляйте пользовательскую документацию при изменении интерфейса, команд, безопасности или конфигурации. Полные контракты: [Module API v1](docs/module-api-v1.md) (встроенные модули) и [Module API v2](docs/module-api-v2.md) (внешние модули).
+Lavis — статически типизированный Telegram userbot на Rust и Nix. Вносите минимальные связные изменения, добавляйте тесты для изменённого поведения и обновляйте пользовательскую документацию при изменении интерфейса, команд, безопасности, manifest/protocol или конфигурации.
 
-## Module API v1
+Основные контракты:
+
+- [Module API v1](docs/module-api-v1.md) — встроенный compile-time registry;
+- [Module API v2/v3](docs/module-api-v2.md) — внешние manifests и JSON-line protocol;
+- [External Modules](docs/external-modules.md) — lifecycle внешних модулей;
+- [Packaging `.lmod`](docs/lmod-packaging.md) — installer package boundary.
+
+## Built-in Module API v1
 
 Используйте утверждённые публичные типы: `ModuleId`, `ModuleOrigin`, `ModuleCapability`, `ModuleSpec`, `CommandKind`, `CommandRisk`, `CommandDefinition` и `Action`.
 
-- `ModuleOrigin`: `Builtin` либо `External { author, version, source }`. Внешнее происхождение — только проверяемые метаданные для рендеринга; это не внешний загрузчик, установщик, выполнение кода, разрешение URL или песочница.
-- `ModuleCapability`: `TelegramRpc`, `PersistentStateRead`, `PersistentStateWrite`, `HostInformation`, `RestrictedProcess`, `Network`. Возможность заявляет необходимую границу операции, а не даёт неограниченное разрешение.
-- `ModuleSpec`: `id`, `name`, `description_ru`, `icon`, `origin`, `capabilities`, `unloadable`, `replaceable`.
-- `CommandRisk`: `ReadOnly`, `PersistentStateChange`, `RestrictedProcess`, `ArbitraryProcess`, `Privileged`. Встроенным командам запрещены `ArbitraryProcess` и `Privileged`; `fastfetch` имеет риск `RestrictedProcess`.
+- `ModuleOrigin::External` в v1 — только проверяемые метаданные для рендеринга; external runtime не регистрируется в статических таблицах.
+- `CommandRisk`: `ReadOnly`, `PersistentStateChange`, `RestrictedProcess`, `ArbitraryProcess`, `Privileged`, `ExternalCodeInstall`.
+- `setup` использует `Privileged`, `lm` — `ExternalCodeInstall`, `fastfetch` — `RestrictedProcess`.
 - `CommandDefinition`: `kind`, `name`, `usage`, `summary_ru`, `description_ru`, `examples`, `risk`, `icon`, `aliasable`, `module`.
 
-Публичные запросы статического реестра: `modules()`, `module_by_id`, `module_by_name`, `commands()`, `command_by_kind`, `command_by_name`, `commands_for_module`, `module_for_command`. Не обходите их дублирующими каталогами или локальными таблицами.
+Публичные запросы статического реестра: `modules()`, `module_by_id`, `module_by_name`, `commands()`, `command_by_kind`, `command_by_name`, `commands_for_module`, `module_for_command`. Не обходите их дублирующими каталогами.
 
 ### Регистрация встроенной команды
 
-Делайте регистрацию в следующем порядке:
-
-1. Добавьте `ModuleId` и затем полный `ModuleSpec` в статический реестр.
+1. Добавьте/обновите `ModuleSpec`.
 2. Добавьте `CommandKind` и полный `CommandDefinition`.
 3. Добавьте типизированный вариант `Action`.
 4. Добавьте соответствие в `dispatch`.
-5. Добавьте отдельный parser аргументов в типизированный запрос; не разбирайте префикс повторно.
-6. Добавьте обработку `Action` в runtime.
+5. Добавьте отдельный parser аргументов.
+6. Добавьте runtime behavior.
 7. Добавьте тесты реестра, parser, dispatch, runtime и Help v2.
+8. Обновите README и соответствующие документы.
 
-`examples` всегда без префикса: `ping`, `help system`, `fastfetch --no-profile`. Интерфейс Help v2 сам подставляет текущий пользовательский префикс.
+`examples` всегда без префикса: `ping`, `help system`, `lm list`. UI сам подставляет активный префикс.
 
-### Инварианты и выбор границ
+## External module subsystem
 
-Идентификаторы и ASCII-имена модулей и команд уникальны; метаданные, описания, значки и примеры не пусты; каждая команда принадлежит существующему модулю; у каждого модуля есть команда; `commands_for_module` покрывает каждую команду ровно один раз. Поиск имени нечувствителен к ASCII-регистру.
+Разделяйте обязанности:
 
-Выбирайте минимальный риск и возможности: `PersistentStateChange` требует `PersistentStateWrite`, а `RestrictedProcess` — `RestrictedProcess`. Системная информация требует `HostInformation`; ограниченный вызов Fastfetch требует `RestrictedProcess` и допускает только фиксированные программу и аргументы.
+- Telegram acquisition только получает bounded document bytes;
+- inspection проверяет untrusted archive и создаёт owned staging + review plan;
+- approval store является единственным owner pending inspections;
+- installer выполняет только filesystem transaction;
+- manager/runtime регистрирует descriptor, управляет process state и snapshots;
+- enabled state хранится отдельно и не меняется установкой.
 
-## Help v2 и тесты
+Не создавайте параллельные token/staging maps или повторную post-install validation в runtime.
 
-Help v2 получает русские `summary_ru`, `description_ru` и примеры из реестра, показывает модуль и происхождение. Для `Builtin` рендерится встроенное происхождение; для `External` — только валидированные `author`, `version`, `source`.
+### Manifest и protocol changes
 
-Порядок разрешения темы обязателен: каноническая команда → существующий псевдоним → модуль → неизвестная тема. Поэтому псевдоним не затеняет команду, но может быть темой с именем модуля. Тесты Help v2 должны проверять этот порядок, русские метаданные и подстановку префикса, а также корректные UTF-16 границы entity, fallback при невозможном рендеринге и сохранение полной безопасной строки происхождения при сокращении основного текста.
+При изменении schema/protocol:
+
+- сохраняйте `serde(deny_unknown_fields)` для manifest boundaries;
+- обновляйте validator, protocol serializer/parser, manager/process tests и docs;
+- schema 2 не должна молча принимать schema 3-only fields;
+- новые subscriptions/actions должны иметь явные capabilities и scoped validation;
+- входные/выходные строки, IDs, entities и actions должны иметь bounded limits;
+- request ID обязан точно связывать request и reply.
+
+### `.lmod` acquisition and inspection
+
+Сохраняйте fail-closed invariants:
+
+- state-changing `lm install/confirm/cancel` только из нового собственного сообщения в Saved Messages;
+- только same-message `Media::Document` с lowercase `.lmod` suffix;
+- declared size — preflight, actual streamed bytes — обязательная boundary;
+- download прекращается сразу после превышения лимита;
+- ZIP принимает только unencrypted stored entries;
+- root `module.json` ровно один;
+- no symlink/device/FIFO/path traversal/special bits;
+- staging root и wrappers private, marker schema строгая;
+- cleanup не следует symlink и не трогает module root.
+
+Тесты acquisition должны покрывать missing declared size, early declared rejection, exact limit, actual oversize early abort и transport error. Inspection regression suite должен покрывать paths, entry types, archive limits, manifest/schema/capabilities, staging ownership и deterministic fingerprint.
+
+### Approval and installation
+
+- ApprovalId — полный canonical 80-bit Crockford Base32 `XXXX-XXXX-XXXX-XXXX`; prefix matching запрещён.
+- TTL — 600 секунд, expiry при `now >= expires_at`.
+- approval одноразовый; redeem передаёт ownership staging installer'у.
+- quota accounting освобождается при redeem/revoke/expiry/shutdown даже при cleanup failure.
+- no-overwrite boundary — Linux `renameat2(..., RENAME_NOREPLACE)` через safe Rust API.
+- `EEXIST` не перезаписывает target; `EXDEV` не имеет copy fallback.
+- manifest валидируется один раз после rename из final target; validation failure вызывает rollback.
+- ошибка удаления пустого wrapper после успешного commit не отменяет установку.
+- installation не включает и не запускает модуль.
+- stale/duplicate descriptor conflict не должен возвращать ложный success.
+
+## Help v2
+
+Help получает built-in metadata из v1 registry, а active external metadata — из runtime snapshot. `lm` использует специализированный renderer с Saved Messages flow, ApprovalId, TTL, disabled-after-install и no-sandbox warning.
+
+Порядок разрешения темы: built-in canonical command → active external namespaced command → alias → built-in module → discovered external module → unknown.
+
+`,lm list` не строится из active command refs: он показывает все discovered descriptors и manager status, включая disabled modules.
 
 ## Проверка безопасности
 
-Перед отправкой PR проверьте:
+Перед PR проверьте:
 
-- команда доступна только исходящему авторизованному аккаунту;
-- входные данные разбираются строго, а ошибки не раскрывают секреты, локальные пути или необработанный stderr;
-- не добавлены динамический загрузчик, установщик, терминал, `sudo`, `sh`, `bash`, `eval` или произвольный процесс;
-- каждый разрешённый процесс имеет фиксированные программу и аргументы, null stdin, ограниченный захват stdout/stderr, timeout и санитарную обработку вывода;
-- риск команды соответствует возможностям модуля;
-- документация использует символические пути Fastfetch: `$XDG_CONFIG_HOME/lavis/fastfetch.json` или `$HOME/.config/lavis/fastfetch.json`.
+- команда/событие доступно только предусмотренному авторизованному scope;
+- входные данные разбираются строго;
+- ошибки не раскрывают секреты, локальные пути, untrusted bytes или raw stderr;
+- built-in process launch не использует `sh`, `bash`, `eval` или user-controlled program path;
+- external installer не запускает код и не меняет enabled state;
+- external runtime не заявляет sandbox, которой нет;
+- новые файловые операции no-follow, bounded и не имеют TOCTOU `exists() + rename()` как security boundary;
+- документация отражает фактический scope и ограничения.
 
 ## Секреты, профили и локальные данные
 
-Никогда не добавляйте в Git, PR, тесты, документацию или логи API ID, API hash, пароли, коды входа, MTProto-сеанс, `credentials.json`, состояние, локальные профили, их содержимое или пользовательские пути. Не публикуйте журналы, которые могут содержать учётные данные. В документации не указывайте абсолютные пути конкретного пользователя.
+Никогда не добавляйте в Git, PR, тесты, документацию или логи API ID, API hash, пароли, коды входа, MTProto-сеанс, `credentials.json`, companion token, локальное состояние, профили или пользовательские абсолютные пути. В документации используйте символические XDG-пути.
 
 ## Ветки, PR и проверки
 
 - Работайте в отдельной ветке с понятным названием.
-- Один PR решает одну связанную задачу; не смешивайте с ним нерелевантный рефакторинг.
-- В описании PR укажите назначение, пользовательское поведение, тесты, обновлённые пользовательские документы и фактически выполненные проверки.
+- Один PR решает одну связанную задачу.
+- В описании PR укажите поведение, security boundaries, тесты, обновлённые документы и фактически выполненные проверки.
 
-Поддерживаемый Nix workflow и обязательная полная проверка перед PR:
+Полная проверка:
 
 ```bash
 nix develop
