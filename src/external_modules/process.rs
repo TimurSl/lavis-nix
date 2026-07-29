@@ -1,7 +1,8 @@
 use super::{
     manifest::ExternalModuleDescriptor,
     protocol::{
-        self, CoreMessage, MAX_LINE_BYTES, MAX_RESULT_BYTES, MessageCreatedEvent, ModuleMessage,
+        self, CoreMessage, MAX_LINE_BYTES, MAX_RESULT_BYTES, MessageEvent, MessageEventKind,
+        ModuleMessage,
     },
 };
 use crate::error::ExternalError;
@@ -241,17 +242,21 @@ impl ModuleProcess {
         }
     }
 
-    pub async fn dispatch_created_event(
+    pub async fn dispatch_event(
         &mut self,
-        payload: MessageCreatedEvent,
+        event: MessageEventKind,
+        payload: MessageEvent,
     ) -> Result<(String, Vec<protocol::EventAction>), ExternalError> {
-        if self.descriptor.protocol_version != 3 {
+        if self.descriptor.protocol_version < 3
+            || (event == MessageEventKind::Edited && self.descriptor.protocol_version < 4)
+        {
             return Err(ExternalError::InvalidArgument);
         }
         let request_id = protocol::request_id();
         self.in_flight_request = Some(request_id.clone());
         let message = CoreMessage::Event {
             request_id: request_id.clone(),
+            event,
             payload,
         };
         if let Err(error) = self.send(&message).await {
@@ -538,7 +543,22 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    fn test_nonce() -> String {
+        format!(
+            "{}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        )
+    }
 
     const ECHO_MODULE_PY: &str = r#"#!/usr/bin/env python3
 import sys, json
@@ -623,11 +643,7 @@ if child:
     }
 
     fn create_echo_module() -> (ExternalModuleDescriptor, PathBuf) {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("lavis-proc-test-{nonce}"));
+        let dir = std::env::temp_dir().join(format!("lavis-proc-test-{}", test_nonce()));
         fs::create_dir_all(dir.join("bin")).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(dir.join("bin"), fs::Permissions::from_mode(0o700)).unwrap();
@@ -653,11 +669,7 @@ if child:
     }
 
     fn create_child_spawner_module() -> (ExternalModuleDescriptor, PathBuf) {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("lavis-proc-child-{nonce}"));
+        let dir = std::env::temp_dir().join(format!("lavis-proc-child-{}", test_nonce()));
         fs::create_dir_all(dir.join("bin")).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(dir.join("bin"), fs::Permissions::from_mode(0o700)).unwrap();
@@ -683,11 +695,7 @@ if child:
     }
 
     fn create_fixture_module(body: &str, id: &str) -> (ExternalModuleDescriptor, PathBuf) {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("lavis-fixture-{nonce}"));
+        let dir = std::env::temp_dir().join(format!("lavis-fixture-{}", test_nonce()));
         fs::create_dir_all(dir.join("bin")).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(dir.join("bin"), fs::Permissions::from_mode(0o700)).unwrap();
@@ -718,10 +726,11 @@ if child:
         (descriptor, directory)
     }
 
-    fn created_event() -> MessageCreatedEvent {
-        MessageCreatedEvent {
+    fn created_event() -> MessageEvent {
+        MessageEvent {
             event_id: "event-1".to_owned(),
             message_ref: "message-1".to_owned(),
+            message_key: "stable-message-1".to_owned(),
             text: "hello".to_owned(),
             outgoing: true,
             entities: vec![],
@@ -874,16 +883,16 @@ for line in sys.stdin:
                 "ordinary",
                 vec![protocol::EventAction {
                     message_ref: "message-1".to_owned(),
-                    reaction: protocol::ReactionSpec::Emoji("👍".to_owned()),
+                    reactions: vec![protocol::ReactionSpec::Emoji("👍".to_owned())],
                 }],
             ),
             (
                 "custom",
                 vec![protocol::EventAction {
                     message_ref: "message-1".to_owned(),
-                    reaction: protocol::ReactionSpec::CustomEmoji {
+                    reactions: vec![protocol::ReactionSpec::CustomEmoji {
                         document_id: "5456140674028019486".to_owned(),
-                    },
+                    }],
                 }],
             ),
         ] {
@@ -895,7 +904,7 @@ for line in sys.stdin:
             );
             let mut process = ModuleProcess::start(descriptor).await.unwrap();
             let (_, actions) = process
-                .dispatch_created_event(created_event())
+                .dispatch_event(MessageEventKind::Created, created_event())
                 .await
                 .unwrap();
             assert_eq!(actions, expected);
@@ -921,7 +930,7 @@ for line in sys.stdin:
             );
             let mut process = ModuleProcess::start(descriptor).await.unwrap();
             let error = process
-                .dispatch_created_event(created_event())
+                .dispatch_event(MessageEventKind::Created, created_event())
                 .await
                 .unwrap_err();
             assert_eq!(
