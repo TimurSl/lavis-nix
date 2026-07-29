@@ -13,22 +13,24 @@ use crate::{
     bot_api::{BotApi, HttpBotApi},
     command::Command,
     commands::{
-        Action, AliasRequest, ExternalInvocation, LmRequest, ModulesRequest, PrefixRequest, SetupRequest,
-        dispatch,
+        Action, AliasRequest, ExternalInvocation, LmRequest, ModulesRequest, PrefixRequest,
+        SetupRequest, dispatch,
     },
     error::ExternalError,
     external_modules::manager::{ExternalManagerHandle, ExternalRuntimeSnapshot},
     external_modules::{
         acquisition::{AcquisitionLimits, ModuleSourceAcquirer},
         approval::{
-            DEFAULT_APPROVAL_TTL, ApprovalError, ApprovalId, ApprovalLimits, ApprovalStore,
+            ApprovalError, ApprovalId, ApprovalLimits, ApprovalStore, DEFAULT_APPROVAL_TTL,
         },
         events::{
             EventScope, module_can_receive_created_event, opaque_message_ref,
             validate_reaction_action,
         },
         protocol::{EventAction, MessageCreatedEvent},
-        source_inspection::{InspectionConfig, InspectionLimits, ModuleInspector, OsRandom, SystemClock},
+        source_inspection::{
+            InspectionConfig, InspectionLimits, ModuleInspector, OsRandom, SystemClock,
+        },
     },
     fastfetch::{self, FastfetchInputError, FastfetchProfileError, FastfetchResult},
     help::{render_modules_overview_with_external, render_with_external},
@@ -63,7 +65,8 @@ struct ModuleInstallation {
 
 const MODULE_APPROVAL_LIMIT: usize = 8;
 const MODULE_APPROVAL_BYTES: u64 = 128 * 1024 * 1024;
-const EDITED_LM_STATE_CHANGE: &str = "⚠️ Изменённые сообщения не могут изменять состояние установки.";
+const EDITED_LM_STATE_CHANGE: &str =
+    "⚠️ Изменённые сообщения не могут изменять состояние установки.";
 const LM_SAVED_MESSAGES_ONLY: &str =
     "⚠️ Установка модулей доступна только из нового собственного сообщения в Saved Messages.";
 
@@ -765,29 +768,38 @@ impl RuntimeState {
     }
 
     fn is_lm_saved_message(&self, message: &Message, authored_by_self: bool) -> bool {
-        self.module_installation.as_ref().is_some_and(|installation| {
-            authored_by_self
-                && message.outgoing()
-                && message.peer_id() == installation.saved_messages_peer
-        })
+        self.module_installation
+            .as_ref()
+            .is_some_and(|installation| {
+                authored_by_self
+                    && message.outgoing()
+                    && message.peer_id() == installation.saved_messages_peer
+            })
     }
 
     async fn inspect_module_install(&mut self, client: &Client, message: &Message) -> Response {
         let Some(installation) = &self.module_installation else {
             return Response::plain("⚠️ Установка внешних модулей недоступна.".to_owned());
         };
-        let acquired = match ModuleSourceAcquirer::new(
-            client,
-            installation.saved_messages_peer,
-            AcquisitionLimits::default(),
-        )
-        .acquire(message)
-        .await
-        {
-            Ok(acquired) => acquired,
-            Err(_) => return Response::plain("⚠️ Прикрепите документ .lmod к новому исходящему сообщению в Saved Messages.".to_owned()),
+        let acquired =
+            match ModuleSourceAcquirer::new(
+                client,
+                installation.saved_messages_peer,
+                AcquisitionLimits::default(),
+            )
+            .acquire(message)
+            .await
+            {
+                Ok(acquired) => acquired,
+                Err(_) => return Response::plain(
+                    "⚠️ Прикрепите документ .lmod к новому исходящему сообщению в Saved Messages."
+                        .to_owned(),
+                ),
+            };
+        let config = InspectionConfig {
+            staging_root: installation.staging_root.clone(),
+            limits: InspectionLimits::default(),
         };
-        let config = InspectionConfig { staging_root: installation.staging_root.clone(), limits: InspectionLimits::default() };
         let now = SystemTime::now();
         let pending = match ModuleInspector::new(&config, OsRandom).inspect(
             acquired,
@@ -795,7 +807,9 @@ impl RuntimeState {
             now + DEFAULT_APPROVAL_TTL,
         ) {
             Ok(pending) => pending,
-            Err(_) => return Response::plain("⚠️ Пакет .lmod не прошёл безопасную проверку.".to_owned()),
+            Err(_) => {
+                return Response::plain("⚠️ Пакет .lmod не прошёл безопасную проверку.".to_owned());
+            }
         };
         match self.module_approvals.issue(pending) {
             Ok((id, plan)) => Response::plain(render_install_plan(&plan, id, self.prefix())),
@@ -812,7 +826,9 @@ impl RuntimeState {
         };
         let pending = match self.module_approvals.redeem(id) {
             Ok(pending) => pending,
-            Err(ApprovalError::Unavailable | ApprovalError::InvalidId) => return Response::plain("⚠️ ApprovalId недействителен или истёк.".to_owned()),
+            Err(ApprovalError::Unavailable | ApprovalError::InvalidId) => {
+                return Response::plain("⚠️ ApprovalId недействителен или истёк.".to_owned());
+            }
             Err(_) => return Response::plain("⚠️ План установки недоступен.".to_owned()),
         };
         let module_id = pending.plan.module_id.clone();
@@ -825,7 +841,9 @@ impl RuntimeState {
             &module_id,
         );
         if let Err(error) = result {
-            if let Err(cleanup) = crate::external_modules::installer::cleanup_redeemed_stage(&wrapper) {
+            if let Err(cleanup) =
+                crate::external_modules::installer::cleanup_redeemed_stage(&wrapper)
+            {
                 tracing::warn!(
                     event = "external_module_redeemed_stage_cleanup_failed",
                     wrapper = %cleanup.wrapper.display(),
@@ -1033,9 +1051,17 @@ fn render_install_plan(
     prefix: &str,
 ) -> String {
     let source = match &plan.source_identity {
-        crate::external_modules::source_inspection::SourceIdentity::Archive => "архив .lmod".to_owned(),
-        crate::external_modules::source_inspection::SourceIdentity::PinnedRepository(repository) => {
-            format!("репозиторий {} @ {}", repository.repository(), repository.revision())
+        crate::external_modules::source_inspection::SourceIdentity::Archive => {
+            "архив .lmod".to_owned()
+        }
+        crate::external_modules::source_inspection::SourceIdentity::PinnedRepository(
+            repository,
+        ) => {
+            format!(
+                "репозиторий {} @ {}",
+                repository.repository(),
+                repository.revision()
+            )
         }
     };
     format!(
@@ -1054,7 +1080,13 @@ fn render_install_plan(
         bounded_list(&plan.capabilities),
         bounded_list(&plan.subscriptions),
         bounded_list(&plan.actions),
-        bounded_list(&plan.warnings.iter().map(|warning| format!("{warning:?}")).collect::<Vec<_>>()),
+        bounded_list(
+            &plan
+                .warnings
+                .iter()
+                .map(|warning| format!("{warning:?}"))
+                .collect::<Vec<_>>()
+        ),
     )
 }
 
@@ -2455,7 +2487,9 @@ for line in sys.stdin:
 
     #[test]
     fn module_install_lists_are_bounded_and_state_change_text_is_exact() {
-        let values = (0..10).map(|index| format!("value-{index}")).collect::<Vec<_>>();
+        let values = (0..10)
+            .map(|index| format!("value-{index}"))
+            .collect::<Vec<_>>();
         assert_eq!(
             bounded_list(&values),
             "value-0, value-1, value-2, value-3, value-4, value-5, value-6, value-7, ещё 2"

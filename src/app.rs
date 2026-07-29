@@ -223,11 +223,12 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
         let module_root = config::ConfigPaths::data_dir_with(&environment)
             .context("failed to determine data directory")?
             .join(external_modules::MODULE_DIR_NAME);
-        fs::create_dir_all(&module_root)
-            .context("failed to create external module root")?;
-        let module_root_metadata = fs::symlink_metadata(&module_root)
-            .context("failed to inspect external module root")?;
-        if !module_root_metadata.file_type().is_dir() || module_root_metadata.file_type().is_symlink() {
+        fs::create_dir_all(&module_root).context("failed to create external module root")?;
+        let module_root_metadata =
+            fs::symlink_metadata(&module_root).context("failed to inspect external module root")?;
+        if !module_root_metadata.file_type().is_dir()
+            || module_root_metadata.file_type().is_symlink()
+        {
             anyhow::bail!("external module root is not a safe directory");
         }
         let module_staging_root = module_root
@@ -236,8 +237,9 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
             .join("module-staging");
         fs::create_dir_all(&module_staging_root)
             .context("failed to create external module staging root")?;
-        let cleanup_failures = external_modules::installer::cleanup_abandoned_wrappers(&module_staging_root)
-            .context("failed to clean abandoned external module staging")?;
+        let cleanup_failures =
+            external_modules::installer::cleanup_abandoned_wrappers(&module_staging_root)
+                .context("failed to clean abandoned external module staging")?;
         for failure in cleanup_failures {
             tracing::warn!(
                 event = "external_module_staging_cleanup_failed",

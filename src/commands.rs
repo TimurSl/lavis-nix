@@ -379,21 +379,18 @@ fn parse_lm_approval(mut tokens: std::str::SplitWhitespace<'_>) -> Option<Approv
 
 fn is_canonical_approval_id(value: &str) -> bool {
     value.len() == 19
-        && value
-            .bytes()
-            .enumerate()
-            .all(|(index, byte)| match index {
-                4 | 9 | 14 => byte == b'-',
-                _ => matches!(
-                    byte,
-                    b'0'..=b'9'
-                        | b'A'..=b'H'
-                        | b'J'..=b'K'
-                        | b'M'..=b'N'
-                        | b'P'..=b'T'
-                        | b'V'..=b'Z'
-                ),
-            })
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            4 | 9 | 14 => byte == b'-',
+            _ => matches!(
+                byte,
+                b'0'..=b'9'
+                    | b'A'..=b'H'
+                    | b'J'..=b'K'
+                    | b'M'..=b'N'
+                    | b'P'..=b'T'
+                    | b'V'..=b'Z'
+            ),
+        })
 }
 
 fn parse_prefix_request(args: &str) -> PrefixRequest {
@@ -800,10 +797,7 @@ mod tests {
 
         assert_eq!(lm(" \t"), Some(Action::Lm(LmRequest::Overview)));
         assert_eq!(lm("list"), Some(Action::Lm(LmRequest::List)));
-        assert_eq!(
-            lm("install"),
-            Some(Action::Lm(LmRequest::Install))
-        );
+        assert_eq!(lm("install"), Some(Action::Lm(LmRequest::Install)));
 
         let Some(Action::Lm(LmRequest::Confirm { approval_id })) =
             lm(&format!("confirm {approval}"))
@@ -812,8 +806,7 @@ mod tests {
         };
         assert_eq!(approval_id.as_str(), approval);
 
-        let Some(Action::Lm(LmRequest::Cancel { approval_id })) =
-            lm(&format!("cancel {approval}"))
+        let Some(Action::Lm(LmRequest::Cancel { approval_id })) = lm(&format!("cancel {approval}"))
         else {
             panic!("expected canonical cancellation request");
         };
@@ -833,7 +826,11 @@ mod tests {
             "confirm 0123-4567-89AB-CDEF extra",
             "unknown",
         ] {
-            assert_eq!(lm(invalid), Some(Action::Lm(LmRequest::Invalid)), "{invalid}");
+            assert_eq!(
+                lm(invalid),
+                Some(Action::Lm(LmRequest::Invalid)),
+                "{invalid}"
+            );
         }
     }
 

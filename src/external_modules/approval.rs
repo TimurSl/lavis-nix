@@ -65,8 +65,8 @@ fn decode_crockford(byte: u8) -> Option<u8> {
 impl fmt::Display for ApprovalId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let bits = u128::from_be_bytes([
-            0, 0, 0, 0, 0, 0, self.0[0], self.0[1], self.0[2], self.0[3], self.0[4],
-            self.0[5], self.0[6], self.0[7], self.0[8], self.0[9],
+            0, 0, 0, 0, 0, 0, self.0[0], self.0[1], self.0[2], self.0[3], self.0[4], self.0[5],
+            self.0[6], self.0[7], self.0[8], self.0[9],
         ]);
         for index in 0..APPROVAL_ID_ENCODED_CHARS {
             if index != 0 && index % 4 == 0 {
@@ -81,7 +81,10 @@ impl fmt::Display for ApprovalId {
 
 impl fmt::Debug for ApprovalId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_tuple("ApprovalId").field(&self.to_string()).finish()
+        formatter
+            .debug_tuple("ApprovalId")
+            .field(&self.to_string())
+            .finish()
     }
 }
 
@@ -191,7 +194,10 @@ impl<C: Clock, R: RandomSource> ApprovalStore<C, R> {
     }
 
     /// Returns review data only; a stage path is never exposed.
-    pub(crate) fn get(&mut self, approval_id: ApprovalId) -> Result<&ModuleInstallPlan, ApprovalError> {
+    pub(crate) fn get(
+        &mut self,
+        approval_id: ApprovalId,
+    ) -> Result<&ModuleInstallPlan, ApprovalError> {
         self.purge_expired()?;
         self.entries
             .get(&approval_id)
@@ -258,7 +264,10 @@ impl<C: Clock, R: RandomSource> ApprovalStore<C, R> {
         Ok(count)
     }
 
-    fn remove(&mut self, approval_id: ApprovalId) -> Result<Option<PendingInspection>, ApprovalError> {
+    fn remove(
+        &mut self,
+        approval_id: ApprovalId,
+    ) -> Result<Option<PendingInspection>, ApprovalError> {
         let Some(entry) = self.entries.remove(&approval_id) else {
             return Ok(None);
         };
@@ -296,7 +305,9 @@ fn generate_approval_id<R: RandomSource>(
 ) -> Result<ApprovalId, ApprovalError> {
     for _ in 0..MAX_COLLISION_ATTEMPTS {
         let mut bytes = [0_u8; APPROVAL_ID_BYTES];
-        random.fill(&mut bytes).map_err(|_| ApprovalError::Entropy)?;
+        random
+            .fill(&mut bytes)
+            .map_err(|_| ApprovalError::Entropy)?;
         let approval_id = ApprovalId::from_bytes(bytes);
         if !is_live(approval_id) {
             return Ok(approval_id);

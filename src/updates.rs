@@ -392,7 +392,15 @@ async fn process_update(
     );
 
     let execution = runtime
-        .execute(client, &action, message_id, peer_id, &message, edited, authored_by_self)
+        .execute(
+            client,
+            &action,
+            message_id,
+            peer_id,
+            &message,
+            edited,
+            authored_by_self,
+        )
         .await;
     if let Some(request) = execution.provision
         && !provision_tasks.try_spawn(request)

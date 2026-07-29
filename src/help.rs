@@ -804,12 +804,8 @@ mod tests {
 
     #[tokio::test]
     async fn lm_help_describes_the_full_review_and_confirmation_flow() {
-        let response = render(
-            &HelpRequest::Topic("lm".to_owned()),
-            "🦀",
-            &aliases().await,
-        )
-        .response;
+        let response =
+            render(&HelpRequest::Topic("lm".to_owned()), "🦀", &aliases().await).response;
 
         assert!(response.text.starts_with("📦 🦀lm"));
         assert!(response.text.contains("🦀lm list"));
@@ -825,8 +821,16 @@ mod tests {
         assert!(response.text.contains("ровно 10 минут"));
         assert!(response.text.contains("disabled"));
         assert!(response.text.contains("не запускается автоматически"));
-        assert!(response.text.contains("исполняемый код без системной песочницы"));
-        assert!(response.text.contains("не может быть использовано повторно"));
+        assert!(
+            response
+                .text
+                .contains("исполняемый код без системной песочницы")
+        );
+        assert!(
+            response
+                .text
+                .contains("не может быть использовано повторно")
+        );
         assert!(response.text.contains("Риск: установка внешнего кода"));
     }
 

@@ -436,7 +436,9 @@ impl std::fmt::Debug for ValidatedStage {
 }
 impl ValidatedStage {
     fn path(&self) -> Result<&Path, SourceInspectionError> {
-        self.wrapper.as_deref().ok_or(SourceInspectionError::Staging)
+        self.wrapper
+            .as_deref()
+            .ok_or(SourceInspectionError::Staging)
     }
 
     pub(crate) fn take_wrapper(mut self) -> Option<PathBuf> {

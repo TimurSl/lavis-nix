@@ -6,10 +6,18 @@
 //! [`install_staged_module`]; this module intentionally neither redeems nor
 //! re-inspects a pending stage.
 
+use rustix::{
+    fs::{CWD, RenameFlags},
+    io::Errno,
+};
 use serde::{Deserialize, Serialize};
-use std::{fs, io, io::Write, path::Path, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    fs, io,
+    io::Write,
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use thiserror::Error;
-use rustix::{fs::{CWD, RenameFlags}, io::Errno};
 
 use super::manifest::{validate_manifest_at, validate_module_id};
 use crate::error::ExternalError;
@@ -70,14 +78,20 @@ pub(crate) const STAGE_FORMAT: u32 = 1;
 pub(crate) const STAGE_CREATED_BY: &str = "lavis";
 
 /// Create a strict ownership marker in a private staging wrapper.
-pub(crate) fn write_stage_marker(wrapper: &Path, created_at: SystemTime) -> Result<(), InstallError> {
+pub(crate) fn write_stage_marker(
+    wrapper: &Path,
+    created_at: SystemTime,
+) -> Result<(), InstallError> {
     if !is_plain_directory(wrapper)? {
         return Err(InstallError::UnsafeStage);
     }
     let marker = StageMarker {
         format: STAGE_FORMAT,
         created_by: STAGE_CREATED_BY.into(),
-        created_at: created_at.duration_since(UNIX_EPOCH).map_err(|_| InstallError::InvalidMarker)?.as_secs(),
+        created_at: created_at
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| InstallError::InvalidMarker)?
+            .as_secs(),
     };
     let bytes = serde_json::to_vec(&marker).map_err(|_| InstallError::InvalidMarker)?;
     let mut file = fs::OpenOptions::new()
@@ -91,7 +105,9 @@ pub(crate) fn write_stage_marker(wrapper: &Path, created_at: SystemTime) -> Resu
 /// Remove wrappers left after an interrupted install, but only when their
 /// strict owner marker proves they are installer-owned.  Symlinks are never
 /// traversed or removed through this routine.
-pub(crate) fn cleanup_abandoned_wrappers(staging_root: &Path) -> Result<Vec<StageCleanupError>, InstallError> {
+pub(crate) fn cleanup_abandoned_wrappers(
+    staging_root: &Path,
+) -> Result<Vec<StageCleanupError>, InstallError> {
     if !is_plain_directory(staging_root)? {
         return Err(InstallError::UnsafeStage);
     }
@@ -107,7 +123,10 @@ pub(crate) fn cleanup_abandoned_wrappers(staging_root: &Path) -> Result<Vec<Stag
             continue;
         }
         if let Err(error) = remove_tree_no_follow(&wrapper) {
-            failures.push(StageCleanupError { wrapper, kind: error.kind() });
+            failures.push(StageCleanupError {
+                wrapper,
+                kind: error.kind(),
+            });
         }
     }
     Ok(failures)
@@ -116,7 +135,10 @@ pub(crate) fn cleanup_abandoned_wrappers(staging_root: &Path) -> Result<Vec<Stag
 /// Cleanup failure after a wrapper was identified as installer-owned. It is
 /// distinct from `TargetCleanupError`, which follows a visible install failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StageCleanupError { pub wrapper: std::path::PathBuf, pub kind: io::ErrorKind }
+pub(crate) struct StageCleanupError {
+    pub wrapper: std::path::PathBuf,
+    pub kind: io::ErrorKind,
+}
 
 /// Atomically install the `payload` child of an inspection-owned wrapper.
 ///
@@ -196,8 +218,11 @@ fn read_stage_marker(wrapper: &Path) -> Result<StageMarker, InstallError> {
         return Err(InstallError::InvalidMarker);
     }
     let bytes = fs::read(owner_path).map_err(|_| InstallError::InvalidMarker)?;
-    let marker = serde_json::from_slice::<StageMarker>(&bytes).map_err(|_| InstallError::InvalidMarker)?;
-    if marker.format != STAGE_FORMAT || marker.created_by != STAGE_CREATED_BY { return Err(InstallError::InvalidMarker); }
+    let marker =
+        serde_json::from_slice::<StageMarker>(&bytes).map_err(|_| InstallError::InvalidMarker)?;
+    if marker.format != STAGE_FORMAT || marker.created_by != STAGE_CREATED_BY {
+        return Err(InstallError::InvalidMarker);
+    }
     Ok(marker)
 }
 
@@ -218,20 +243,29 @@ fn remove_empty_wrapper(wrapper: &Path) -> io::Result<()> {
 fn remove_tree_no_follow(path: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "symlink in removal path"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "symlink in removal path",
+        ));
     }
     if metadata.is_file() {
         return fs::remove_file(path);
     }
     if !metadata.is_dir() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported removal type"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported removal type",
+        ));
     }
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         let child = entry.path();
         let child_metadata = fs::symlink_metadata(&child)?;
         if child_metadata.file_type().is_symlink() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "symlink in removal tree"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "symlink in removal tree",
+            ));
         }
         remove_tree_no_follow(&child)?;
     }
@@ -252,7 +286,13 @@ mod tests {
 
     #[test]
     fn no_replace_rename_errors_keep_their_semantics() {
-        assert!(matches!(map_rename_error(Errno::EXIST), InstallError::TargetExists));
-        assert!(matches!(map_rename_error(Errno::XDEV), InstallError::CrossDevice));
+        assert!(matches!(
+            map_rename_error(Errno::EXIST),
+            InstallError::TargetExists
+        ));
+        assert!(matches!(
+            map_rename_error(Errno::XDEV),
+            InstallError::CrossDevice
+        ));
     }
 }
