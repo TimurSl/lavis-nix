@@ -4,6 +4,7 @@ pub mod manager;
 pub mod manifest;
 pub mod process;
 pub mod protocol;
+pub mod source_inspection;
 pub mod state;
 
 pub const MAX_ENABLED_MODULES: usize = 32;
