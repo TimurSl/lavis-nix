@@ -303,10 +303,11 @@ pub fn parse_module_line_for(
                 return Err(ExternalError::ProtocolDecode);
             }
             let request_id = validate_request_id(&value)?;
-            let actions = value
-                .get("actions")
-                .and_then(|value| value.as_array())
-                .ok_or(ExternalError::ProtocolDecode)?;
+            let actions: &[serde_json::Value] = match value.get("actions") {
+                Some(actions) => actions.as_array().ok_or(ExternalError::ProtocolDecode)?,
+                None if expected_protocol_version == 4 => &[],
+                None => return Err(ExternalError::ProtocolDecode),
+            };
             if actions.len() > MAX_EVENT_ACTIONS {
                 return Err(ExternalError::ProtocolDecode);
             }
@@ -530,6 +531,31 @@ mod tests {
             panic!("expected event result");
         };
         assert!(actions[0].reactions.is_empty());
+    }
+
+    #[test]
+    fn v4_event_result_accepts_omitted_or_empty_actions_for_noop() {
+        let omitted = r#"{"protocol_version":4,"type":"event_result","request_id":"42"}"#;
+        let parsed = parse_module_line_for(omitted, 4).unwrap().unwrap();
+        let ModuleMessage::EventResult { actions, .. } = parsed else {
+            panic!("expected event result");
+        };
+        assert!(actions.is_empty());
+
+        let empty =
+            r#"{"protocol_version":4,"type":"event_result","request_id":"42","actions":[]}"#;
+        let parsed = parse_module_line_for(empty, 4).unwrap().unwrap();
+        let ModuleMessage::EventResult { actions, .. } = parsed else {
+            panic!("expected event result");
+        };
+        assert!(actions.is_empty());
+
+        let malformed =
+            r#"{"protocol_version":4,"type":"event_result","request_id":"42","actions":{}}"#;
+        assert!(matches!(
+            parse_module_line_for(malformed, 4),
+            Err(ExternalError::ProtocolDecode)
+        ));
     }
 
     #[test]

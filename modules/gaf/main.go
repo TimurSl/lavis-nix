@@ -68,14 +68,14 @@ type eventAction struct {
 }
 
 type response struct {
-	ProtocolVersion int           `json:"protocol_version"`
-	Type            string        `json:"type"`
-	RequestID       string        `json:"request_id"`
-	ModuleID        string        `json:"module_id,omitempty"`
-	Text            string        `json:"text,omitempty"`
-	Code            string        `json:"code,omitempty"`
-	Message         string        `json:"message,omitempty"`
-	Actions         []eventAction `json:"actions,omitempty"`
+	ProtocolVersion int            `json:"protocol_version"`
+	Type            string         `json:"type"`
+	RequestID       string         `json:"request_id"`
+	ModuleID        string         `json:"module_id,omitempty"`
+	Text            string         `json:"text,omitempty"`
+	Code            string         `json:"code,omitempty"`
+	Message         string         `json:"message,omitempty"`
+	Actions         *[]eventAction `json:"actions,omitempty"`
 }
 
 type trigger struct {
@@ -187,7 +187,11 @@ func (m *module) handle(req request) response {
 		}
 	case "event":
 		base.Type = "event_result"
-		base.Actions = m.handleEvent(req.Event, req.Payload)
+		actions := m.handleEvent(req.Event, req.Payload)
+		if actions == nil {
+			actions = []eventAction{}
+		}
+		base.Actions = &actions
 	default:
 		base.Type = "error"
 		base.Code = "UNKNOWN_TYPE"

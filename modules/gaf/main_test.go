@@ -200,6 +200,59 @@ func TestCreatedNonMatchDoesNotPopulateActiveState(t *testing.T) {
 	}
 }
 
+func TestEventResultSerializesNoOpActionsAsEmptyArray(t *testing.T) {
+	m := testModule(t)
+	response := m.handle(request{
+		ProtocolVersion: protocolVersion,
+		Type:            "event",
+		RequestID:       "no-op",
+		Event:           "message.created",
+		Payload: eventPayload{
+			EventID: "10", MessageRef: "message", MessageKey: "no-match", Text: "обычное сообщение",
+		},
+	})
+	data, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		Type    string          `json:"type"`
+		Actions json.RawMessage `json:"actions"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire.Type != "event_result" || string(wire.Actions) != "[]" {
+		t.Fatalf("unexpected event result: %s", data)
+	}
+}
+
+func TestEventResultSerializesReactionActions(t *testing.T) {
+	m := testModule(t)
+	response := m.handle(request{
+		ProtocolVersion: protocolVersion,
+		Type:            "event",
+		RequestID:       "match",
+		Event:           "message.created",
+		Payload: eventPayload{
+			EventID: "10", MessageRef: "message", MessageKey: "match", Text: "лайк",
+		},
+	})
+	data, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire struct {
+		Actions []eventAction `json:"actions"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if len(wire.Actions) != 1 || wire.Actions[0].Type != "message.react" || wire.Actions[0].MessageRef != "message" || len(wire.Actions[0].Reactions) != 1 || wire.Actions[0].Reactions[0] != (reaction{Type: "emoji", Emoji: "👍"}) {
+		t.Fatalf("unexpected reaction actions: %s", data)
+	}
+}
+
 func TestMalformedCustomIDIsRejected(t *testing.T) {
 	if _, err := parseReactions([]token{{Text: "ce:not-a-number"}}, nil); err == nil {
 		t.Fatal("malformed diagnostic custom emoji ID must be rejected")
