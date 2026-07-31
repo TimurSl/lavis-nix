@@ -1,0 +1,360 @@
+{ self }:
+
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
+
+let
+  inherit (lib)
+    concatMapStringsSep
+    literalExpression
+    mkEnableOption
+    mkIf
+    mkOption
+    optional
+    types
+    ;
+
+  cfg = config.services.lavis;
+  system = pkgs.stdenv.hostPlatform.system;
+  extensionLib = import ../lib/extensions.nix { inherit pkgs; };
+
+  declaredUser =
+    if cfg.user != null && builtins.hasAttr cfg.user config.users.users then
+      config.users.users.${cfg.user}
+    else
+      null;
+  declaredUserGroup = if declaredUser != null then declaredUser.group else null;
+  effectiveGroup = if cfg.group != null then cfg.group else declaredUserGroup;
+  declaredUserHome =
+    if declaredUser != null then declaredUser.home else null;
+  effectiveHome =
+    if cfg.home != null then
+      cfg.home
+    else if declaredUserHome != null then
+      declaredUserHome
+    else
+      "/var/lib/lavis";
+
+  configHome = "${effectiveHome}/.config";
+  stateHome = "${effectiveHome}/.local/state";
+  dataHome = "${effectiveHome}/.local/share";
+  lavisConfigDir = "${configHome}/lavis";
+  lavisStateDir = "${stateHome}/lavis";
+  lavisDataDir = "${dataHome}/lavis";
+  modulesDir = "${lavisDataDir}/modules";
+  moduleStateRoot = "${lavisStateDir}/modules";
+  moduleStagingDir = "${lavisDataDir}/module-staging";
+  declarativeStateFile = "${lavisStateDir}/declarative-modules.json";
+  moduleIdType = types.addCheck types.str (
+    id: builtins.match "[a-z][a-z0-9-]{0,31}" id != null
+  );
+
+  settingsFile =
+    if cfg.settings.prefix == null then
+      null
+    else
+      pkgs.writeText "lavis-settings.json" (
+        builtins.toJSON {
+          version = 1;
+          prefix = cfg.settings.prefix;
+        }
+      );
+
+  fastfetchProfileFile =
+    if cfg.fastfetchProfile == null then
+      null
+    else
+      pkgs.writeText "lavis-fastfetch.json" (builtins.toJSON cfg.fastfetchProfile);
+
+  extensionModule =
+    { ... }:
+    {
+      options = {
+        id = mkOption {
+          type = moduleIdType;
+          description = "Lavis external module id. Must match the module manifest id.";
+          example = "gaf";
+        };
+
+        package = mkOption {
+          type = types.nullOr (types.either types.package types.path);
+          default = null;
+          description = "Directory package containing module.json and the module entrypoint.";
+        };
+
+        url = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          description = "URL of a .lmod archive to fetch and install declaratively.";
+          example = "https://example.invalid/my-module.lmod";
+        };
+
+        hash = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          description = "Hash for the .lmod archive declared by url.";
+          example = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        };
+
+        enable = mkOption {
+          type = types.bool;
+          default = true;
+          description = "Whether this declarative extension id should be enabled in Lavis state.";
+        };
+      };
+    };
+
+  extensionSource =
+    ext:
+    if ext.package != null then
+      ext.package
+    else
+      extensionLib.buildLavisExtensionFromLmod {
+        inherit (ext) id;
+        src = pkgs.fetchurl {
+          inherit (ext) url hash;
+        };
+      };
+
+  extensions = map (ext: ext // { source = extensionSource ext; }) cfg.extensions;
+  declarativeIdsJson = pkgs.writeText "lavis-declarative-extension-ids.json" (
+    builtins.toJSON (map (ext: ext.id) extensions)
+  );
+  enabledIdsJson = pkgs.writeText "lavis-enabled-extension-ids.json" (
+    builtins.toJSON (map (ext: ext.id) (builtins.filter (ext: ext.enable) extensions))
+  );
+
+  installExtensionCommands = concatMapStringsSep "\n" (
+    ext: ''
+      install_lavis_extension ${lib.escapeShellArg ext.id} ${lib.escapeShellArg (toString ext.source)}
+    ''
+  ) extensions;
+
+  setupScript = pkgs.writeShellScript "lavis-setup" ''
+    set -euo pipefail
+
+    install -d -m 700 \
+      ${lib.escapeShellArg lavisConfigDir} \
+      ${lib.escapeShellArg lavisStateDir} \
+      ${lib.escapeShellArg lavisDataDir} \
+      ${lib.escapeShellArg modulesDir} \
+      ${lib.escapeShellArg moduleStagingDir}
+
+    ${lib.optionalString (settingsFile != null) ''
+      install -m 600 \
+        ${lib.escapeShellArg settingsFile} ${lib.escapeShellArg "${lavisStateDir}/settings.json"}
+    ''}
+
+    ${lib.optionalString (fastfetchProfileFile != null) ''
+      install -m 600 \
+        ${lib.escapeShellArg fastfetchProfileFile} ${lib.escapeShellArg "${lavisConfigDir}/fastfetch.json"}
+    ''}
+
+    install_lavis_extension() {
+      local id="$1"
+      local src="$2"
+      local dest=${lib.escapeShellArg modulesDir}/"$id"
+      local state_dir=${lib.escapeShellArg moduleStateRoot}/"$id"
+      local staging
+      local old
+
+      if [ ! -f "$src/module.json" ]; then
+        echo "lavis extension $id: $src/module.json does not exist" >&2
+        exit 1
+      fi
+      if ! ${pkgs.python3}/bin/python3 - "$id" "$src/module.json" <<'PY'
+import json
+import sys
+
+expected_id, manifest_path = sys.argv[1:3]
+with open(manifest_path, "r", encoding="utf-8") as handle:
+    manifest = json.load(handle)
+actual_id = manifest.get("id")
+if actual_id != expected_id:
+    raise SystemExit(
+        f"lavis extension {expected_id}: module.json id {actual_id!r} does not match declarative id"
+    )
+PY
+      then
+        exit 1
+      fi
+
+      install -d -m 700 "$state_dir"
+
+      staging=$(mktemp -d -p ${lib.escapeShellArg moduleStagingDir} ".nixos-$id.XXXXXXXXXX")
+      trap 'rm -rf "$staging"' RETURN
+
+      cp -R --no-dereference --no-preserve=ownership "$src/." "$staging/"
+      chmod -R u+rwX,go-rwx "$staging"
+      printf '%s\n' 'managed-by=services.lavis' > "$staging/.lavis-nixos-module"
+      chmod 600 "$staging/.lavis-nixos-module"
+
+      if [ -e "$dest" ] || [ -L "$dest" ]; then
+        old="$staging.old"
+        mv -T "$dest" "$old"
+        if [ -f "$old/state.json" ] && [ ! -L "$old/state.json" ] && [ ! -e "$state_dir/state.json" ]; then
+          install -m 600 "$old/state.json" "$state_dir/state.json"
+        fi
+        mv -T "$staging" "$dest"
+        rm -rf "$old"
+      else
+        mv -T "$staging" "$dest"
+      fi
+      trap - RETURN
+    }
+
+    ${installExtensionCommands}
+
+    ${pkgs.python3}/bin/python3 ${./merge-enabled-extensions.py} \
+      ${lib.escapeShellArg "${lavisStateDir}/external-modules.json"} \
+      ${lib.escapeShellArg declarativeStateFile} \
+      ${lib.escapeShellArg declarativeIdsJson} \
+      ${lib.escapeShellArg enabledIdsJson}
+  '';
+in
+{
+  options.services.lavis = {
+    enable = mkEnableOption "Lavis Telegram userbot";
+
+    package = mkOption {
+      type = types.package;
+      default = self.packages.${system}.default;
+      defaultText = literalExpression "inputs.lavis.packages.${pkgs.stdenv.hostPlatform.system}.default";
+      description = "Lavis package to run.";
+    };
+
+    user = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "Existing Unix user that owns and runs Lavis.";
+      example = "melvi";
+    };
+
+    group = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "Existing Unix group for Lavis files. Defaults to the declared primary group of services.lavis.user.";
+      example = "users";
+    };
+
+    home = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "Home directory used to derive Lavis XDG paths. Defaults to the configured user's home.";
+      example = "/home/melvi";
+    };
+
+    autoStart = mkOption {
+      type = types.bool;
+      default = true;
+      description = "Whether lavis.service should start at boot.";
+    };
+
+    credentialsEnvironmentFile = mkOption {
+      type = types.nullOr types.path;
+      default = null;
+      description = "Environment file containing LAVIS_API_ID and LAVIS_API_HASH.";
+      example = "/run/secrets/lavis.env";
+    };
+
+    logLevel = mkOption {
+      type = types.str;
+      default = "info";
+      description = "RUST_LOG value for the Lavis service.";
+    };
+
+    settings.prefix = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "Optional declarative command prefix written to Lavis settings.json.";
+      example = ",";
+    };
+
+    fastfetchProfile = mkOption {
+      type = types.nullOr types.attrs;
+      default = null;
+      description = "Optional fastfetch profile written to Lavis fastfetch.json.";
+      example = literalExpression ''
+        {
+          version = 1;
+          logo = "NixOS";
+          structure = [ "title" "os" "kernel" ];
+        }
+      '';
+    };
+
+    extensions = mkOption {
+      type = types.listOf (types.submodule extensionModule);
+      default = [ ];
+      description = "Declarative Lavis external modules to install from packages or fetched .lmod archives.";
+      example = literalExpression ''
+        [
+          { id = "gaf"; package = inputs.lavis.packages.''${pkgs.system}.lavis-extension-gaf; }
+          {
+            id = "my-module";
+            url = "https://example.invalid/my-module.lmod";
+            hash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+          }
+        ]
+      '';
+    };
+  };
+
+  config = mkIf cfg.enable {
+    assertions =
+      [
+        {
+          assertion = cfg.user != null;
+          message = "services.lavis.user must be set to an existing Unix user.";
+        }
+        {
+          assertion = cfg.home != null || declaredUserHome != null;
+          message = "services.lavis.home must be set when services.lavis.user has no declared home.";
+        }
+        {
+          assertion = effectiveGroup != null;
+          message = "services.lavis.group must be set when services.lavis.user has no declared primary group.";
+        }
+      ]
+      ++ map (ext: {
+        assertion = (ext.package != null) != (ext.url != null);
+        message = "services.lavis.extensions entry ${ext.id} must set exactly one of package or url.";
+      }) cfg.extensions
+      ++ map (ext: {
+        assertion = ext.url == null || ext.hash != null;
+        message = "services.lavis.extensions entry ${ext.id} with url must also set hash.";
+      }) cfg.extensions;
+
+    systemd.services.lavis = {
+      description = "Lavis Telegram userbot";
+      wantedBy = optional cfg.autoStart "multi-user.target";
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
+
+      environment = {
+        HOME = effectiveHome;
+        XDG_CONFIG_HOME = configHome;
+        XDG_STATE_HOME = stateHome;
+        XDG_DATA_HOME = dataHome;
+        RUST_LOG = cfg.logLevel;
+      };
+
+      preStart = "${setupScript}";
+
+      serviceConfig = {
+        Type = "simple";
+        ExecStart = "${cfg.package}/bin/lavis run";
+        User = cfg.user;
+        Group = effectiveGroup;
+        WorkingDirectory = effectiveHome;
+        Restart = "on-failure";
+        RestartSec = "5s";
+        EnvironmentFile = optional (cfg.credentialsEnvironmentFile != null) cfg.credentialsEnvironmentFile;
+      };
+    };
+  };
+}
