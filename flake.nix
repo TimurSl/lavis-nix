@@ -122,10 +122,35 @@
               )
             ];
           };
+          defaultEvaluated = nixpkgs.lib.nixosSystem {
+            inherit system;
+            modules = [
+              self.nixosModules.default
+              (
+                { ... }:
+                {
+                  services.lavis = {
+                    enable = true;
+                    credentialsEnvironmentFile = "/run/secrets/lavis.env";
+                  };
+                }
+              )
+            ];
+          };
+          customAuthPackage = builtins.head (
+            builtins.filter
+              (package: (package.name or "") == "lavis-auth")
+              evaluated.config.environment.systemPackages
+          );
         in
         pkgs.runCommand "lavis-nixos-module-eval" {
           unit = evaluated.config.systemd.units."lavis.service".unit;
           preStartScript = evaluated.config.systemd.services.lavis.preStart;
+          authScript = "${customAuthPackage}/bin/lavis-auth";
+          defaultUnit = defaultEvaluated.config.systemd.units."lavis.service".unit;
+          defaultTmpfiles = pkgs.writeText "lavis-default-tmpfiles" (
+            nixpkgs.lib.concatStringsSep "\n" defaultEvaluated.config.systemd.tmpfiles.rules
+          );
         } ''
           grep -q 'User=lavis-test' "$unit/lavis.service"
           grep -q 'Group=users' "$unit/lavis.service"
@@ -133,6 +158,13 @@
           grep -q 'EnvironmentFile=/run/secrets/lavis.env' "$unit/lavis.service"
           grep -q 'XDG_STATE_HOME=/build/lavis-test/.local/state' "$unit/lavis.service"
           grep -q 'mktemp -d -p /build/lavis-test/.local/share/lavis/module-staging' "$preStartScript"
+          grep -q 'runuser' "$authScript"
+          grep -q 'XDG_STATE_HOME=/build/lavis-test/.local/state' "$authScript"
+          grep -q '/run/secrets/lavis.env' "$authScript"
+          grep -q 'User=lavis' "$defaultUnit/lavis.service"
+          grep -q 'Group=lavis' "$defaultUnit/lavis.service"
+          grep -q 'WorkingDirectory=/var/lib/lavis' "$defaultUnit/lavis.service"
+          grep -q 'd /var/lib/lavis 0700 lavis lavis - -' "$defaultTmpfiles"
           ! grep -q 'chown -R' "$preStartScript"
           ! grep -q 'PermissionsStartOnly=true' "$unit/lavis.service"
 
