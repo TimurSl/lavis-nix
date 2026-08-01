@@ -28,6 +28,9 @@ Add the Lavis flake input and import the module:
         {
           services.lavis = {
             enable = true;
+            # Keep the service stopped until the first interactive auth
+            # has created the Telegram session.
+            autoStart = false;
             credentialsEnvironmentFile = "/run/secrets/lavis.env";
           };
         }
@@ -51,8 +54,8 @@ services.lavis = {
 };
 ```
 
-By default the service starts at boot. Set `autoStart = false` to install the
-unit without adding it to `multi-user.target`.
+By default the service starts at boot. Keep `autoStart = false` for first-time
+authorization, then remove it or set it to `true` after `lavis-auth` succeeds.
 
 ## Credentials and first authorization
 
@@ -75,9 +78,10 @@ interactively with the helper installed by the module:
 sudo lavis-auth
 ```
 
-`lavis-auth` reads `credentialsEnvironmentFile` as root, creates the configured
-home/XDG directories with private permissions, switches to the service user, and
-runs `lavis auth` with the same environment as `lavis.service`.
+`lavis-auth` parses only literal `LAVIS_API_ID` and `LAVIS_API_HASH` assignments
+from `credentialsEnvironmentFile` as root, switches to the service user, creates
+the Lavis XDG directories with private permissions, and runs `lavis auth` with
+the same environment as `lavis.service`.
 
 The default service uses these paths:
 
@@ -96,6 +100,7 @@ On a fresh VPS, the usual sequence is:
 nixos-rebuild test --flake .#host
 sudo lavis-auth
 sudo systemctl start lavis.service
+# Remove autoStart = false, or set autoStart = true.
 nixos-rebuild switch --flake .#host
 ```
 

@@ -191,6 +191,8 @@ lavis modules status
 
   services.lavis = {
     enable = true;
+    # Keep stopped until the first interactive auth succeeds.
+    autoStart = false;
     credentialsEnvironmentFile = "/run/secrets/lavis.env";
   };
 }
@@ -204,6 +206,9 @@ lavis modules status
 sudo lavis-auth
 sudo systemctl start lavis.service
 ```
+
+После успешной авторизации можно убрать `autoStart = false` или заменить на
+`autoStart = true`.
 
 Full service, credentials and declarative extension setup:
 [NixOS module](docs/nixos-module.md).

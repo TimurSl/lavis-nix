@@ -236,31 +236,58 @@ PY
       exit 1
     fi
 
+    credential_env=()
     ${optionalString (cfg.credentialsEnvironmentFile != null) ''
-      set -a
-      . ${lib.escapeShellArg cfg.credentialsEnvironmentFile}
-      set +a
+      mapfile -t credential_env < <(${pkgs.python3}/bin/python3 - ${lib.escapeShellArg cfg.credentialsEnvironmentFile} <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+allowed = {"LAVIS_API_ID", "LAVIS_API_HASH"}
+values = {}
+line_re = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^#\s]+)\s*(?:#.*)?$")
+
+with open(path, "r", encoding="utf-8") as handle:
+    for number, line in enumerate(handle, 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = line_re.match(line)
+        if match is None or match.group(1) not in allowed:
+            raise SystemExit(f"{path}:{number}: expected literal LAVIS_API_ID=... or LAVIS_API_HASH=...")
+        key, value = match.groups()
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+            raise SystemExit(f"{path}:{number}: invalid control character")
+        values[key] = value
+
+api_id = values.get("LAVIS_API_ID")
+api_hash = values.get("LAVIS_API_HASH")
+if (api_id is None) != (api_hash is None):
+    raise SystemExit(f"{path}: LAVIS_API_ID and LAVIS_API_HASH must be set together")
+if api_id is not None:
+    if not api_id.isdigit():
+        raise SystemExit(f"{path}: LAVIS_API_ID must be decimal digits")
+    if re.fullmatch(r"[A-Fa-f0-9]{32}", api_hash) is None:
+        raise SystemExit(f"{path}: LAVIS_API_HASH must be 32 hexadecimal characters")
+    print(f"LAVIS_API_ID={api_id}")
+    print(f"LAVIS_API_HASH={api_hash}")
+PY
+      )
     ''}
 
-    install -d -m 700 -o ${lib.escapeShellArg serviceUser} -g ${lib.escapeShellArg serviceGroup} \
-      ${lib.escapeShellArg effectiveHome} \
-      ${lib.escapeShellArg lavisConfigDir} \
-      ${lib.escapeShellArg lavisStateDir} \
-      ${lib.escapeShellArg lavisDataDir}
+    ${optionalString createsDefaultUser ''
+      ${pkgs.coreutils}/bin/install -d -m 700 -o ${lib.escapeShellArg serviceUser} -g ${lib.escapeShellArg serviceGroup} \
+        ${lib.escapeShellArg effectiveHome}
+    ''}
 
     lavis_env=(
-      HOME=${lib.escapeShellArg effectiveHome}
-      XDG_CONFIG_HOME=${lib.escapeShellArg configHome}
-      XDG_STATE_HOME=${lib.escapeShellArg stateHome}
-      XDG_DATA_HOME=${lib.escapeShellArg dataHome}
-      RUST_LOG=${lib.escapeShellArg cfg.logLevel}
+      "HOME=${lib.escapeShellArg effectiveHome}"
+      "XDG_CONFIG_HOME=${lib.escapeShellArg configHome}"
+      "XDG_STATE_HOME=${lib.escapeShellArg stateHome}"
+      "XDG_DATA_HOME=${lib.escapeShellArg dataHome}"
+      "RUST_LOG=${lib.escapeShellArg cfg.logLevel}"
+      "''${credential_env[@]}"
     )
-    if [ "''${LAVIS_API_ID+x}" = x ]; then
-      lavis_env+=("LAVIS_API_ID=$LAVIS_API_ID")
-    fi
-    if [ "''${LAVIS_API_HASH+x}" = x ]; then
-      lavis_env+=("LAVIS_API_HASH=$LAVIS_API_HASH")
-    fi
 
     exec ${pkgs.util-linux}/bin/runuser \
       --user ${lib.escapeShellArg serviceUser} \
@@ -269,7 +296,27 @@ PY
       ${pkgs.coreutils}/bin/env \
         -i \
         "''${lavis_env[@]}" \
-        ${cfg.package}/bin/lavis auth
+        ${pkgs.bash}/bin/bash -euo pipefail -c '
+    ${optionalString createsDefaultUser ''
+    ${pkgs.coreutils}/bin/mkdir -p \
+      ${lib.escapeShellArg effectiveHome}
+
+    ${pkgs.coreutils}/bin/chmod 700 \
+      ${lib.escapeShellArg effectiveHome}
+    ''}
+
+    ${pkgs.coreutils}/bin/mkdir -p \
+      ${lib.escapeShellArg lavisConfigDir} \
+      ${lib.escapeShellArg lavisStateDir} \
+      ${lib.escapeShellArg lavisDataDir}
+
+    ${pkgs.coreutils}/bin/chmod 700 \
+      ${lib.escapeShellArg lavisConfigDir} \
+      ${lib.escapeShellArg lavisStateDir} \
+      ${lib.escapeShellArg lavisDataDir}
+
+    exec ${cfg.package}/bin/lavis auth
+        '
   '';
 in
 {
@@ -395,9 +442,9 @@ in
       };
     };
 
-    systemd.tmpfiles.rules = [
+    systemd.tmpfiles.rules = optional createsDefaultUser (
       "d ${effectiveHome} 0700 ${serviceUser} ${serviceGroup} - -"
-    ];
+    );
 
     environment.systemPackages = [ authScript ];
 

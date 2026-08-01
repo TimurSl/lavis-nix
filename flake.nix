@@ -148,6 +148,9 @@
           preStartScript = evaluated.config.systemd.services.lavis.preStart;
           authScript = "${customAuthPackage}/bin/lavis-auth";
           defaultUnit = defaultEvaluated.config.systemd.units."lavis.service".unit;
+          existingTmpfiles = pkgs.writeText "lavis-existing-user-tmpfiles" (
+            nixpkgs.lib.concatStringsSep "\n" evaluated.config.systemd.tmpfiles.rules
+          );
           defaultTmpfiles = pkgs.writeText "lavis-default-tmpfiles" (
             nixpkgs.lib.concatStringsSep "\n" defaultEvaluated.config.systemd.tmpfiles.rules
           );
@@ -161,6 +164,12 @@
           grep -q 'runuser' "$authScript"
           grep -q 'XDG_STATE_HOME=/build/lavis-test/.local/state' "$authScript"
           grep -q '/run/secrets/lavis.env' "$authScript"
+          grep -q 'expected literal LAVIS_API_ID' "$authScript"
+          grep -q '32 hexadecimal characters' "$authScript"
+          ! grep -q 'install -d -m 700 -o lavis-test' "$authScript"
+          ! grep -q 'set -a' "$authScript"
+          ! grep -q '\. /run/secrets/lavis.env' "$authScript"
+          ! grep -q 'd /build/lavis-test 0700' "$existingTmpfiles"
           grep -q 'User=lavis' "$defaultUnit/lavis.service"
           grep -q 'Group=lavis' "$defaultUnit/lavis.service"
           grep -q 'WorkingDirectory=/var/lib/lavis' "$defaultUnit/lavis.service"
