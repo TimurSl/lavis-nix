@@ -370,6 +370,16 @@ mod tests {
         );
         assert_eq!(
             validate_alias(
+                "again",
+                &Alias {
+                    target: "reboot".to_owned(),
+                    args: Vec::new(),
+                }
+            ),
+            Err(AliasError::TargetNotAliasable)
+        );
+        assert_eq!(
+            validate_alias(
                 "fast",
                 &Alias {
                     target: "missing".to_owned(),

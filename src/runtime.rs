@@ -18,7 +18,6 @@ use crate::{
         SetupRequest, dispatch,
     },
     error::ExternalError,
-    external_modules::manager::{ExternalManagerHandle, ExternalRuntimeSnapshot},
     external_modules::{
         acquisition::{AcquisitionLimits, ModuleSourceAcquirer},
         approval::{
@@ -32,6 +31,11 @@ use crate::{
         source_inspection::{
             InspectionConfig, InspectionLimits, ModuleInspector, OsRandom, SystemClock,
         },
+    },
+    external_modules::{
+        control,
+        manager::{ExternalManagerHandle, ExternalRuntimeSnapshot},
+        state::ExternalStateStore,
     },
     fastfetch::{self, FastfetchInputError, FastfetchProfileError, FastfetchResult},
     help::{render_modules_overview_with_external, render_with_external},
@@ -55,6 +59,7 @@ pub struct RuntimeState {
     setup_edit_fallback_sources: VecDeque<(PeerId, i32)>,
     setup: Option<SetupCoordinator>,
     module_installation: Option<ModuleInstallation>,
+    module_control: Option<ModuleControlConfig>,
     module_approvals: ApprovalStore<SystemClock, OsRandom>,
 }
 
@@ -64,12 +69,18 @@ struct ModuleInstallation {
     saved_messages_peer: PeerId,
 }
 
+struct ModuleControlConfig {
+    root: PathBuf,
+    state_path: PathBuf,
+    declarative_state_path: PathBuf,
+    saved_messages_peer: PeerId,
+}
+
 const MODULE_APPROVAL_LIMIT: usize = 8;
 const MODULE_APPROVAL_BYTES: u64 = 128 * 1024 * 1024;
-const EDITED_LM_STATE_CHANGE: &str =
-    "⚠️ Изменённые сообщения не могут изменять состояние установки.";
-const LM_SAVED_MESSAGES_ONLY: &str =
-    "⚠️ Установка модулей доступна только из нового собственного сообщения в Saved Messages.";
+const MODULE_MUTATION_DENIED: &str =
+    "⚠️ Эта операция с модулями доступна только из нового собственного сообщения в Saved Messages.";
+const REBOOT_DENIED: &str = "⚠️ Перезапуск доступен только из нового сообщения.";
 
 const MAX_EXPECTED_SELF_EDITS: usize = 128;
 const SETUP_STAGE_TIMEOUT: Duration = Duration::from_secs(90);
@@ -199,6 +210,19 @@ struct BotFatherOutcome {
 pub(crate) struct RuntimeExecution {
     pub response: Response,
     pub provision: Option<ProvisionRequest>,
+    pub shutdown: Option<ShutdownReason>,
+    pub post_edit: Option<PostEditAction>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PostEditAction {
+    ArmRebootReceipt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownReason {
+    Exit,
+    Restart,
 }
 
 #[derive(Clone, Copy)]
@@ -213,6 +237,8 @@ impl From<Response> for RuntimeExecution {
         Self {
             response,
             provision: None,
+            shutdown: None,
+            post_edit: None,
         }
     }
 }
@@ -253,6 +279,7 @@ impl RuntimeState {
             setup_edit_fallback_sources: VecDeque::new(),
             setup: None,
             module_installation: None,
+            module_control: None,
             module_approvals: ApprovalStore::new(
                 SystemClock,
                 OsRandom,
@@ -379,6 +406,21 @@ impl RuntimeState {
         });
     }
 
+    pub fn configure_module_control(
+        &mut self,
+        root: PathBuf,
+        state_path: PathBuf,
+        declarative_state_path: PathBuf,
+        saved_messages_peer: PeerId,
+    ) {
+        self.module_control = Some(ModuleControlConfig {
+            root,
+            state_path,
+            declarative_state_path,
+            saved_messages_peer,
+        });
+    }
+
     pub fn shutdown_module_approvals(&mut self) {
         match self.module_approvals.shutdown() {
             Ok(removed) => tracing::debug!(
@@ -473,8 +515,11 @@ impl RuntimeState {
     }
 
     pub fn register_expected_self_edit(&mut self, peer_id: PeerId, message_id: i32, text: String) {
-        self.expected_self_edits
-            .retain(|expected| expected.peer_id != peer_id || expected.message_id != message_id);
+        self.expected_self_edits.retain(|expected| {
+            expected.peer_id != peer_id
+                || expected.message_id != message_id
+                || expected.text != text
+        });
         if self.expected_self_edits.len() == MAX_EXPECTED_SELF_EDITS {
             self.expected_self_edits.pop_front();
         }
@@ -737,6 +782,7 @@ impl RuntimeState {
             Action::Prefix(request) => self.execute_prefix(request).await,
             Action::Modules(request) => self.execute_modules(request, &prefix),
             Action::Lm(request) => self.execute_lm(client, message_context, request).await,
+            Action::Reboot => return self.execute_reboot(message_context),
             Action::Setup(_) => unreachable!("setup actions return before response dispatch"),
             Action::External(invocation) => self.execute_external(invocation).await,
         }
@@ -761,48 +807,58 @@ impl RuntimeState {
                 "Could not sweep expired external module approvals"
             ),
         }
+        if lm_request_mutates(request)
+            && let Err(response) = self.lm_mutation_policy(message_context)
+        {
+            return response;
+        }
         match request {
-            LmRequest::Overview | LmRequest::List => {
-                self.refresh_snapshot().await;
-                self.render_lm_list()
-            }
+            LmRequest::Overview | LmRequest::List => self.render_lm_list().await,
+            LmRequest::Info { id } => self.lm_info(id).await,
             LmRequest::Invalid => Response::plain(lm_usage(self.prefix())),
-            LmRequest::Install | LmRequest::Confirm { .. } | LmRequest::Cancel { .. }
-                if message_context.edited =>
-            {
-                Response::plain(EDITED_LM_STATE_CHANGE.to_owned())
-            }
-            LmRequest::Install | LmRequest::Confirm { .. } | LmRequest::Cancel { .. }
-                if !self.is_lm_saved_message(message_context) =>
-            {
-                Response::plain(LM_SAVED_MESSAGES_ONLY.to_owned())
-            }
             LmRequest::Install => {
                 self.inspect_module_install(client, message_context.message)
                     .await
             }
             LmRequest::Confirm { approval_id } => self.confirm_module_install(approval_id).await,
             LmRequest::Cancel { approval_id } => self.cancel_module_install(approval_id),
+            LmRequest::Enable { id } => self.lm_set_enabled(id, true).await,
+            LmRequest::Disable { id } => self.lm_set_enabled(id, false).await,
         }
     }
 
-    fn render_lm_list(&self) -> Response {
-        let statuses = self
-            .external_snapshot
-            .module_statuses
-            .iter()
-            .map(|module| {
-                format!(
-                    "• {}\n  ID: {}\n  Версия: {}\n  Статус: {}\n  Автор: {}\n  Команд: {}",
-                    module.display_name,
-                    module.id,
-                    module.version,
-                    module.status,
-                    module.author,
-                    module.command_count,
-                )
-            })
-            .collect::<Vec<_>>();
+    async fn render_lm_list(&self) -> Response {
+        let Some(config) = &self.module_control else {
+            return Response::plain("⚠️ Управление внешними модулями недоступно.".to_owned());
+        };
+        let state = match ExternalStateStore::load(config.state_path.clone()).await {
+            Ok(state) => state,
+            Err(_) => {
+                return Response::plain("⚠️ Состояние внешних модулей недоступно.".to_owned());
+            }
+        };
+        let list = match control::list_modules(&config.root, &config.declarative_state_path, &state)
+        {
+            Ok(list) => list,
+            Err(_) => {
+                return Response::plain(
+                    "⚠️ Не удалось прочитать список внешних модулей.".to_owned(),
+                );
+            }
+        };
+        let mut statuses = list.modules.iter().map(|entry| match &entry.module {
+            Some(module) => format!("• {}\n  ID: {}\n  Версия: {}\n  Состояние: {}\n  Источник: {}\n  Runtime: {}\n  Автор: {}\n  Команд: {}", module.display_name, module.id, module.version, enabled_label(module.enabled), management_label(module.management), runtime_status(self, &module.id), module.author, module.commands.len()),
+            None => format!("• {}\n  Диагностика: {}\n  Состояние: {}\n  Источник: {}", entry.id.as_deref().unwrap_or("некорректный ID"), diagnostic_label(entry.diagnostic.as_ref()), enabled_label(entry.enabled), management_label(entry.management)),
+        }).collect::<Vec<_>>();
+        for id in state.enabled_ids() {
+            if !list
+                .modules
+                .iter()
+                .any(|entry| entry.id.as_deref() == Some(id))
+            {
+                statuses.push(format!("• {id}\n  Статус: включён, но каталог отсутствует"));
+            }
+        }
         if statuses.is_empty() {
             Response::plain(format!(
                 "📦 Внешние модули не установлены.\n\nЧтобы установить модуль, прикрепите .lmod к сообщению:\n{}lm install",
@@ -813,17 +869,99 @@ impl RuntimeState {
         }
     }
 
-    fn is_lm_saved_message(&self, message_context: MessageExecutionContext<'_>) -> bool {
-        self.module_installation
-            .as_ref()
-            .is_some_and(|installation| {
-                is_fresh_self_authored_saved_message(
-                    message_context.authored_by_self,
-                    message_context.message.peer_id(),
-                    message_context.message.id(),
-                    installation.saved_messages_peer,
-                )
-            })
+    fn lm_mutation_policy(&self, context: MessageExecutionContext<'_>) -> Result<(), Response> {
+        self.authorize_sensitive_command(
+            SensitiveCommandPolicy::ModuleMutation,
+            context,
+            self.module_control
+                .as_ref()
+                .map(|control| control.saved_messages_peer),
+        )
+    }
+
+    async fn lm_info(&self, id: &str) -> Response {
+        let Some(config) = &self.module_control else {
+            return Response::plain("⚠️ Управление внешними модулями недоступно.".to_owned());
+        };
+        let state = match ExternalStateStore::load(config.state_path.clone()).await {
+            Ok(state) => state,
+            Err(_) => {
+                return Response::plain("⚠️ Состояние внешних модулей недоступно.".to_owned());
+            }
+        };
+        match control::module_info(&config.root, &config.declarative_state_path, &state, id) {
+            Ok(module) => Response::plain(format!(
+                "📦 {}\nID: {}\nВерсия: {}\nАвтор: {}\nСостояние: {}\nИсточник: {}\nТочка входа: {}\nSchema/API protocol: v{}\nВозможности: {}\nПредоставляемые команды: {}",
+                module.display_name,
+                module.id,
+                module.version,
+                module.author,
+                enabled_label(module.enabled),
+                management_label(module.management),
+                module.entrypoint,
+                module.protocol_version,
+                capabilities_label(&module.capabilities),
+                commands_label(&module.commands)
+            )),
+            Err(control::ModuleControlError::InvalidInstalledModule) => {
+                Response::plain("⚠️ Манифест установленного модуля некорректен.".to_owned())
+            }
+            Err(_) => Response::plain("⚠️ Модуль не установлен или недоступен.".to_owned()),
+        }
+    }
+
+    async fn lm_set_enabled(&self, id: &str, enabled: bool) -> Response {
+        let Some(config) = &self.module_control else {
+            return Response::plain("⚠️ Управление внешними модулями недоступно.".to_owned());
+        };
+        let mut state = match ExternalStateStore::load(config.state_path.clone()).await {
+            Ok(state) => state,
+            Err(_) => {
+                return Response::plain("⚠️ Состояние внешних модулей недоступно.".to_owned());
+            }
+        };
+        let result = if enabled {
+            control::enable_module(&config.root, &config.declarative_state_path, &mut state, id)
+                .await
+        } else {
+            control::disable_module(&config.root, &config.declarative_state_path, &mut state, id)
+                .await
+        };
+        match result {
+            Ok(operation) if operation.changed => Response::plain(format!("✅ Модуль «{}» {}.\n\nДля применения изменений выполните:\n,reboot", operation.module.display_name, if enabled { "включён" } else { "отключён" })),
+            Ok(operation) => Response::plain(format!("ℹ️ Модуль «{}» уже {}.", operation.module.display_name, if enabled { "включён" } else { "отключён" })),
+            Err(control::ModuleControlError::DeclarativelyManaged) => Response::plain("⚠️ Модуль управляется декларативно через NixOS. Измените services.lavis.extensions и выполните nh os switch.".to_owned()),
+            Err(_) => Response::plain("⚠️ Не удалось изменить состояние модуля.".to_owned()),
+        }
+    }
+
+    fn execute_reboot(&self, context: MessageExecutionContext<'_>) -> RuntimeExecution {
+        match self.authorize_sensitive_command(SensitiveCommandPolicy::Reboot, context, None) {
+            Ok(()) => RuntimeExecution {
+                response: Response::plain("♻️ Lavis перезапускается…".to_owned()),
+                provision: None,
+                shutdown: None,
+                post_edit: Some(PostEditAction::ArmRebootReceipt),
+            },
+            Err(response) => response.into(),
+        }
+    }
+
+    fn authorize_sensitive_command(
+        &self,
+        policy: SensitiveCommandPolicy,
+        context: MessageExecutionContext<'_>,
+        saved_messages_peer: Option<PeerId>,
+    ) -> Result<(), Response> {
+        authorize_sensitive_message(
+            policy,
+            context.edited,
+            context.authored_by_self,
+            context.message.peer_id(),
+            context.message.id(),
+            saved_messages_peer,
+        )
+        .map_err(|reason| Response::plain(reason.response(policy).to_owned()))
     }
 
     async fn inspect_module_install(&mut self, client: &Client, message: &Message) -> Response {
@@ -1104,18 +1242,125 @@ impl RuntimeState {
     }
 }
 
-fn is_fresh_self_authored_saved_message(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SensitiveCommandPolicy {
+    ModuleMutation,
+    Reboot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SensitiveCommandDenial {
+    Edited,
+    NotSelfAuthored,
+    InvalidMessageId,
+    NotSavedMessages,
+}
+
+impl SensitiveCommandDenial {
+    fn response(self, policy: SensitiveCommandPolicy) -> &'static str {
+        match (policy, self) {
+            (SensitiveCommandPolicy::ModuleMutation, _) => MODULE_MUTATION_DENIED,
+            (SensitiveCommandPolicy::Reboot, _) => REBOOT_DENIED,
+        }
+    }
+}
+
+fn authorize_sensitive_message(
+    policy: SensitiveCommandPolicy,
+    edited: bool,
     authored_by_self: bool,
     peer_id: PeerId,
     message_id: i32,
-    saved_messages_peer: PeerId,
-) -> bool {
-    authored_by_self && message_id > 0 && peer_id == saved_messages_peer
+    saved_messages_peer: Option<PeerId>,
+) -> Result<(), SensitiveCommandDenial> {
+    if edited {
+        return Err(SensitiveCommandDenial::Edited);
+    }
+    if !authored_by_self {
+        return Err(SensitiveCommandDenial::NotSelfAuthored);
+    }
+    if message_id <= 0 {
+        return Err(SensitiveCommandDenial::InvalidMessageId);
+    }
+    if policy == SensitiveCommandPolicy::ModuleMutation && saved_messages_peer != Some(peer_id) {
+        return Err(SensitiveCommandDenial::NotSavedMessages);
+    }
+    Ok(())
+}
+
+fn lm_request_mutates(request: &LmRequest) -> bool {
+    matches!(
+        request,
+        LmRequest::Install
+            | LmRequest::Confirm { .. }
+            | LmRequest::Cancel { .. }
+            | LmRequest::Enable { .. }
+            | LmRequest::Disable { .. }
+    )
+}
+
+fn enabled_label(enabled: bool) -> &'static str {
+    if enabled {
+        "включён"
+    } else {
+        "отключён"
+    }
+}
+
+fn management_label(management: control::ModuleManagement) -> &'static str {
+    match management {
+        control::ModuleManagement::Manual => "вручную",
+        control::ModuleManagement::DeclarativeNixOs => "NixOS (декларативно)",
+    }
+}
+
+fn diagnostic_label(diagnostic: Option<&control::ModuleDiagnostic>) -> &'static str {
+    match diagnostic {
+        Some(control::ModuleDiagnostic::InvalidModuleId) => "некорректный ID каталога",
+        Some(control::ModuleDiagnostic::InvalidManifest) => "некорректный манифест",
+        None => "нет",
+    }
+}
+
+fn runtime_status<'a>(runtime: &'a RuntimeState, id: &str) -> &'a str {
+    runtime
+        .external_snapshot
+        .module_statuses
+        .iter()
+        .find(|status| status.id == id)
+        .map(|status| status.status)
+        .unwrap_or("не запущен")
+}
+
+fn capabilities_label(capabilities: &[ExternalCapability]) -> String {
+    if capabilities.is_empty() {
+        "нет".to_owned()
+    } else {
+        capabilities
+            .iter()
+            .map(|capability| capability.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn commands_label(
+    commands: &[crate::external_modules::manifest::ExternalCommandDescriptor],
+) -> String {
+    if commands.is_empty() {
+        "нет".to_owned()
+    } else {
+        commands
+            .iter()
+            .map(|command| command.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 fn lm_usage(prefix: &str) -> String {
     format!(
-        "⚠️ Использование:\n{prefix}lm\n{prefix}lm list\n{prefix}lm install\n{prefix}lm confirm <ApprovalId>\n{prefix}lm cancel <ApprovalId>"
+        "⚠️ Использование:\n{prefix}lm\n{prefix}lm list\n{prefix}lm info <id>\n{prefix}lm install\n{prefix}lm confirm <ApprovalId>\n{prefix}lm cancel <ApprovalId>\n{prefix}lm enable <id>\n{prefix}lm disable <id>"
     )
 }
 
@@ -1537,6 +1782,8 @@ impl SetupCoordinator {
                     self.token_path.clone(),
                     username,
                 )),
+                shutdown: None,
+                post_edit: None,
             },
             Err(response) => response.into(),
         }
@@ -1849,9 +2096,10 @@ fn format_stats(
 #[cfg(test)]
 mod tests {
     use super::{
-        EDITED_LM_STATE_CHANGE, ProcStats, bounded_list, external_event_error_category,
-        fastfetch_response, format_duration, format_latency, format_stats,
-        is_fresh_self_authored_saved_message, lm_usage, parse_memory_kib, parse_system_uptime,
+        MODULE_MUTATION_DENIED, ProcStats, REBOOT_DENIED, SensitiveCommandDenial,
+        SensitiveCommandPolicy, authorize_sensitive_message, bounded_list,
+        external_event_error_category, fastfetch_response, format_duration, format_latency,
+        format_stats, lm_usage, parse_memory_kib, parse_system_uptime,
     };
     use crate::response::Response;
     use crate::{
@@ -1867,6 +2115,51 @@ mod tests {
         path::PathBuf,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn sensitive_command_policies_distinguish_saved_messages_from_reboot_dialogs() {
+        let saved = PeerId::user(1).unwrap();
+        let private = PeerId::user(2).unwrap();
+        let group = PeerId::chat(3).unwrap();
+        let supergroup = PeerId::channel(4).unwrap();
+
+        for peer in [saved, private, group, supergroup] {
+            assert_eq!(
+                authorize_sensitive_message(
+                    SensitiveCommandPolicy::Reboot,
+                    false,
+                    true,
+                    peer,
+                    1,
+                    None,
+                ),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            authorize_sensitive_message(SensitiveCommandPolicy::Reboot, true, true, group, 1, None,),
+            Err(SensitiveCommandDenial::Edited)
+        );
+        assert_eq!(
+            SensitiveCommandDenial::Edited.response(SensitiveCommandPolicy::Reboot),
+            REBOOT_DENIED
+        );
+        assert!(!REBOOT_DENIED.contains("модул"));
+
+        let request = SensitiveCommandPolicy::ModuleMutation;
+        assert_eq!(
+            authorize_sensitive_message(request, false, true, private, 1, Some(saved)),
+            Err(SensitiveCommandDenial::NotSavedMessages)
+        );
+        assert_eq!(
+            authorize_sensitive_message(request, false, false, saved, 1, Some(saved)),
+            Err(SensitiveCommandDenial::NotSelfAuthored)
+        );
+        assert_eq!(
+            SensitiveCommandDenial::NotSavedMessages.response(request),
+            MODULE_MUTATION_DENIED
+        );
+    }
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -2173,7 +2466,7 @@ mod tests {
             runtime.execute_modules(&crate::commands::ModulesRequest::Overview, runtime.prefix());
         assert!(overview.text.starts_with("🧩 Модули Lavis: 3\n\n"));
         assert!(overview.text.contains("🦀fastfetch"));
-        assert!(overview.text.contains("Команды (9)"));
+        assert!(overview.text.contains("Команды (10)"));
         assert_eq!(overview.entities.len(), 2);
         assert_eq!(
             runtime.execute_modules(&crate::commands::ModulesRequest::Invalid, runtime.prefix(),),
@@ -2191,7 +2484,7 @@ mod tests {
             "🧩 Модули Lavis: 3\n\n"
         );
         let body = String::from_utf16(&units[offset..offset + length]).unwrap();
-        assert!(body.contains("Команды (9)"));
+        assert!(body.contains("Команды (10)"));
         let grammers_client::tl::enums::MessageEntity::Blockquote(provenance) =
             &overview.entities[1]
         else {
@@ -2225,7 +2518,7 @@ mod tests {
 
         runtime.register_expected_self_edit(peer, 42, "old response".to_owned());
         runtime.register_expected_self_edit(peer, 42, "new response".to_owned());
-        assert!(!runtime.consume_expected_self_edit(peer, 42, "old response"));
+        assert!(runtime.consume_expected_self_edit(peer, 42, "old response"));
         assert!(runtime.consume_expected_self_edit(peer, 42, "new response"));
 
         runtime.register_expected_self_edit(peer, 43, "failed response".to_owned());
@@ -2585,7 +2878,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn module_install_lists_are_bounded_and_state_change_text_is_exact() {
+    fn module_install_lists_are_bounded_and_mutation_denial_text_is_exact() {
         let values = (0..10)
             .map(|index| format!("value-{index}"))
             .collect::<Vec<_>>();
@@ -2594,8 +2887,8 @@ for line in sys.stdin:
             "value-0, value-1, value-2, value-3, value-4, value-5, value-6, value-7, ещё 2"
         );
         assert_eq!(
-            EDITED_LM_STATE_CHANGE,
-            "⚠️ Изменённые сообщения не могут изменять состояние установки."
+            MODULE_MUTATION_DENIED,
+            "⚠️ Эта операция с модулями доступна только из нового собственного сообщения в Saved Messages."
         );
     }
 
@@ -2605,12 +2898,17 @@ for line in sys.stdin:
         let outgoing = false;
 
         assert!(!outgoing);
-        assert!(is_fresh_self_authored_saved_message(
-            true,
-            self_user_id,
-            1,
-            self_user_id,
-        ));
+        assert_eq!(
+            authorize_sensitive_message(
+                SensitiveCommandPolicy::ModuleMutation,
+                false,
+                true,
+                self_user_id,
+                1,
+                Some(self_user_id),
+            ),
+            Ok(())
+        );
     }
 
     #[test]
@@ -2618,31 +2916,46 @@ for line in sys.stdin:
         let self_user_id = PeerId::user(1).unwrap();
         let other_user_id = PeerId::user(2).unwrap();
 
-        assert!(!is_fresh_self_authored_saved_message(
-            true,
-            self_user_id,
-            0,
-            self_user_id,
-        ));
-        assert!(!is_fresh_self_authored_saved_message(
-            true,
-            other_user_id,
-            1,
-            self_user_id,
-        ));
-        assert!(!is_fresh_self_authored_saved_message(
-            false,
-            self_user_id,
-            1,
-            self_user_id,
-        ));
+        assert_eq!(
+            authorize_sensitive_message(
+                SensitiveCommandPolicy::ModuleMutation,
+                false,
+                true,
+                self_user_id,
+                0,
+                Some(self_user_id),
+            ),
+            Err(SensitiveCommandDenial::InvalidMessageId)
+        );
+        assert_eq!(
+            authorize_sensitive_message(
+                SensitiveCommandPolicy::ModuleMutation,
+                false,
+                true,
+                other_user_id,
+                1,
+                Some(self_user_id),
+            ),
+            Err(SensitiveCommandDenial::NotSavedMessages)
+        );
+        assert_eq!(
+            authorize_sensitive_message(
+                SensitiveCommandPolicy::ModuleMutation,
+                false,
+                false,
+                self_user_id,
+                1,
+                Some(self_user_id),
+            ),
+            Err(SensitiveCommandDenial::NotSelfAuthored)
+        );
     }
 
     #[test]
     fn lm_usage_lists_each_supported_form() {
         assert_eq!(
             lm_usage("."),
-            "⚠️ Использование:\n.lm\n.lm list\n.lm install\n.lm confirm <ApprovalId>\n.lm cancel <ApprovalId>"
+            "⚠️ Использование:\n.lm\n.lm list\n.lm info <id>\n.lm install\n.lm confirm <ApprovalId>\n.lm cancel <ApprovalId>\n.lm enable <id>\n.lm disable <id>"
         );
     }
 }

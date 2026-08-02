@@ -14,8 +14,8 @@ write module
     → inspect plan
     → ,lm confirm <ApprovalId>
     → installed disabled
-    → lavis modules enable <id>
-    → restart Lavis
+    → ,lm enable <id>
+    → ,reboot
     → ,<id>.<command>
 ```
 
@@ -141,15 +141,40 @@ Local CLI:
 lavis modules status
 ```
 
-## 7. Enable and run
+## 7. Inspect, enable and run
 
 Installation intentionally leaves the module disabled.
+
+Read the installed-module list or its metadata in Telegram:
+
+```text
+,lm list
+,lm info my-echo
+```
+
+Enable a manually managed module in a new self-authored Saved Messages message:
+
+```text
+,lm enable my-echo
+,reboot
+```
+
+Enablement is persistent. It changes the next application start only: enabled modules start
+during application startup, not on first command. There is no live enable/disable or hot
+reload. `,reboot` restarts the Lavis application process; it does not reboot the host. It edits
+the same command message first to `♻️ Lavis перезапускается…` and, after successful startup, to
+`✅ Lavis перезагрузился` with whole elapsed seconds, truncated from milliseconds; it creates no separate message.
+
+For security, `,lm enable`, `,lm disable` and `,reboot` are accepted only from a new,
+self-authored Saved Messages message. Edited messages do not qualify.
+
+The existing local CLI flow remains available:
 
 ```bash
 lavis modules enable my-echo
 ```
 
-Restart Lavis. Enabled modules start during application startup, not on first command.
+Restart Lavis after using the CLI, or send `,reboot` from a qualifying Saved Messages message.
 
 Namespaced invocation:
 
@@ -163,13 +188,22 @@ A schema 3 manifest may declare `default_command`, which additionally enables:
 ,my-echo Hello from Lavis!
 ```
 
-Disable without deleting files:
+Disable without deleting files (also from a new self-authored Saved Messages message):
 
-```bash
-lavis modules disable my-echo
+```text
+,lm disable my-echo
 ```
 
-The running process is stopped during normal Lavis shutdown. Live enable/disable is not implemented.
+The running process is stopped during normal Lavis shutdown. The local equivalent is
+`lavis modules disable my-echo`.
+
+### Scenario: install and activate a module
+
+1. Attach `my-echo.lmod` to a new self-authored Saved Messages message and send `,lm install`.
+2. Inspect the plan, then send `,lm confirm <ApprovalId>`.
+3. Send `,lm enable my-echo` in a new self-authored Saved Messages message.
+4. Send `,reboot` in another new self-authored Saved Messages message.
+5. After Lavis restarts, invoke `,my-echo.echo Hello`.
 
 ## CLI reference
 
@@ -196,13 +230,17 @@ Show discovered modules and persistent enabled state.
 ```text
 ,lm
 ,lm list
+,lm info <id>
 ,lm install
 ,lm confirm <ApprovalId>
 ,lm cancel <ApprovalId>
+,lm enable <id>
+,lm disable <id>
 ,help lm
 ```
 
-`install`, `confirm` and `cancel` are state-changing and require a new own message in Saved Messages. `lm` and `lm list` are read-only.
+`install`, `confirm`, `cancel`, `enable` and `disable` are state-changing and require a new
+own message in Saved Messages. `lm`, `lm list` and `lm info <id>` are read-only.
 
 ## Command and help resolution
 
@@ -289,6 +327,7 @@ Pending staging is cleaned best-effort on cancel, expiry, shutdown and next star
 ## Current limitations
 
 - no live enable/disable or hot reload;
+- `reboot` restarts Lavis only; it is not an operating-system reboot;
 - no update, replace or uninstall command;
 - no remote repository or URL acquisition;
 - no registry, signatures or trust store;

@@ -4,22 +4,30 @@ use grammers_client::{
     tl,
     update::{Message, Update},
 };
-use grammers_session::types::PeerId;
+use grammers_session::types::{PeerAuth, PeerId, PeerKind, PeerRef};
 use std::{future::Future, time::Duration};
 use tokio::task::JoinSet;
 
 use crate::{
     command::parse,
     commands::{Action, dispatch},
+    reboot_receipt::{
+        ArmOutcome, PendingRebootReceipt, RebootReceiptCompletion, RebootReceiptCoordinatorError,
+        RebootReceiptEditIntent, RebootReceiptEditor, RebootReceiptStore, ReceiptEditOutcome,
+        ReceiptStoreError, ReceiptTarget, SystemClock, TokioSleeper,
+        complete_pending_reboot_receipt,
+    },
     runtime::{
-        CreatedEventDispatchResult, MessageExecutionContext, RuntimeState,
-        invocation_error_category,
+        CreatedEventDispatchResult, MessageExecutionContext, PostEditAction, RuntimeState,
+        ShutdownReason, invocation_error_category,
     },
     setup_telegram::{ProvisionOutcome, ProvisionRequest},
 };
 
 const MAX_EVENT_DISPATCH_TASKS: usize = 32;
 const PROVISION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const REBOOT_RECEIPT_EDIT_TIMEOUT: Duration = Duration::from_secs(1);
+const REBOOT_RECEIPT_COMPLETION_TIMEOUT: Duration = Duration::from_secs(4);
 
 struct EventDispatches {
     tasks: JoinSet<()>,
@@ -111,7 +119,9 @@ pub async fn run(
     self_user_id: PeerId,
     client: &grammers_client::Client,
     runtime: &mut RuntimeState,
-) -> anyhow::Result<()> {
+    receipt_store: &RebootReceiptStore,
+) -> anyhow::Result<ShutdownReason> {
+    consume_pending_reboot_receipt(client, runtime, self_user_id, receipt_store).await;
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
     let mut event_dispatches = EventDispatches::new();
@@ -131,7 +141,7 @@ pub async fn run(
                     .await
                     .map_err(anyhow::Error::from_boxed)
                     .context("failed to synchronize Telegram update state")?;
-                return Ok(());
+                return Ok(ShutdownReason::Exit);
             }
             provision = provision_tasks.tasks.join_next(), if !provision_tasks.tasks.is_empty() => {
                 match provision {
@@ -165,7 +175,7 @@ pub async fn run(
                         // shutdown and the owned setup deadline while it is pending.
                         let process_timeout = runtime.setup_timeout_deadline();
                         enum ProcessingResult {
-                            Completed,
+                            Completed(Option<ShutdownReason>),
                             Shutdown(anyhow::Result<()>),
                             TimedOut,
                         }
@@ -175,13 +185,14 @@ pub async fn run(
                                 self_user_id,
                                 client,
                                 runtime,
+                                receipt_store,
                                 &mut event_dispatches,
                                 &mut provision_tasks,
                             );
                             tokio::pin!(processing);
                             tokio::select! {
                                 signal = &mut shutdown => ProcessingResult::Shutdown(signal.context("failed to listen for Ctrl-C shutdown signal")),
-                                _ = &mut processing => ProcessingResult::Completed,
+                                result = &mut processing => ProcessingResult::Completed(result),
                                 _ = async {
                                     if let Some(deadline) = process_timeout {
                                         tokio::time::sleep_until(deadline.into()).await;
@@ -190,7 +201,13 @@ pub async fn run(
                             }
                         };
                         match result {
-                            ProcessingResult::Completed => {}
+                            ProcessingResult::Completed(Some(reason)) => {
+                                event_dispatches.abort_and_drain().await;
+                                provision_tasks.abort_and_drain().await;
+                                stream.sync_update_state().await.map_err(anyhow::Error::from_boxed).context("failed to synchronize Telegram update state")?;
+                                return Ok(reason);
+                            }
+                            ProcessingResult::Completed(None) => {}
                             ProcessingResult::TimedOut => {
                                 if let Some(response) = runtime.handle_setup_timeout() {
                                     send_setup_notification(client, runtime, response).await;
@@ -205,7 +222,7 @@ pub async fn run(
                                     .await
                                     .map_err(anyhow::Error::from_boxed)
                                     .context("failed to synchronize Telegram update state")?;
-                                return Ok(());
+                                return Ok(ShutdownReason::Exit);
                             }
                         }
                     }
@@ -243,18 +260,19 @@ async fn process_update(
     self_user_id: PeerId,
     client: &grammers_client::Client,
     runtime: &mut RuntimeState,
+    receipt_store: &RebootReceiptStore,
     event_dispatches: &mut EventDispatches,
     provision_tasks: &mut ProvisionTasks,
-) {
+) -> Option<ShutdownReason> {
     let (message, edited) = match update {
         Update::NewMessage(message) => (message, false),
         Update::MessageEdited(message) => (message, true),
-        _ => return,
+        _ => return None,
     };
     let message_id = message.id();
     let peer_id = message.peer_id();
     if runtime.consume_setup_notification(peer_id, message_id) {
-        return;
+        return None;
     }
     if edited && runtime.consume_expected_self_edit(peer_id, message_id, message.text()) {
         tracing::debug!(
@@ -262,7 +280,7 @@ async fn process_update(
             message_id,
             "Suppressed the expected command response edit"
         );
-        return;
+        return None;
     }
     let outgoing = message.outgoing();
     let authored_by_self = is_self_authored(message.sender_id(), outgoing, self_user_id);
@@ -380,19 +398,17 @@ async fn process_update(
                 }
             }
         }
-        return;
+        return None;
     }
     if setup_input.is_some() {
         // BotFather replies are setup-private but are not ours to edit.
         if let Some(response) = setup_input {
             send_setup_notification(client, runtime, response).await;
         }
-        return;
+        return None;
     }
 
-    let Some(mut action) = action else {
-        return;
-    };
+    let mut action = action?;
     if let Action::External(invocation) = &mut action {
         invocation.argument_entities = command_argument_entities(
             message.text(),
@@ -429,12 +445,39 @@ async fn process_update(
             "Provisioning already runs"
         );
     }
+    let post_edit = execution.post_edit;
+    let mut shutdown_reason = execution.shutdown;
+    let reboot_target = if matches!(post_edit, Some(PostEditAction::ArmRebootReceipt)) {
+        match receipt_store.load(&SystemClock).await {
+            Ok(crate::reboot_receipt::LoadOutcome::Pending(_)) => {
+                let text = "⚠️ Уже ожидается подтверждение предыдущего перезапуска.".to_owned();
+                fallback_reboot_edit(&message, runtime, peer_id, message_id, text).await;
+                return None;
+            }
+            Err(_) => {
+                let text = "⚠️ Не удалось проверить подтверждение перезапуска.".to_owned();
+                fallback_reboot_edit(&message, runtime, peer_id, message_id, text).await;
+                return None;
+            }
+            Ok(_) if peer_id == self_user_id => Some(ReceiptTarget::SelfUser),
+            Ok(_) => match message.peer_ref().await {
+                Ok(Some(peer)) => Some(receipt_target_from_peer_ref(peer)),
+                _ => {
+                    let text = "⚠️ Не удалось подготовить подтверждение перезапуска.".to_owned();
+                    fallback_reboot_edit(&message, runtime, peer_id, message_id, text).await;
+                    return None;
+                }
+            },
+        }
+    } else {
+        None
+    };
     let rendered_text = execution.response.text;
     let input = grammers_client::message::InputMessage::new()
         .text(rendered_text.clone())
         .fmt_entities(execution.response.entities);
     runtime.register_expected_self_edit(peer_id, message_id, rendered_text.clone());
-    match message.edit(input).await {
+    let source_edit_succeeded = match message.edit(input).await {
         Ok(()) => {
             tracing::debug!(
                 event = "command_edit_succeeded",
@@ -442,6 +485,7 @@ async fn process_update(
                 message_id,
                 "Edited outgoing command message"
             );
+            true
         }
         Err(error) => {
             runtime.remove_expected_self_edit(peer_id, message_id, &rendered_text);
@@ -453,8 +497,241 @@ async fn process_update(
                 error = %error,
                 "Failed to edit outgoing command message"
             );
+            false
+        }
+    };
+    if matches!(post_edit, Some(PostEditAction::ArmRebootReceipt)) {
+        if !source_edit_succeeded {
+            let failure = "⚠️ Не удалось начать перезапуск; Lavis продолжает работу.".to_owned();
+            fallback_reboot_edit(&message, runtime, peer_id, message_id, failure).await;
+            return None;
+        }
+        let target = reboot_target?;
+        let started = match crate::reboot_receipt::Clock::unix_millis(&SystemClock) {
+            Ok(value) => value,
+            Err(_) => {
+                fallback_reboot_edit(
+                    &message,
+                    runtime,
+                    peer_id,
+                    message_id,
+                    "⚠️ Не удалось начать перезапуск; Lavis продолжает работу.".to_owned(),
+                )
+                .await;
+                return None;
+            }
+        };
+        let receipt = match PendingRebootReceipt::new(target, message_id, started) {
+            Ok(receipt) => receipt,
+            Err(_) => {
+                fallback_reboot_edit(
+                    &message,
+                    runtime,
+                    peer_id,
+                    message_id,
+                    "⚠️ Не удалось начать перезапуск; Lavis продолжает работу.".to_owned(),
+                )
+                .await;
+                return None;
+            }
+        };
+        match receipt_store.arm(receipt).await {
+            Ok(ArmOutcome::Armed) | Err(ReceiptStoreError::ArmDurabilityUnknown { .. }) => {
+                shutdown_reason = Some(ShutdownReason::Restart);
+            }
+            Ok(ArmOutcome::Conflict) | Err(_) => {
+                let failure =
+                    "⚠️ Не удалось сохранить подтверждение перезапуска; Lavis продолжает работу."
+                        .to_owned();
+                fallback_reboot_edit(&message, runtime, peer_id, message_id, failure).await;
+                shutdown_reason = None;
+            }
         }
     }
+    shutdown_reason
+}
+
+pub(crate) fn receipt_target_from_peer_ref(peer: PeerRef) -> ReceiptTarget {
+    if peer.id == PeerId::self_user() {
+        return ReceiptTarget::SelfUser;
+    }
+    match peer.id.kind() {
+        PeerKind::User => ReceiptTarget::User {
+            id: peer.id.bare_id_unchecked(),
+            access_hash: peer.auth.hash(),
+        },
+        PeerKind::Chat => ReceiptTarget::Chat {
+            id: peer.id.bare_id_unchecked(),
+        },
+        PeerKind::Channel => ReceiptTarget::Channel {
+            id: peer.id.bare_id_unchecked(),
+            access_hash: peer.auth.hash(),
+        },
+    }
+}
+
+fn peer_ref_from_receipt_target(target: &ReceiptTarget) -> Option<PeerRef> {
+    match *target {
+        ReceiptTarget::SelfUser => Some(PeerId::self_user().to_ambient_ref()),
+        ReceiptTarget::User { id, access_hash } => Some(PeerRef {
+            id: PeerId::user(id)?,
+            auth: PeerAuth::from_hash(access_hash),
+        }),
+        ReceiptTarget::Chat { id } => Some(PeerId::chat(id)?.to_ambient_ref()),
+        ReceiptTarget::Channel { id, access_hash } => Some(PeerRef {
+            id: PeerId::channel(id)?,
+            auth: PeerAuth::from_hash(access_hash),
+        }),
+    }
+}
+
+async fn consume_pending_reboot_receipt(
+    client: &grammers_client::Client,
+    runtime: &mut RuntimeState,
+    self_user_id: PeerId,
+    receipt_store: &RebootReceiptStore,
+) {
+    let mut editor = TelegramRebootReceiptEditor {
+        client,
+        runtime,
+        self_user_id,
+    };
+    let mut sleeper = TokioSleeper;
+    let result = tokio::time::timeout(
+        REBOOT_RECEIPT_COMPLETION_TIMEOUT,
+        complete_pending_reboot_receipt(
+            receipt_store,
+            &SystemClock,
+            &mut editor,
+            &mut sleeper,
+            Default::default(),
+        ),
+    )
+    .await;
+    match result {
+        Ok(Ok(outcome)) => tracing::info!(
+            event = "reboot_receipt_completion",
+            outcome = reboot_completion_category(outcome),
+            "Finished reboot receipt completion"
+        ),
+        Ok(Err(error)) => tracing::warn!(
+            event = "reboot_receipt_completion_failed",
+            category = reboot_coordinator_error_category(&error),
+            "Could not complete reboot receipt"
+        ),
+        Err(_) => tracing::warn!(
+            event = "reboot_receipt_completion_failed",
+            category = "timeout",
+            "Reboot receipt completion timed out"
+        ),
+    }
+}
+
+fn reboot_completion_category(outcome: RebootReceiptCompletion) -> &'static str {
+    match outcome {
+        RebootReceiptCompletion::Absent => "absent",
+        RebootReceiptCompletion::Discarded => "discarded",
+        RebootReceiptCompletion::Applied => "applied",
+        RebootReceiptCompletion::AlreadyApplied => "already_applied",
+        RebootReceiptCompletion::Terminal => "terminal",
+        RebootReceiptCompletion::TemporaryExhausted => "temporary_exhausted",
+    }
+}
+
+fn reboot_coordinator_error_category(error: &RebootReceiptCoordinatorError) -> &'static str {
+    match error {
+        RebootReceiptCoordinatorError::Store(_) => "store",
+        RebootReceiptCoordinatorError::Clock(_) => "clock",
+        RebootReceiptCoordinatorError::Validation(_) => "validation",
+    }
+}
+
+struct TelegramRebootReceiptEditor<'a> {
+    client: &'a grammers_client::Client,
+    runtime: &'a mut RuntimeState,
+    self_user_id: PeerId,
+}
+
+impl RebootReceiptEditor for TelegramRebootReceiptEditor<'_> {
+    fn edit_reboot_receipt(
+        &mut self,
+        intent: RebootReceiptEditIntent,
+    ) -> impl Future<Output = ReceiptEditOutcome> + Send {
+        telegram_reboot_receipt_edit(self, intent)
+    }
+}
+
+async fn telegram_reboot_receipt_edit(
+    editor: &mut TelegramRebootReceiptEditor<'_>,
+    intent: RebootReceiptEditIntent,
+) -> ReceiptEditOutcome {
+    let Some(peer) = peer_ref_from_receipt_target(intent.receipt.target()) else {
+        return ReceiptEditOutcome::Terminal;
+    };
+    register_reboot_completion_suppression(editor.runtime, editor.self_user_id, peer.id, &intent);
+    match tokio::time::timeout(
+        REBOOT_RECEIPT_EDIT_TIMEOUT,
+        editor.client.edit_message(
+            peer,
+            intent.receipt.message_id(),
+            grammers_client::message::InputMessage::new().text(intent.text),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(())) => ReceiptEditOutcome::Applied,
+        Ok(Err(error)) if error.is("MESSAGE_NOT_MODIFIED") => ReceiptEditOutcome::AlreadyApplied,
+        Ok(Err(error)) if is_temporary_receipt_edit_error(&error) => ReceiptEditOutcome::Temporary,
+        Ok(Err(_)) => ReceiptEditOutcome::Terminal,
+        Err(_) => ReceiptEditOutcome::Temporary,
+    }
+}
+
+fn is_temporary_receipt_edit_error(error: &grammers_client::InvocationError) -> bool {
+    match error {
+        grammers_client::InvocationError::Io(_)
+        | grammers_client::InvocationError::Transport(_)
+        | grammers_client::InvocationError::Dropped => true,
+        grammers_client::InvocationError::Rpc(error) => {
+            error.code == 420 && error.value.unwrap_or(u32::MAX) <= 5
+                || matches!(error.code, 500 | 502 | 503)
+        }
+        _ => false,
+    }
+}
+
+async fn fallback_reboot_edit(
+    message: &Message,
+    runtime: &mut RuntimeState,
+    peer_id: PeerId,
+    message_id: i32,
+    text: String,
+) {
+    runtime.register_expected_self_edit(peer_id, message_id, text.clone());
+    if message
+        .edit(grammers_client::message::InputMessage::new().text(text.clone()))
+        .await
+        .is_err()
+    {
+        runtime.remove_expected_self_edit(peer_id, message_id, &text);
+    }
+}
+
+fn register_reboot_completion_suppression(
+    runtime: &mut RuntimeState,
+    self_user_id: PeerId,
+    peer_id: PeerId,
+    intent: &RebootReceiptEditIntent,
+) {
+    let suppression_peer = match intent.receipt.target() {
+        ReceiptTarget::SelfUser => self_user_id,
+        _ => peer_id,
+    };
+    runtime.register_expected_self_edit(
+        suppression_peer,
+        intent.receipt.message_id(),
+        intent.text.clone(),
+    );
 }
 
 fn should_prepare_message_event(edited: bool, event_protected: bool) -> bool {
@@ -632,7 +909,8 @@ mod tests {
 
     use super::{
         EventDispatches, MAX_EVENT_DISPATCH_TASKS, ProvisionTasks, UpdateOrEvent, is_self_authored,
-        provision_completion_text, route, should_prepare_message_event,
+        provision_completion_text, register_reboot_completion_suppression, route,
+        should_prepare_message_event,
     };
     use crate::commands::{Action, ExternalInvocation, PrefixRequest};
     use crate::{
@@ -641,6 +919,7 @@ mod tests {
             manager::ExternalRuntimeSnapshot,
             manifest::{ExternalCommandDescriptor, ExternalModuleDescriptor},
         },
+        reboot_receipt::{PendingRebootReceipt, ReceiptTarget, reboot_completion_text},
         runtime::RuntimeState,
         settings::SettingsStore,
     };
@@ -734,6 +1013,32 @@ mod tests {
         };
         assert_eq!(received, "update");
         tasks.abort_and_drain().await;
+    }
+
+    #[test]
+    fn reboot_completion_text_is_exact() {
+        assert_eq!(
+            reboot_completion_text(35_033),
+            "✅ Lavis перезагрузился\n\nВремя перезагрузки: 35 с"
+        );
+    }
+
+    #[tokio::test]
+    async fn reboot_completion_attempt_registers_expected_suppression_before_edit() {
+        let mut runtime = runtime().await;
+        let self_user = PeerId::user(1).unwrap();
+        let intent = crate::reboot_receipt::RebootReceiptEditIntent {
+            receipt: PendingRebootReceipt::new(ReceiptTarget::SelfUser, 42, 1).unwrap(),
+            text: reboot_completion_text(428),
+        };
+
+        register_reboot_completion_suppression(
+            &mut runtime,
+            self_user,
+            PeerId::self_user(),
+            &intent,
+        );
+        assert!(runtime.consume_expected_self_edit(self_user, 42, &intent.text));
     }
 
     #[test]
@@ -851,6 +1156,7 @@ mod tests {
 
         assert!(outgoing);
         assert_eq!(route(authored_by_self, ",ping", &runtime().await), None);
+        assert_eq!(route(authored_by_self, ",reboot", &runtime().await), None);
     }
 
     #[tokio::test]
