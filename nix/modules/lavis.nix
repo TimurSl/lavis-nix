@@ -238,7 +238,7 @@ PY
 
     credential_env=()
     ${optionalString (cfg.credentialsEnvironmentFile != null) ''
-      mapfile -t credential_env < <(${pkgs.python3}/bin/python3 - ${lib.escapeShellArg cfg.credentialsEnvironmentFile} <<'PY'
+      credential_output="$(${pkgs.python3}/bin/python3 - ${lib.escapeShellArg cfg.credentialsEnvironmentFile} <<'PY'
 import re
 import sys
 
@@ -272,7 +272,10 @@ if api_id is not None:
     print(f"LAVIS_API_ID={api_id}")
     print(f"LAVIS_API_HASH={api_hash}")
 PY
-      )
+      )"
+      if [ -n "$credential_output" ]; then
+        mapfile -t credential_env <<< "$credential_output"
+      fi
     ''}
 
     ${optionalString createsDefaultUser ''
@@ -281,11 +284,11 @@ PY
     ''}
 
     lavis_env=(
-      "HOME=${lib.escapeShellArg effectiveHome}"
-      "XDG_CONFIG_HOME=${lib.escapeShellArg configHome}"
-      "XDG_STATE_HOME=${lib.escapeShellArg stateHome}"
-      "XDG_DATA_HOME=${lib.escapeShellArg dataHome}"
-      "RUST_LOG=${lib.escapeShellArg cfg.logLevel}"
+      ${lib.escapeShellArg "HOME=${effectiveHome}"}
+      ${lib.escapeShellArg "XDG_CONFIG_HOME=${configHome}"}
+      ${lib.escapeShellArg "XDG_STATE_HOME=${stateHome}"}
+      ${lib.escapeShellArg "XDG_DATA_HOME=${dataHome}"}
+      ${lib.escapeShellArg "RUST_LOG=${cfg.logLevel}"}
       "''${credential_env[@]}"
     )
 
