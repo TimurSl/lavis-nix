@@ -331,8 +331,8 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
     .await;
 
     if let Some(handle) = external_handle {
-        // Stop timers and module processes before their core-owned Telegram
-        // gateway is disconnected.
+        // Stop module processes before their core-owned Telegram gateway is
+        // disconnected.
         handle.shutdown_all().await;
     }
     let shutdown_result = guard.shutdown().await;

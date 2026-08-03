@@ -11,7 +11,7 @@ External modules extend Lavis with commands implemented in any language. Each en
 | v1 | Внутренние метаданные, не runtime внешнего процесса: [Module API v1](module-api-v1.md). |
 | v2–v3 | Базовый manifest и JSON Lines: [Module API v2/v3](module-api-v2.md). |
 | v4 | Редактирование сообщений и наборы реакций: [Module API v4](module-api-v4.md). |
-| v5 | Структурированные таймеры и allowlisted Telegram gateway: [Module API v5](module-api-v5.md). |
+| v5 | Gateway статуса аккаунта: [Module API v5](module-api-v5.md). |
 
 V1–V4 сохраняют свои существующие wire-контракты; выбор v5 не изменяет их
 manifest или сообщения.
@@ -287,9 +287,9 @@ Help for a discovered module card is available by module ID even while it is dis
 - use stderr only for diagnostics.
 
 Schema 3 may also receive `message.created` events and return one scoped
-`message.react` action. Schema 4 adds edited-message support; schema 5 adds
-structured timers and the allowlisted core Telegram gateway. See
-[Module API v5](module-api-v5.md); v2–v4 behavior remains unchanged.
+`message.react` action. Schema 4 adds edited-message support; schema 5 adds the
+allowlisted core account-status gateway. See [Module API v5](module-api-v5.md);
+v2–v4 behavior remains unchanged.
 
 ### Environment
 
@@ -306,10 +306,9 @@ Telegram credentials and arbitrary host environment variables are not passed to 
 ### Capabilities
 
 Capabilities do not form an OS sandbox. A module retains the ordinary OS access
-of the Lavis user. In schema 5, the `timer` and `telegram.invoke` capabilities
-are enforced by the core at the scheduler and gateway boundary; they control
-access to those core-mediated features, not direct OS access. See [Module API
-v5](module-api-v5.md).
+of the Lavis user. In schema 5, `telegram.account.status` is enforced by the
+core gateway boundary; it controls that core-mediated feature, not direct OS
+access. See [Module API v5](module-api-v5.md).
 
 ## Files and lifecycle
 
@@ -340,8 +339,8 @@ Pending staging is cleaned best-effort on cancel, expiry, shutdown and next star
 - `.lmod` inspection is structural validation, not malware analysis or signature verification.
 - External modules run as arbitrary executable code with the Lavis user's OS permissions.
 - No seccomp, container, WASM runtime or other system sandbox is applied.
-- Schema-5 `timer` and `telegram.invoke` capabilities are enforced only at the
-  core scheduler/gateway boundary; they are not OS permissions.
+- Schema-5 `telegram.account.status` is enforced only at the core gateway
+  boundary; it is not an OS permission.
 - The installer never overwrites an existing module target.
 - Telegram acquisition is limited to a same-message document in Saved Messages and bounded by declared and actual bytes.
 - Enable only code you trust.

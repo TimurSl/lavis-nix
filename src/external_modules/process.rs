@@ -317,49 +317,6 @@ impl ModuleProcess {
         }
     }
 
-    pub async fn dispatch_timer(&mut self, event_id: String) -> Result<String, ExternalError> {
-        if self.descriptor.protocol_version != 5
-            || !self
-                .descriptor
-                .capabilities
-                .contains(&ExternalCapability::Timer)
-        {
-            return Err(ExternalError::InvalidArgument);
-        }
-        let request_id = protocol::request_id();
-        self.in_flight_request = Some(request_id.clone());
-        if let Err(error) = self
-            .send(&CoreMessage::TimerTick {
-                request_id: request_id.clone(),
-                event_id,
-            })
-            .await
-        {
-            return Err(self.fail_and_terminate(error).await);
-        }
-        let reply = match self
-            .collect_reply_until(
-                &request_id,
-                request_deadline(self.descriptor.protocol_version),
-            )
-            .await
-        {
-            Ok(reply) => reply,
-            Err(error) => return Err(self.fail_and_terminate(error).await),
-        };
-        self.clear_request_state();
-        match reply {
-            ModuleMessage::EventResult {
-                request_id: actual,
-                actions,
-            } if actual == request_id && actions.is_empty() => Ok(request_id),
-            ModuleMessage::EventResult { .. } => {
-                Err(self.fail_and_terminate(ExternalError::ProtocolDecode).await)
-            }
-            _ => Err(self.fail_and_terminate(ExternalError::ProtocolDecode).await),
-        }
-    }
-
     async fn collect_reply_until(
         &mut self,
         expected_id: &str,
@@ -396,11 +353,11 @@ impl ModuleProcess {
                     let result = if !self
                         .descriptor
                         .capabilities
-                        .contains(&ExternalCapability::TelegramInvoke)
+                        .contains(&ExternalCapability::TelegramAccountStatus)
                     {
                         Err(telegram_error(
                             "capability",
-                            "telegram.invoke capability is required",
+                            "telegram.account.status capability is required",
                         ))
                     } else if let Some(gateway) = &self.gateway {
                         let context = GatewayContext {
@@ -938,7 +895,6 @@ if child:
             capabilities: Vec::new(),
             default_command: None,
             subscriptions: Vec::new(),
-            timer_subscriptions: Vec::new(),
             actions: Vec::new(),
             commands: vec![],
         };
@@ -965,7 +921,6 @@ if child:
             capabilities: Vec::new(),
             default_command: None,
             subscriptions: Vec::new(),
-            timer_subscriptions: Vec::new(),
             actions: Vec::new(),
             commands: vec![],
         };
@@ -992,7 +947,6 @@ if child:
             capabilities: Vec::new(),
             default_command: None,
             subscriptions: Vec::new(),
-            timer_subscriptions: Vec::new(),
             actions: Vec::new(),
             commands: vec![],
         };
@@ -1258,7 +1212,7 @@ for line in sys.stdin:
     async fn v5_nested_invoke_preserves_parent_and_success_envelope() {
         let (mut descriptor, directory) = create_fixture_module(V5_INVOKE_MODULE_PY, "v5-invoke");
         descriptor.protocol_version = 5;
-        descriptor.capabilities = vec![ExternalCapability::TelegramInvoke];
+        descriptor.capabilities = vec![ExternalCapability::TelegramAccountStatus];
         let gateway = Arc::new(FakeGateway {
             result: Ok(serde_json::Value::Bool(true)),
             contexts: Mutex::new(Vec::new()),
@@ -1280,7 +1234,7 @@ for line in sys.stdin:
     async fn v5_nested_invoke_returns_rpc_error_envelope() {
         let (mut descriptor, directory) = create_fixture_module(V5_INVOKE_MODULE_PY, "v5-rpc");
         descriptor.protocol_version = 5;
-        descriptor.capabilities = vec![ExternalCapability::TelegramInvoke];
+        descriptor.capabilities = vec![ExternalCapability::TelegramAccountStatus];
         let gateway = Arc::new(FakeGateway {
             result: Err(protocol::TelegramCallError {
                 kind: "rpc",
@@ -1310,7 +1264,7 @@ for line in sys.stdin:
         let (mut descriptor, directory) =
             create_fixture_module(V5_DOUBLE_INVOKE_MODULE_PY, "v5-double");
         descriptor.protocol_version = 5;
-        descriptor.capabilities = vec![ExternalCapability::TelegramInvoke];
+        descriptor.capabilities = vec![ExternalCapability::TelegramAccountStatus];
         let gateway = Arc::new(FakeGateway {
             result: Ok(serde_json::Value::Bool(true)),
             contexts: Mutex::new(Vec::new()),
@@ -1332,7 +1286,7 @@ for line in sys.stdin:
     async fn v5_hanging_gateway_receives_timeout_result_before_terminal_reply() {
         let (mut descriptor, directory) = create_fixture_module(V5_INVOKE_MODULE_PY, "v5-timeout");
         descriptor.protocol_version = 5;
-        descriptor.capabilities = vec![ExternalCapability::TelegramInvoke];
+        descriptor.capabilities = vec![ExternalCapability::TelegramAccountStatus];
         let mut process =
             ModuleProcess::start_with_gateway(descriptor, Some(Arc::new(HangingGateway)))
                 .await

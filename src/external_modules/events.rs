@@ -164,7 +164,6 @@ mod tests {
             } else {
                 vec![ExternalSubscription::MessageCreated]
             },
-            timer_subscriptions: vec![],
             actions: vec![ExternalAction::MessageReact],
             commands: vec![ExternalCommandDescriptor {
                 name: "manage".to_owned(),

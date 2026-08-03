@@ -30,7 +30,6 @@ pub struct ExternalModuleDescriptor {
     pub capabilities: Vec<ExternalCapability>,
     pub default_command: Option<String>,
     pub subscriptions: Vec<ExternalSubscription>,
-    pub timer_subscriptions: Vec<TimerSubscription>,
     pub actions: Vec<ExternalAction>,
     pub commands: Vec<ExternalCommandDescriptor>,
 }
@@ -53,8 +52,7 @@ pub enum ExternalCapability {
     MessageRead,
     MessagePeerId,
     MessageReact,
-    TelegramInvoke,
-    Timer,
+    TelegramAccountStatus,
 }
 
 impl ExternalCapability {
@@ -67,8 +65,7 @@ impl ExternalCapability {
             Self::MessageRead => "message.read",
             Self::MessagePeerId => "message.peer_id",
             Self::MessageReact => "message.react",
-            Self::TelegramInvoke => "telegram.invoke",
-            Self::Timer => "timer",
+            Self::TelegramAccountStatus => "telegram.account.status",
         }
     }
 
@@ -81,8 +78,7 @@ impl ExternalCapability {
             Self::MessageRead => "чтение сообщений",
             Self::MessagePeerId => "идентификатор чата сообщения",
             Self::MessageReact => "реакции на сообщения",
-            Self::TelegramInvoke => "вызовы разрешённых методов Telegram",
-            Self::Timer => "периодические таймеры",
+            Self::TelegramAccountStatus => "изменение статуса аккаунта Telegram",
         }
     }
 
@@ -95,22 +91,10 @@ impl ExternalCapability {
             "message.read" => Some(Self::MessageRead),
             "message.peer_id" => Some(Self::MessagePeerId),
             "message.react" => Some(Self::MessageReact),
-            "telegram.invoke" => Some(Self::TelegramInvoke),
-            "timer" => Some(Self::Timer),
+            "telegram.account.status" => Some(Self::TelegramAccountStatus),
             _ => None,
         }
     }
-}
-
-/// The shortest supported timer period. This deliberately prevents modules
-/// from using the core as a high-frequency work queue.
-pub const MIN_TIMER_INTERVAL_SECONDS: u64 = 30;
-/// Limits the longest idle timer so lifecycle changes are observed promptly.
-pub const MAX_TIMER_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TimerSubscription {
-    pub interval_seconds: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -161,7 +145,7 @@ struct ManifestFile {
     #[serde(default)]
     default_command: Option<String>,
     #[serde(default)]
-    subscriptions: Vec<serde_json::Value>,
+    subscriptions: Vec<String>,
     #[serde(default)]
     actions: Vec<String>,
 }
@@ -404,36 +388,16 @@ pub fn validate_manifest_at(
     {
         return Err(ExternalError::UnsupportedSchemaVersion);
     }
-    let mut timer_subscriptions = Vec::new();
     for value in &manifest.subscriptions {
-        if let Some(value) = value.as_str() {
-            let subscription =
-                ExternalSubscription::from_str(value).ok_or(ExternalError::InvalidArgument)?;
-            if subscription == ExternalSubscription::MessageEdited && manifest.schema_version < 4 {
-                return Err(ExternalError::UnsupportedSchemaVersion);
-            }
-            if subscriptions.contains(&subscription) {
-                return Err(ExternalError::InvalidArgument);
-            }
-            subscriptions.push(subscription);
-        } else {
-            if manifest.schema_version < 5 {
-                return Err(ExternalError::UnsupportedSchemaVersion);
-            }
-            let timer: TimerManifestSubscription = serde_json::from_value(value.clone())
-                .map_err(|_| ExternalError::InvalidArgument)?;
-            if timer.kind != "timer.tick"
-                || !(MIN_TIMER_INTERVAL_SECONDS..=MAX_TIMER_INTERVAL_SECONDS)
-                    .contains(&timer.interval_seconds)
-                || !timer_subscriptions.is_empty()
-            {
-                return Err(ExternalError::InvalidArgument);
-            }
-            let subscription = TimerSubscription {
-                interval_seconds: timer.interval_seconds,
-            };
-            timer_subscriptions.push(subscription);
+        let subscription =
+            ExternalSubscription::from_str(value).ok_or(ExternalError::InvalidArgument)?;
+        if subscription == ExternalSubscription::MessageEdited && manifest.schema_version < 4 {
+            return Err(ExternalError::UnsupportedSchemaVersion);
         }
+        if subscriptions.contains(&subscription) {
+            return Err(ExternalError::InvalidArgument);
+        }
+        subscriptions.push(subscription);
     }
     for value in &manifest.actions {
         let action = ExternalAction::from_str(value).ok_or(ExternalError::InvalidArgument)?;
@@ -512,13 +476,7 @@ pub fn validate_manifest_at(
     if !subscriptions.is_empty() && !seen_capabilities.contains(&ExternalCapability::MessageRead) {
         return Err(ExternalError::InvalidCapability);
     }
-    if seen_capabilities.contains(&ExternalCapability::Timer) && manifest.schema_version < 5 {
-        return Err(ExternalError::InvalidCapability);
-    }
-    if !timer_subscriptions.is_empty() && !seen_capabilities.contains(&ExternalCapability::Timer) {
-        return Err(ExternalError::InvalidCapability);
-    }
-    if seen_capabilities.contains(&ExternalCapability::TelegramInvoke)
+    if seen_capabilities.contains(&ExternalCapability::TelegramAccountStatus)
         && manifest.schema_version < 5
     {
         return Err(ExternalError::InvalidCapability);
@@ -546,18 +504,9 @@ pub fn validate_manifest_at(
         capabilities: seen_capabilities,
         default_command: manifest.default_command,
         subscriptions,
-        timer_subscriptions,
         actions,
         commands,
     })
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TimerManifestSubscription {
-    #[serde(rename = "type")]
-    kind: String,
-    interval_seconds: u64,
 }
 
 pub fn discover_modules(root: &Path) -> Result<Vec<ExternalModuleDescriptor>, ExternalError> {
@@ -771,60 +720,60 @@ mod tests {
     }
 
     #[test]
-    fn v5_accepts_capability_gated_structured_timer_only() {
+    fn v5_accepts_account_status_capability_and_rejects_timer_api() {
         let base = temp_dir();
         let dir = create_module_dir(&base, "echo");
         let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
         json["schema_version"] = serde_json::json!(5);
-        json["capabilities"] = serde_json::json!(["timer", "telegram.invoke"]);
-        json["subscriptions"] = serde_json::json!([{"type":"timer.tick", "interval_seconds": MIN_TIMER_INTERVAL_SECONDS}]);
+        json["capabilities"] = serde_json::json!(["telegram.account.status"]);
         let path = write_manifest(&dir, &serde_json::to_vec(&json).unwrap());
         let descriptor = validate_manifest_at(&path, Some("echo")).unwrap();
-        assert_eq!(
-            descriptor.timer_subscriptions[0].interval_seconds,
-            MIN_TIMER_INTERVAL_SECONDS
+        assert!(
+            descriptor
+                .capabilities
+                .contains(&ExternalCapability::TelegramAccountStatus)
         );
-        json["schema_version"] = serde_json::json!(4);
+
+        json["timer_subscriptions"] = serde_json::json!([]);
         fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(matches!(
             validate_manifest_at(&path, Some("echo")),
-            Err(ExternalError::UnsupportedSchemaVersion)
+            Err(ExternalError::MalformedManifest)
         ));
-        fs::remove_dir_all(&base).unwrap();
-    }
 
-    #[test]
-    fn v5_rejects_invalid_timer_shapes_and_v5_capabilities_in_legacy_schemas() {
-        let base = temp_dir();
-        let dir = create_module_dir(&base, "echo");
-        let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
-        json["schema_version"] = serde_json::json!(5);
+        json.as_object_mut()
+            .unwrap()
+            .remove("timer_subscriptions");
         json["capabilities"] = serde_json::json!(["timer"]);
-        json["subscriptions"] = serde_json::json!([
-            {"type": "timer.tick", "interval_seconds": MIN_TIMER_INTERVAL_SECONDS - 1}
-        ]);
-        let path = write_manifest(&dir, &serde_json::to_vec(&json).unwrap());
-        assert!(matches!(
-            validate_manifest_at(&path, Some("echo")),
-            Err(ExternalError::InvalidArgument)
-        ));
-
-        json["subscriptions"] = serde_json::json!([
-            {"type": "timer.tick", "interval_seconds": MAX_TIMER_INTERVAL_SECONDS + 1}
-        ]);
-        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
-        assert!(matches!(
-            validate_manifest_at(&path, Some("echo")),
-            Err(ExternalError::InvalidArgument)
-        ));
-
-        json["schema_version"] = serde_json::json!(4);
-        json["subscriptions"] = serde_json::json!([]);
         fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(matches!(
             validate_manifest_at(&path, Some("echo")),
             Err(ExternalError::InvalidCapability)
         ));
+
+        json["capabilities"] = serde_json::json!(["telegram.invoke"]);
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(matches!(
+            validate_manifest_at(&path, Some("echo")),
+            Err(ExternalError::InvalidCapability)
+        ));
+
+        json["capabilities"] = serde_json::json!(["telegram.account.status"]);
+        json["subscriptions"] =
+            serde_json::json!([{"type": "timer.tick", "interval_seconds": 30}]);
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(matches!(
+            validate_manifest_at(&path, Some("echo")),
+            Err(ExternalError::MalformedManifest)
+        ));
+        for schema_version in 2..=4 {
+            json["schema_version"] = serde_json::json!(schema_version);
+            fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+            assert!(matches!(
+                validate_manifest_at(&path, Some("echo")),
+                Err(ExternalError::MalformedManifest)
+            ));
+        }
         fs::remove_dir_all(&base).unwrap();
     }
 

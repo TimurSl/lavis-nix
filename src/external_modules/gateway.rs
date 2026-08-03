@@ -42,7 +42,8 @@ impl TelegramGateway for GrammersGateway {
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, TelegramCallError>> + Send + 'a>>
     {
         Box::pin(async move {
-            let offline = validate_request(ExternalCapability::TelegramInvoke, method, &params)?;
+            let offline =
+                validate_request(ExternalCapability::TelegramAccountStatus, method, &params)?;
             let request = grammers_client::tl::functions::account::UpdateStatus { offline };
             match tokio::time::timeout(TELEGRAM_CALL_TIMEOUT, self.client.invoke(&request)).await {
                 Ok(Ok(value)) => Ok(serde_json::Value::Bool(value)),
@@ -83,7 +84,7 @@ pub fn validate_request(
     method: &str,
     params: &serde_json::Value,
 ) -> Result<bool, TelegramCallError> {
-    if capability != ExternalCapability::TelegramInvoke {
+    if capability != ExternalCapability::TelegramAccountStatus {
         return Err(validation("capability is required"));
     }
     if method != "account.updateStatus" {
@@ -119,7 +120,7 @@ mod tests {
     fn update_status_policy_is_capability_gated_and_strict() {
         assert!(
             validate_request(
-                ExternalCapability::TelegramInvoke,
+                ExternalCapability::TelegramAccountStatus,
                 "account.updateStatus",
                 &serde_json::json!({"offline": true})
             )
@@ -127,7 +128,7 @@ mod tests {
         );
         assert_eq!(
             validate_request(
-                ExternalCapability::Timer,
+                ExternalCapability::MessageRead,
                 "account.updateStatus",
                 &serde_json::json!({"offline": true})
             )
@@ -137,7 +138,7 @@ mod tests {
         );
         assert!(
             validate_request(
-                ExternalCapability::TelegramInvoke,
+                ExternalCapability::TelegramAccountStatus,
                 "messages.sendMessage",
                 &serde_json::json!({})
             )
@@ -145,7 +146,7 @@ mod tests {
         );
         assert!(
             validate_request(
-                ExternalCapability::TelegramInvoke,
+                ExternalCapability::TelegramAccountStatus,
                 "account.updateStatus",
                 &serde_json::json!({"offline": true, "extra": false})
             )

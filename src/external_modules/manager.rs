@@ -35,7 +35,6 @@ pub struct ExternalManager {
     descriptors: Vec<ExternalModuleDescriptor>,
     processes: BTreeMap<String, Arc<Mutex<ModuleProcess>>>,
     gateway: Option<Arc<dyn super::gateway::TelegramGateway>>,
-    timer_tasks: BTreeMap<String, Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl Default for ExternalManager {
@@ -50,7 +49,6 @@ impl ExternalManager {
             descriptors: Vec::new(),
             processes: BTreeMap::new(),
             gateway: None,
-            timer_tasks: BTreeMap::new(),
         }
     }
 
@@ -249,8 +247,6 @@ impl ExternalManager {
             event = "external_modules_shutdown",
             "Shutting down external modules"
         );
-        let timer_tasks = std::mem::take(&mut self.timer_tasks);
-        stop_timer_tasks(timer_tasks).await;
         let processes: Vec<(String, Arc<Mutex<ModuleProcess>>)> = self
             .processes
             .iter()
@@ -375,13 +371,6 @@ impl ExternalManagerHandle {
         };
         for descriptor in descriptors {
             let id = descriptor.id.clone();
-            let old_timers = {
-                let mut manager = self.inner.lock().await;
-                manager.timer_tasks.remove(&id)
-            };
-            if let Some(tasks) = old_timers {
-                stop_timer_tasks(BTreeMap::from([(id.clone(), tasks)])).await;
-            }
             match ModuleProcess::start_with_gateway(descriptor.clone(), gateway.clone()).await {
                 Ok(process) => {
                     let replaced = {
@@ -395,12 +384,6 @@ impl ExternalManagerHandle {
                         replaced.terminate().await;
                     }
                     tracing::info!(event = "external_module_started", module_id = %id, "External module started");
-                    if descriptor
-                        .capabilities
-                        .contains(&super::manifest::ExternalCapability::Timer)
-                    {
-                        self.start_timers(id, descriptor.timer_subscriptions).await;
-                    }
                 }
                 Err(error) => {
                     tracing::warn!(event = "external_module_startup_failed", module_id = %id, error = %error, "Не удалось запустить внешний модуль")
@@ -412,14 +395,10 @@ impl ExternalManagerHandle {
     /// Removes the index before awaiting child shutdown, so status refresh and
     /// routing never wait behind a slow process shutdown.
     pub async fn shutdown_all(&self) {
-        let (timer_tasks, processes) = {
+        let processes = {
             let mut manager = self.inner.lock().await;
-            (
-                std::mem::take(&mut manager.timer_tasks),
-                std::mem::take(&mut manager.processes),
-            )
+            std::mem::take(&mut manager.processes)
         };
-        stop_timer_tasks(timer_tasks).await;
         for (id, process) in processes {
             let mut process = process.lock().await;
             if process.status() != ProcessStatus::Running {
@@ -430,58 +409,6 @@ impl ExternalManagerHandle {
             }
             tracing::warn!(event = "external_module_shutdown_forced", module_id = %id, "Forcefully terminating external module");
             process.terminate().await;
-        }
-    }
-
-    async fn start_timers(
-        &self,
-        module_id: String,
-        timers: Vec<super::manifest::TimerSubscription>,
-    ) {
-        if timers.is_empty() {
-            return;
-        }
-        let mut tasks = Vec::with_capacity(timers.len());
-        for timer in timers {
-            let manager = Arc::downgrade(&self.inner);
-            let id = module_id.clone();
-            tasks.push(tokio::spawn(async move {
-                let mut interval =
-                    tokio::time::interval(std::time::Duration::from_secs(timer.interval_seconds));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                interval.tick().await;
-                loop {
-                    interval.tick().await;
-                    let Some(manager) = manager.upgrade() else {
-                        break;
-                    };
-                    let process = {
-                        let manager = manager.lock().await;
-                        manager.processes.get(&id).cloned()
-                    };
-                    let Some(process) = process else { break; };
-                    let Ok(mut process) = process.try_lock() else { continue; };
-                    if process.status() != ProcessStatus::Running { break; }
-                    if let Err(error) = process
-                        .dispatch_timer(format!("timer-{}", super::protocol::request_id()))
-                        .await
-                    {
-                        tracing::warn!(event = "external_timer_failed", module_id = %id, error = %error, "External timer disabled after module failure");
-                        break;
-                    }
-                }
-            }));
-        }
-        let replaced = {
-            let mut manager = self.inner.lock().await;
-            if manager.processes.contains_key(&module_id) {
-                manager.timer_tasks.insert(module_id.clone(), tasks)
-            } else {
-                Some(tasks)
-            }
-        };
-        if let Some(tasks) = replaced {
-            stop_timer_tasks(BTreeMap::from([(module_id, tasks)])).await;
         }
     }
 
@@ -525,26 +452,11 @@ impl ExternalManagerHandle {
     }
 }
 
-async fn stop_timer_tasks(tasks: BTreeMap<String, Vec<tokio::task::JoinHandle<()>>>) {
-    for task in tasks.values().flatten() {
-        task.abort();
-    }
-    for task in tasks.into_values().flatten() {
-        let _ = task.await;
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{ExternalManager, ExternalManagerHandle};
+    use super::ExternalManager;
     use crate::external_modules::manifest::{ExternalCommandDescriptor, ExternalModuleDescriptor};
-    use std::{
-        path::PathBuf,
-        sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        },
-    };
+    use std::path::PathBuf;
 
     fn descriptor(id: &str, version: &str) -> ExternalModuleDescriptor {
         ExternalModuleDescriptor {
@@ -558,7 +470,6 @@ mod tests {
             capabilities: vec![],
             default_command: None,
             subscriptions: vec![],
-            timer_subscriptions: vec![],
             actions: vec![],
             commands: vec![ExternalCommandDescriptor {
                 name: "run".to_owned(),
@@ -592,238 +503,4 @@ mod tests {
         assert!(manager.command_refs().is_empty());
     }
 
-    struct DropProbe(Arc<AtomicBool>);
-
-    impl Drop for DropProbe {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Release);
-        }
-    }
-
-    #[tokio::test]
-    async fn shutdown_aborts_and_joins_registered_timer_tasks() {
-        let handle = ExternalManagerHandle::new(ExternalManager::new());
-        let stopped = Arc::new(AtomicBool::new(false));
-        let probe = Arc::clone(&stopped);
-        let (started, started_receiver) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            let _probe = DropProbe(probe);
-            let _ = started.send(());
-            std::future::pending::<()>().await;
-        });
-        started_receiver.await.unwrap();
-        {
-            let mut manager = handle.lock().await;
-            manager.timer_tasks.insert("timer".to_owned(), vec![task]);
-        }
-        handle.shutdown_all().await;
-        assert!(stopped.load(Ordering::Acquire));
-        assert!(handle.lock().await.timer_tasks.is_empty());
-    }
-
-    #[tokio::test]
-    async fn timer_task_teardown_does_not_keep_manager_alive() {
-        let handle = ExternalManagerHandle::new(ExternalManager::new());
-        let weak = Arc::downgrade(&handle.inner);
-        let task = tokio::spawn(async move {
-            while weak.upgrade().is_some() {
-                tokio::task::yield_now().await;
-            }
-        });
-        drop(handle);
-        task.await.unwrap();
-    }
-
-    #[cfg(all(feature = "fixture-tests", unix))]
-    mod scheduler_tests {
-        use super::*;
-        use crate::external_modules::{
-            manifest::{ExternalCapability, TimerSubscription},
-            process::ModuleProcess,
-        };
-        use std::{
-            fs,
-            os::unix::fs::PermissionsExt,
-            path::PathBuf,
-            sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
-            time::{Duration, SystemTime, UNIX_EPOCH},
-        };
-        use tokio::sync::Mutex;
-
-        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
-
-        const TIMER_MODULE: &str = r#"#!/usr/bin/env python3
-import json, sys
-marker = __MARKER__
-fail = __FAIL__
-for line in sys.stdin:
-    message = json.loads(line)
-    request_id = message["request_id"]
-    if message["type"] == "initialize":
-        print(json.dumps({"protocol_version": 5, "type": "initialized", "request_id": request_id, "module_id": message["module_id"]}), flush=True)
-    elif message["type"] == "event" and message["event"] == "timer.tick":
-        with open(marker, "a") as output:
-            output.write("tick\n")
-        if fail:
-            sys.exit(0)
-        print(json.dumps({"protocol_version": 5, "type": "event_result", "request_id": request_id, "actions": []}), flush=True)
-    elif message["type"] == "shutdown":
-        sys.exit(0)
-"#;
-
-        async fn timer_fixture(
-            fail: bool,
-        ) -> (String, Arc<Mutex<ModuleProcess>>, PathBuf, PathBuf) {
-            let nonce = format!(
-                "{}-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos(),
-                NEXT_FIXTURE.fetch_add(1, AtomicOrdering::Relaxed)
-            );
-            let directory = std::env::temp_dir().join(format!("lavis-manager-timer-{nonce}"));
-            let bin = directory.join("bin");
-            let marker = directory.join("ticks");
-            fs::create_dir_all(&bin).unwrap();
-            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
-            fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
-            let entrypoint = bin.join("timer-module");
-            let python = std::env::var_os("PATH")
-                .into_iter()
-                .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-                .map(|path| path.join("python3"))
-                .find(|path| path.is_file())
-                .expect("fixture tests require python3");
-            let script = TIMER_MODULE
-                .replacen(
-                    "#!/usr/bin/env python3",
-                    &format!("#!{}", python.display()),
-                    1,
-                )
-                .replace("__MARKER__", &format!("{:?}", marker))
-                .replace("__FAIL__", if fail { "True" } else { "False" });
-            fs::write(&entrypoint, script).unwrap();
-            fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700)).unwrap();
-            let id = format!(
-                "timer{}",
-                NEXT_FIXTURE.fetch_add(1, AtomicOrdering::Relaxed)
-            );
-            let descriptor = ExternalModuleDescriptor {
-                protocol_version: 5,
-                id: id.clone(),
-                display_name: id.clone(),
-                version: "test".to_owned(),
-                author: "test".to_owned(),
-                entrypoint,
-                module_dir: directory.clone(),
-                capabilities: vec![ExternalCapability::Timer],
-                default_command: None,
-                subscriptions: vec![],
-                timer_subscriptions: vec![TimerSubscription {
-                    interval_seconds: 1,
-                }],
-                actions: vec![],
-                commands: vec![],
-            };
-            let process = ModuleProcess::start(descriptor).await.unwrap();
-            (id, Arc::new(Mutex::new(process)), directory, marker)
-        }
-
-        async fn install_timer_process(
-            handle: &ExternalManagerHandle,
-            id: String,
-            process: Arc<Mutex<ModuleProcess>>,
-        ) {
-            handle.lock().await.processes.insert(id, process);
-        }
-
-        #[tokio::test]
-        async fn scheduler_starts_after_initialize_and_delays_first_tick() {
-            let (id, process, directory, marker) = timer_fixture(false).await;
-            let handle = ExternalManagerHandle::new(ExternalManager::new());
-            install_timer_process(&handle, id.clone(), process).await;
-            handle
-                .start_timers(
-                    id,
-                    vec![TimerSubscription {
-                        interval_seconds: 1,
-                    }],
-                )
-                .await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            assert!(!marker.exists());
-            tokio::time::sleep(Duration::from_millis(1100)).await;
-            assert!(marker.exists());
-            handle.shutdown_all().await;
-            fs::remove_dir_all(directory).unwrap();
-        }
-
-        #[tokio::test]
-        async fn scheduler_skips_busy_process_and_stops_after_dispatch_failure() {
-            let (id, process, directory, marker) = timer_fixture(false).await;
-            let handle = ExternalManagerHandle::new(ExternalManager::new());
-            install_timer_process(&handle, id.clone(), Arc::clone(&process)).await;
-            let busy = process.lock().await;
-            handle
-                .start_timers(
-                    id.clone(),
-                    vec![TimerSubscription {
-                        interval_seconds: 1,
-                    }],
-                )
-                .await;
-            tokio::time::sleep(Duration::from_millis(1100)).await;
-            assert!(!marker.exists());
-            drop(busy);
-            tokio::time::sleep(Duration::from_millis(1100)).await;
-            assert!(marker.exists());
-            handle.shutdown_all().await;
-            fs::remove_dir_all(directory).unwrap();
-
-            let (id, process, directory, _marker) = timer_fixture(true).await;
-            let handle = ExternalManagerHandle::new(ExternalManager::new());
-            install_timer_process(&handle, id.clone(), process).await;
-            handle
-                .start_timers(
-                    id.clone(),
-                    vec![TimerSubscription {
-                        interval_seconds: 1,
-                    }],
-                )
-                .await;
-            tokio::time::sleep(Duration::from_millis(1200)).await;
-            assert!(handle.lock().await.timer_tasks[&id][0].is_finished());
-            handle.shutdown_all().await;
-            fs::remove_dir_all(directory).unwrap();
-        }
-
-        #[tokio::test]
-        async fn scheduler_replacement_and_shutdown_remove_actual_tasks() {
-            let (id, process, directory, _marker) = timer_fixture(false).await;
-            let handle = ExternalManagerHandle::new(ExternalManager::new());
-            install_timer_process(&handle, id.clone(), process).await;
-            handle
-                .start_timers(
-                    id.clone(),
-                    vec![TimerSubscription {
-                        interval_seconds: 1,
-                    }],
-                )
-                .await;
-            handle
-                .start_timers(
-                    id.clone(),
-                    vec![TimerSubscription {
-                        interval_seconds: 1,
-                    }],
-                )
-                .await;
-            assert_eq!(handle.lock().await.timer_tasks[&id].len(), 1);
-            handle.shutdown_all().await;
-            assert!(handle.lock().await.timer_tasks.is_empty());
-            fs::remove_dir_all(directory).unwrap();
-        }
-    }
 }

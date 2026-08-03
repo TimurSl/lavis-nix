@@ -82,10 +82,6 @@ pub enum CoreMessage {
         event: MessageEventKind,
         payload: MessageEvent,
     },
-    TimerTick {
-        request_id: String,
-        event_id: String,
-    },
     TelegramResult {
         request_id: String,
         call_id: String,
@@ -226,21 +222,6 @@ impl CoreMessage {
                     "payload": event_payload,
                 }))
             }
-            Self::TimerTick {
-                request_id,
-                event_id,
-            } => {
-                if protocol_version != 5 {
-                    return Err(ExternalError::ProtocolEncode);
-                }
-                serde_json::to_string(&serde_json::json!({
-                    "protocol_version": 5,
-                    "type": "event",
-                    "request_id": request_id,
-                    "event": "timer.tick",
-                    "payload": { "event_id": event_id },
-                }))
-            }
             Self::TelegramResult {
                 request_id,
                 call_id,
@@ -302,7 +283,6 @@ impl CoreMessage {
             | Self::Health { request_id }
             | Self::Shutdown { request_id }
             | Self::Event { request_id, .. } => request_id,
-            Self::TimerTick { request_id, .. } => request_id,
             Self::TelegramResult { request_id, .. } => request_id,
         }
     }
@@ -845,14 +825,7 @@ mod tests {
     }
 
     #[test]
-    fn v5_timer_and_telegram_invoke_preserve_correlation() {
-        let timer = CoreMessage::TimerTick {
-            request_id: "10".to_owned(),
-            event_id: "timer-11".to_owned(),
-        };
-        let value: serde_json::Value =
-            serde_json::from_str(&timer.serialize_for(5).unwrap()).unwrap();
-        assert_eq!(value["event"], "timer.tick");
+    fn v5_telegram_invoke_preserves_correlation() {
         let invoke = r#"{"protocol_version":5,"type":"telegram.invoke","request_id":"10","call_id":"call_1","method":"account.updateStatus","params":{"offline":true}}"#;
         assert!(matches!(
             parse_module_line_for(invoke, 5).unwrap(),
