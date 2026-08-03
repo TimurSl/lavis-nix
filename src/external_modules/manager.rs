@@ -605,10 +605,13 @@ mod tests {
         let handle = ExternalManagerHandle::new(ExternalManager::new());
         let stopped = Arc::new(AtomicBool::new(false));
         let probe = Arc::clone(&stopped);
+        let (started, started_receiver) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             let _probe = DropProbe(probe);
+            let _ = started.send(());
             std::future::pending::<()>().await;
         });
+        started_receiver.await.unwrap();
         {
             let mut manager = handle.lock().await;
             manager.timer_tasks.insert("timer".to_owned(), vec![task]);
