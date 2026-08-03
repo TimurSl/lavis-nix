@@ -45,7 +45,7 @@ impl TelegramGateway for GrammersGateway {
             let request = grammers_client::tl::functions::account::UpdateStatus { offline };
             match tokio::time::timeout(TELEGRAM_CALL_TIMEOUT, self.client.invoke(&request)).await {
                 Ok(Ok(value)) => Ok(serde_json::Value::Bool(value)),
-                Ok(Err(grammers_client::InvocationError::Rpc(error)) => {
+                Ok(Err(grammers_client::InvocationError::Rpc(error))) => {
                     Err(rpc_error(error.code, &error.name, error.value))
                 }
                 Ok(Err(_)) => Err(TelegramCallError {
