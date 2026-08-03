@@ -176,6 +176,11 @@ User-enabled non-declarative modules are preserved. Declarative module IDs that
 are removed from the NixOS config are removed from the declarative enabled set,
 but their installed files are not deleted by the module.
 
+Declarative extensions can be changed only through `services.lavis.extensions` and a NixOS
+rebuild (for example, `nh os switch`). Telegram `,lm enable <module-id>` and
+`,lm disable <module-id>` reject declaratively managed module IDs. Use `,lm list` and
+`,lm info <module-id>` only to inspect them from Telegram.
+
 External modules run with the Lavis service user's normal OS permissions. Only
 declare extensions you trust.
 

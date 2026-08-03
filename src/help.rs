@@ -357,7 +357,7 @@ fn alias_primary(prefix: &str, command: &CommandDefinition, module_name: &str) -
 
 fn lm_primary(prefix: &str, command: &CommandDefinition, module_name: &str) -> String {
     format!(
-        "{}\n\nИспользование: {prefix}{}\nМодуль: {module_name}\nРиск: {}\n\nУстановка:\n1. {prefix}lm list — список модулей. В Saved Messages прикрепите .lmod и отправьте {prefix}lm install: код не запускается, показывается inspection-план.\n2. Проверьте план. Подтвердите полный ApprovalId: {prefix}lm confirm <approval-id>; отмена: {prefix}lm cancel <approval-id>.\n\nApprovalId — одноразовый Crockford Base32 идентификатор XXXX-XXXX-XXXX-XXXX, действует ровно 10 минут и не может быть использовано повторно.\n\nПосле установки модуль остаётся disabled и не запускается автоматически. ⚠️ Внешний модуль — исполняемый код без системной песочницы.",
+        "{}\n\nИспользование: {prefix}{}\nМодуль: {module_name}\nРиск: {}\n\n{prefix}lm list — список модулей; {prefix}lm info <id> — сведения. В Saved Messages прикрепите .lmod и отправьте {prefix}lm install: код не запускается, показывается inspection-план.\nПроверьте план. Подтвердите полный ApprovalId: {prefix}lm confirm <approval-id>; отмена: {prefix}lm cancel <approval-id>.\n\n{prefix}lm enable <id> и {prefix}lm disable <id> изменяют состояние только для следующего перезапуска.\n\nApprovalId — одноразовый Crockford Base32 идентификатор XXXX-XXXX-XXXX-XXXX, действует ровно 10 минут и не может быть использовано повторно.\n\nПосле установки модуль остаётся disabled и не запускается автоматически. ⚠️ Внешний модуль — исполняемый код без системной песочницы.",
         command.description_ru,
         command.usage,
         risk_label(command.risk)
@@ -521,7 +521,7 @@ mod tests {
         assert!(
             response
                 .text
-                .starts_with("🛠 Справка Lavis: 3 модулей, 9 команд")
+                .starts_with("🛠 Справка Lavis: 3 модулей, 10 команд")
         );
         assert!(response.text.find("🧩 core").unwrap() < response.text.find("🖥 system").unwrap());
         assert!(response.text.contains("🦀fastfetch"));
@@ -682,7 +682,7 @@ mod tests {
     async fn modules_overview_matches_help_registry_counts() {
         let rendered = render_modules_overview(".");
         assert!(rendered.response.text.contains("Модули: "));
-        assert!(rendered.response.text.contains("Команды (9)"));
+        assert!(rendered.response.text.contains("Команды (10)"));
         assert!(rendered.response.text.contains(".modules"));
         assert_eq!(rendered.response.entities.len(), 2);
         let grammers_client::tl::enums::MessageEntity::Blockquote(primary) =
@@ -809,6 +809,9 @@ mod tests {
 
         assert!(response.text.starts_with("📦 🦀lm"));
         assert!(response.text.contains("🦀lm list"));
+        assert!(response.text.contains("🦀lm info <id>"));
+        assert!(response.text.contains("🦀lm enable <id>"));
+        assert!(response.text.contains("🦀lm disable <id>"));
         assert!(response.text.contains("🦀lm install"));
         assert!(!response.text.contains("🦀lm install <source>"));
         assert!(response.text.contains("🦀lm confirm <approval-id>"));

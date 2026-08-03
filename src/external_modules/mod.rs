@@ -1,5 +1,6 @@
 pub mod acquisition;
 pub mod approval;
+pub mod control;
 pub mod entities;
 pub mod events;
 pub mod installer;

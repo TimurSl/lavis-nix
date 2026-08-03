@@ -12,6 +12,7 @@ pub enum CommandKind {
     Modules,
     Setup,
     Lm,
+    Reboot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,7 +39,7 @@ pub struct CommandDefinition {
     pub module: ModuleId,
 }
 
-const COMMAND_SPECS: [CommandDefinition; 9] = [
+const COMMAND_SPECS: [CommandDefinition; 10] = [
     CommandDefinition {
         kind: CommandKind::Help,
         name: "help",
@@ -49,6 +50,18 @@ const COMMAND_SPECS: [CommandDefinition; 9] = [
         risk: CommandRisk::ReadOnly,
         icon: "🛠",
         aliasable: true,
+        module: ModuleId::Core,
+    },
+    CommandDefinition {
+        kind: CommandKind::Reboot,
+        name: "reboot",
+        usage: "reboot",
+        summary_ru: "Перезапустить Lavis",
+        description_ru: "Редактирует сообщение команды в статус перезапуска, а после успешного запуска — в подтверждение с целым временем в секундах с усечением дробной части; отдельное сообщение не создаётся.",
+        examples: &["reboot"],
+        risk: CommandRisk::Privileged,
+        icon: "♻️",
+        aliasable: false,
         module: ModuleId::Core,
     },
     CommandDefinition {
@@ -109,15 +122,18 @@ const COMMAND_SPECS: [CommandDefinition; 9] = [
     CommandDefinition {
         kind: CommandKind::Lm,
         name: "lm",
-        usage: "lm [list|install|confirm <approval-id>|cancel <approval-id>]",
+        usage: "lm [list|info <id>|install|confirm <approval-id>|cancel <approval-id>|enable <id>|disable <id>]",
         summary_ru: "Проверить и установить внешний модуль",
         description_ru: "Показывает внешние модули или запускает проверяемую установку с отдельным подтверждением.",
         examples: &[
             "lm",
             "lm list",
+            "lm info <id>",
             "lm install",
             "lm confirm <approval-id>",
             "lm cancel <approval-id>",
+            "lm enable <id>",
+            "lm disable <id>",
         ],
         risk: CommandRisk::ExternalCodeInstall,
         icon: "📦",
@@ -212,6 +228,7 @@ pub enum Action {
     Modules(ModulesRequest),
     Setup(SetupRequest),
     Lm(LmRequest),
+    Reboot,
     External(ExternalInvocation),
 }
 
@@ -252,6 +269,7 @@ impl Action {
             Self::Modules(_) => "modules",
             Self::Setup(_) => "setup",
             Self::Lm(_) => "lm",
+            Self::Reboot => "reboot",
             Self::External(_invocation) => {
                 // Safe bounded string: module_id and command_name are validated ASCII
                 // This is never user-controlled free text
@@ -274,6 +292,8 @@ pub fn dispatch(command: &Command) -> Option<Action> {
         CommandKind::Modules => Some(Action::Modules(parse_modules_request(&command.args))),
         CommandKind::Setup => Some(Action::Setup(parse_setup_request(&command.args))),
         CommandKind::Lm => Some(Action::Lm(parse_lm_request(&command.args))),
+        CommandKind::Reboot if command.args.trim().is_empty() => Some(Action::Reboot),
+        CommandKind::Reboot => None,
     }
 }
 
@@ -320,6 +340,9 @@ pub enum LmRequest {
     Install,
     Confirm { approval_id: ApprovalId },
     Cancel { approval_id: ApprovalId },
+    Info { id: String },
+    Enable { id: String },
+    Disable { id: String },
     Invalid,
 }
 
@@ -363,8 +386,22 @@ fn parse_lm_request(args: &str) -> LmRequest {
         "cancel" => parse_lm_approval(tokens)
             .map(|approval_id| LmRequest::Cancel { approval_id })
             .unwrap_or(LmRequest::Invalid),
+        "info" => parse_lm_id(tokens)
+            .map(|id| LmRequest::Info { id })
+            .unwrap_or(LmRequest::Invalid),
+        "enable" => parse_lm_id(tokens)
+            .map(|id| LmRequest::Enable { id })
+            .unwrap_or(LmRequest::Invalid),
+        "disable" => parse_lm_id(tokens)
+            .map(|id| LmRequest::Disable { id })
+            .unwrap_or(LmRequest::Invalid),
         _ => LmRequest::Invalid,
     }
+}
+
+fn parse_lm_id(mut tokens: std::str::SplitWhitespace<'_>) -> Option<String> {
+    let id = tokens.next()?;
+    (tokens.next().is_none()).then(|| id.to_owned())
 }
 
 fn parse_lm_approval(mut tokens: std::str::SplitWhitespace<'_>) -> Option<ApprovalId> {
@@ -537,6 +574,7 @@ mod tests {
             names,
             [
                 "help",
+                "reboot",
                 "modules",
                 "ping",
                 "prefix",
@@ -602,7 +640,10 @@ mod tests {
                     .iter()
                     .any(|module| module.id == definition.module)
             );
-            if matches!(definition.name, "alias" | "prefix" | "setup" | "lm") {
+            if matches!(
+                definition.name,
+                "alias" | "prefix" | "setup" | "lm" | "reboot"
+            ) {
                 assert!(!definition.aliasable);
                 continue;
             }
@@ -616,7 +657,9 @@ mod tests {
             commands_for_module(ModuleId::Core)
                 .map(|command| command.name)
                 .collect::<Vec<_>>(),
-            ["help", "modules", "ping", "prefix", "setup", "lm", "stats"]
+            [
+                "help", "reboot", "modules", "ping", "prefix", "setup", "lm", "stats"
+            ]
         );
         assert_eq!(
             commands_for_module(ModuleId::System)
@@ -706,6 +749,10 @@ mod tests {
         assert_eq!(setup.risk, CommandRisk::Privileged);
         assert_eq!(setup.module, ModuleId::Core);
         assert!(!setup.aliasable);
+        let reboot = command_by_kind(CommandKind::Reboot).unwrap();
+        assert_eq!(reboot.risk, CommandRisk::Privileged);
+        assert_eq!(reboot.module, ModuleId::Core);
+        assert!(!reboot.aliasable);
         let lm = command_by_kind(CommandKind::Lm).unwrap();
         assert_eq!(lm.risk, CommandRisk::ExternalCodeInstall);
         assert_eq!(lm.module, ModuleId::Core);
@@ -796,6 +843,24 @@ mod tests {
         assert_eq!(lm(" \t"), Some(Action::Lm(LmRequest::Overview)));
         assert_eq!(lm("list"), Some(Action::Lm(LmRequest::List)));
         assert_eq!(lm("install"), Some(Action::Lm(LmRequest::Install)));
+        assert_eq!(
+            lm("info echo"),
+            Some(Action::Lm(LmRequest::Info {
+                id: "echo".to_owned()
+            }))
+        );
+        assert_eq!(
+            lm("enable echo"),
+            Some(Action::Lm(LmRequest::Enable {
+                id: "echo".to_owned()
+            }))
+        );
+        assert_eq!(
+            lm("disable echo"),
+            Some(Action::Lm(LmRequest::Disable {
+                id: "echo".to_owned()
+            }))
+        );
 
         let Some(Action::Lm(LmRequest::Confirm { approval_id })) =
             lm(&format!("confirm {approval}"))
@@ -830,6 +895,24 @@ mod tests {
                 "{invalid}"
             );
         }
+    }
+
+    #[test]
+    fn dispatches_reboot_without_arguments_only() {
+        assert_eq!(
+            dispatch(&Command {
+                name: "reboot".to_owned(),
+                args: String::new()
+            }),
+            Some(Action::Reboot)
+        );
+        assert_eq!(
+            dispatch(&Command {
+                name: "reboot".to_owned(),
+                args: "now".to_owned()
+            }),
+            None
+        );
     }
 
     #[test]

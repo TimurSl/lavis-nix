@@ -24,6 +24,7 @@ pub mod external_modules;
 pub mod fastfetch;
 pub mod help;
 pub mod modules;
+pub mod reboot_receipt;
 pub mod response;
 pub mod runtime;
 pub mod settings;
@@ -180,7 +181,7 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
         }
 
         if auth_only {
-            return Ok(());
+            return Ok(runtime::ShutdownReason::Exit);
         }
 
         let self_user_id = outcome.self_user_id();
@@ -212,20 +213,25 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
         let external_state_path =
             config::ConfigPaths::external_modules_state_path_with(&environment)
                 .context("failed to determine external modules state path")?;
-        let external_state = external_modules::state::ExternalStateStore::load(external_state_path)
-            .await
-            .unwrap_or_else(|error| {
-                tracing::warn!(
-                    event = "external_state_load_failed",
-                    error = %error,
-                    "External modules state unavailable, continuing without them"
-                );
-                external_modules::state::ExternalStateStore::new_disabled()
-            });
+        let external_state =
+            external_modules::state::ExternalStateStore::load(external_state_path.clone())
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(
+                        event = "external_state_load_failed",
+                        error = %error,
+                        "External modules state unavailable, continuing without them"
+                    );
+                    external_modules::state::ExternalStateStore::new_disabled()
+                });
 
         let module_root = config::ConfigPaths::data_dir_with(&environment)
             .context("failed to determine data directory")?
             .join(external_modules::MODULE_DIR_NAME);
+        let declarative_state_path = external_state_path
+            .parent()
+            .context("external modules state has no parent")?
+            .join("declarative-modules.json");
         fs::create_dir_all(&module_root).context("failed to create external module root")?;
         let module_root_metadata =
             fs::symlink_metadata(&module_root).context("failed to inspect external module root")?;
@@ -269,8 +275,6 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
             mgr.set_descriptors(descriptors);
         }
         handle.startup_enabled(external_state.enabled_ids()).await;
-        tracing::info!(event = "application_started", "lavis is running");
-
         let mut runtime = runtime::RuntimeState::new(
             started_at,
             aliases,
@@ -284,12 +288,36 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
                 .context("failed to determine companion token path")?,
             self_user_id,
         );
-        runtime.configure_module_installation(module_root, module_staging_root, self_user_id);
+        runtime.configure_module_installation(
+            module_root.clone(),
+            module_staging_root,
+            self_user_id,
+        );
+        runtime.configure_module_control(
+            module_root,
+            external_state_path,
+            declarative_state_path,
+            self_user_id,
+        );
         runtime.set_external_manager(handle).await;
+        let receipt_path = config::ConfigPaths::external_modules_state_path_with(&environment)
+            .context("failed to determine reboot receipt state path")?
+            .parent()
+            .context("reboot receipt state has no parent")?
+            .join("pending-reboot.json");
+        let receipt_store = reboot_receipt::RebootReceiptStore::new(receipt_path);
+        tracing::info!(event = "application_started", prefix = %runtime.prefix(), "lavis is running");
 
         let run_result = {
             let client_ref = guard.inner();
-            updates::run(&mut stream, self_user_id, client_ref.client(), &mut runtime).await
+            updates::run(
+                &mut stream,
+                self_user_id,
+                client_ref.client(),
+                &mut runtime,
+                &receipt_store,
+            )
+            .await
         };
 
         runtime.shutdown_module_approvals();
@@ -305,20 +333,24 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
         handle.shutdown_all().await;
     }
 
-    combine_application_and_shutdown(application_result, shutdown_result)
+    let reason = combine_application_and_shutdown(application_result, shutdown_result)?;
+    if reason == runtime::ShutdownReason::Restart {
+        restart_current_process()?;
+    }
+    Ok(())
 }
 
 fn combine_application_and_shutdown(
-    application_result: anyhow::Result<()>,
+    application_result: anyhow::Result<runtime::ShutdownReason>,
     shutdown_result: Result<(), ClientError>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<runtime::ShutdownReason> {
     match (application_result, shutdown_result) {
-        (Ok(()), Ok(())) => {
+        (Ok(reason), Ok(())) => {
             tracing::info!(event = "application_stopped", "lavis stopped");
-            Ok(())
+            Ok(reason)
         }
         (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(error)) => Err(error.into()),
+        (Ok(_), Err(error)) => Err(error.into()),
         (Err(error), Err(shutdown_error)) => {
             tracing::error!(
                 event = "application_shutdown_failed",
@@ -328,6 +360,22 @@ fn combine_application_and_shutdown(
             Err(error.context("Telegram runner shutdown also failed"))
         }
     }
+}
+
+#[cfg(unix)]
+fn restart_current_process() -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let executable =
+        env::current_exe().context("failed to resolve current executable for restart")?;
+    let error = std::process::Command::new(executable)
+        .args(env::args_os().skip(1))
+        .exec();
+    Err(anyhow::Error::new(error).context("failed to exec Lavis restart"))
+}
+
+#[cfg(not(unix))]
+fn restart_current_process() -> anyhow::Result<()> {
+    anyhow::bail!("restart is unsupported on this platform")
 }
 
 fn authorization_failure(error: anyhow::Error, newly_saved: bool) -> anyhow::Error {
@@ -536,19 +584,25 @@ async fn modules_enable(id: String) -> anyhow::Result<()> {
     let state_path = config::ConfigPaths::external_modules_state_path_with(&environment)
         .context("failed to determine state path")?;
 
-    // Validate the manifest exists
-    let manifest_path = module_root.join(&id).join("module.json");
-    let descriptor = external_modules::manifest::validate_manifest_at(&manifest_path, Some(&id))
-        .context("module validation failed")?;
-
-    let mut state = external_modules::state::ExternalStateStore::load(state_path)
+    let mut state = external_modules::state::ExternalStateStore::load(state_path.clone())
         .await
         .context("failed to load module state")?;
-    state.enable(&id).await?;
-
+    let declarative = config::ConfigPaths::external_modules_state_path_with(&environment)?
+        .parent()
+        .context("state path has no parent")?
+        .join("declarative-modules.json");
+    let operation =
+        external_modules::control::enable_module(&module_root, &declarative, &mut state, &id)
+            .await?;
     println!(
-        "✅ Модуль «{}» ({}) включён. Он будет запущен при следующем запуске lavis.",
-        descriptor.display_name, id
+        "{} Модуль «{}» {}. Требуется перезапуск lavis.",
+        if operation.changed { "✅" } else { "ℹ️" },
+        operation.module.display_name,
+        if operation.changed {
+            "включён"
+        } else {
+            "уже включён"
+        }
     );
     Ok(())
 }
@@ -558,15 +612,28 @@ async fn modules_disable(id: String) -> anyhow::Result<()> {
     let state_path = config::ConfigPaths::external_modules_state_path_with(&environment)
         .context("failed to determine state path")?;
 
-    let mut state = external_modules::state::ExternalStateStore::load(state_path)
+    let mut state = external_modules::state::ExternalStateStore::load(state_path.clone())
         .await
         .context("failed to load module state")?;
-    let removed = state.disable_idempotent(&id).await?;
-    if removed {
-        println!("✅ Модуль «{id}» отключён.");
-    } else {
-        println!("ℹ️ Модуль «{id}» не был включён.");
-    }
+    let module_root =
+        config::ConfigPaths::data_dir_with(&environment)?.join(external_modules::MODULE_DIR_NAME);
+    let declarative = state_path
+        .parent()
+        .context("state path has no parent")?
+        .join("declarative-modules.json");
+    let operation =
+        external_modules::control::disable_module(&module_root, &declarative, &mut state, &id)
+            .await?;
+    println!(
+        "{} Модуль «{}» {}. Требуется перезапуск lavis.",
+        if operation.changed { "✅" } else { "ℹ️" },
+        operation.module.display_name,
+        if operation.changed {
+            "отключён"
+        } else {
+            "уже отключён"
+        }
+    );
     Ok(())
 }
 
@@ -578,34 +645,48 @@ async fn modules_status() -> anyhow::Result<()> {
     let state_path = config::ConfigPaths::external_modules_state_path_with(&environment)
         .context("failed to determine state path")?;
 
-    let state = external_modules::state::ExternalStateStore::load(state_path)
+    let state = external_modules::state::ExternalStateStore::load(state_path.clone())
         .await
         .context("failed to load module state")?;
-    let descriptors =
-        external_modules::manifest::discover_modules(&module_root).unwrap_or_default();
-    let enabled_ids = state.enabled_ids();
-
-    if descriptors.is_empty() && enabled_ids.is_empty() {
+    let declarative = state_path
+        .parent()
+        .context("state path has no parent")?
+        .join("declarative-modules.json");
+    let list = external_modules::control::list_modules(&module_root, &declarative, &state)?;
+    if list.modules.is_empty() && state.enabled_ids().is_empty() {
         println!("Внешние модули не обнаружены.");
         return Ok(());
     }
 
     println!("Внешние модули (альфа):");
-    for desc in &descriptors {
-        let enabled = if enabled_ids.contains(&desc.id) {
-            "включён"
-        } else {
-            "отключён"
-        };
-        let cmd_count = desc.commands.len();
-        println!(
-            "  • {} ({}) — v{}, автор: {} — {enabled}, команд: {cmd_count}",
-            desc.display_name, desc.id, desc.version, desc.author
-        );
+    for entry in &list.modules {
+        match &entry.module {
+            Some(module) => println!(
+                "  • {} ({}) — v{}, автор: {} — {}, команд: {}",
+                module.display_name,
+                module.id,
+                module.version,
+                module.author,
+                if module.enabled {
+                    "включён"
+                } else {
+                    "отключён"
+                },
+                module.commands.len()
+            ),
+            None => println!(
+                "  • {} — диагностика: {:?}",
+                entry.id.as_deref().unwrap_or("<некорректный ID>"),
+                entry.diagnostic
+            ),
+        }
     }
-
-    for id in enabled_ids {
-        if !descriptors.iter().any(|d| d.id == *id) {
+    for id in state.enabled_ids() {
+        if !list
+            .modules
+            .iter()
+            .any(|entry| entry.id.as_deref() == Some(id))
+        {
             println!("  • {id} — включён, но манифест не найден");
         }
     }
@@ -796,8 +877,11 @@ mod tests {
 
     #[test]
     fn shutdown_error_is_returned_when_application_succeeds() {
-        let error =
-            combine_application_and_shutdown(Ok(()), Err(ClientError::RunnerTask)).unwrap_err();
+        let error = combine_application_and_shutdown(
+            Ok(crate::runtime::ShutdownReason::Exit),
+            Err(ClientError::RunnerTask),
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("Telegram runner task failed"));
     }
 
