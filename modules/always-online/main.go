@@ -102,7 +102,11 @@ func defaultState() State {
 }
 
 func validState(state State) bool {
-	return state.Interval >= minimumInterval && state.Interval <= maximumInterval && state.BackoffUntil >= 0 && state.LastInvokeAt >= 0 && state.NextCallID > 0
+	return state.Interval >= minimumInterval &&
+		state.Interval <= maximumInterval &&
+		state.BackoffUntil >= 0 &&
+		state.LastInvokeAt >= 0 &&
+		state.NextCallID > 0
 }
 
 func (m *Module) handle(request Message) ([]Message, bool) {
@@ -148,7 +152,9 @@ func (m *Module) handleEvent(request Message) []Message {
 		return []Message{response}
 	}
 	now := m.now().Unix()
-	if now < m.state.BackoffUntil || m.state.LastInvokeAt > now || now-m.state.LastInvokeAt < m.state.Interval {
+	if now < m.state.BackoffUntil ||
+		m.state.LastInvokeAt > now ||
+		now-m.state.LastInvokeAt < m.state.Interval {
 		return []Message{response}
 	}
 	callID := fmt.Sprintf("online_%d", m.state.NextCallID)
@@ -166,7 +172,9 @@ func (m *Module) handleTelegramResult(message Message) []Message {
 	if err != nil {
 		return m.finishMalformedResult()
 	}
-	if m.pending == nil || result.RequestID != m.pending.requestID || result.CallID != m.pending.callID {
+	if m.pending == nil ||
+		result.RequestID != m.pending.requestID ||
+		result.CallID != m.pending.callID {
 		return m.finishMalformedResult()
 	}
 	requestID := m.pending.requestID
@@ -204,7 +212,10 @@ func retryDelay(problem *TelegramError) int64 {
 	}
 	kind := strings.ToUpper(problem.Kind)
 	name := strings.ToUpper(problem.Name)
-	if strings.Contains(kind, "FLOOD") || strings.Contains(kind, "TEMPORARY") || strings.Contains(kind, "TIMEOUT") || strings.Contains(name, "FLOOD") {
+	if strings.Contains(kind, "FLOOD") ||
+		strings.Contains(kind, "TEMPORARY") ||
+		strings.Contains(kind, "TIMEOUT") ||
+		strings.Contains(name, "FLOOD") {
 		return defaultBackoff
 	}
 	return defaultBackoff
