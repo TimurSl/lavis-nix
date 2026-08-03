@@ -24,10 +24,14 @@ jobs:
         uses: DeterminateSystems/determinate-nix-action@v3
 
       - name: Cache Nix build results
-        uses: DeterminateSystems/magic-nix-cache-action@v9
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', '**/*.nix', 'Cargo.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 1G
 
       - name: Cache Cargo dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -54,7 +58,12 @@ jobs:
         run: |
           nix develop -c bash -c '
             set -euo pipefail
-            test -z "$(gofmt -l modules/always-online/*.go)"
+            unformatted="$(gofmt -l modules/always-online/*.go)"
+            if [ -n "$unformatted" ]; then
+              printf "%s\n" "Always Online files requiring gofmt:" >&2
+              printf "%s\n" "$unformatted" >&2
+              exit 1
+            fi
             cd modules/always-online
             go test ./...
             go vet ./...

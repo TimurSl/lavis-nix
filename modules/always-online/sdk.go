@@ -41,10 +41,10 @@ type TelegramError struct {
 
 type TelegramResult struct {
 	RequestID string
-	CallID string
-	OK     bool
-	Result json.RawMessage
-	Error  *TelegramError
+	CallID    string
+	OK        bool
+	Result    json.RawMessage
+	Error     *TelegramError
 }
 
 func parseTelegramResult(message Message) (TelegramResult, error) {
