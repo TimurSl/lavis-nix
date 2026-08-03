@@ -502,5 +502,4 @@ mod tests {
         assert!(!manager.has_running_process("sample"));
         assert!(manager.command_refs().is_empty());
     }
-
 }

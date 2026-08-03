@@ -741,9 +741,7 @@ mod tests {
             Err(ExternalError::MalformedManifest)
         ));
 
-        json.as_object_mut()
-            .unwrap()
-            .remove("timer_subscriptions");
+        json.as_object_mut().unwrap().remove("timer_subscriptions");
         json["capabilities"] = serde_json::json!(["timer"]);
         fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(matches!(
@@ -759,8 +757,7 @@ mod tests {
         ));
 
         json["capabilities"] = serde_json::json!(["telegram.account.status"]);
-        json["subscriptions"] =
-            serde_json::json!([{"type": "timer.tick", "interval_seconds": 30}]);
+        json["subscriptions"] = serde_json::json!([{"type": "timer.tick", "interval_seconds": 30}]);
         fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(matches!(
             validate_manifest_at(&path, Some("echo")),
