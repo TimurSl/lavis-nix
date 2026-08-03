@@ -34,6 +34,8 @@ pub struct ExternalModuleStatus {
 pub struct ExternalManager {
     descriptors: Vec<ExternalModuleDescriptor>,
     processes: BTreeMap<String, Arc<Mutex<ModuleProcess>>>,
+    gateway: Option<Arc<dyn super::gateway::TelegramGateway>>,
+    timer_tasks: BTreeMap<String, Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl Default for ExternalManager {
@@ -47,11 +49,17 @@ impl ExternalManager {
         Self {
             descriptors: Vec::new(),
             processes: BTreeMap::new(),
+            gateway: None,
+            timer_tasks: BTreeMap::new(),
         }
     }
 
     pub fn set_descriptors(&mut self, descriptors: Vec<ExternalModuleDescriptor>) {
         self.descriptors = descriptors;
+    }
+
+    pub fn set_gateway(&mut self, gateway: Arc<dyn super::gateway::TelegramGateway>) {
+        self.gateway = Some(gateway);
     }
 
     pub fn descriptors(&self) -> &[ExternalModuleDescriptor] {
@@ -115,33 +123,6 @@ impl ExternalManager {
             });
         }
         statuses
-    }
-
-    pub async fn startup_enabled(&mut self, enabled_ids: &std::collections::BTreeSet<String>) {
-        for desc in &self.descriptors {
-            if !enabled_ids.contains(&desc.id) {
-                continue;
-            }
-            match ModuleProcess::start(desc.clone()).await {
-                Ok(process) => {
-                    tracing::info!(
-                        event = "external_module_started",
-                        module_id = %desc.id,
-                        "External module started"
-                    );
-                    let id = desc.id.clone();
-                    self.processes.insert(id, Arc::new(Mutex::new(process)));
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        event = "external_module_startup_failed",
-                        module_id = %desc.id,
-                        error = %error,
-                        "Не удалось запустить внешний модуль"
-                    );
-                }
-            }
-        }
     }
 
     /// Resolve a dotted command name `module-id.command-name` into
@@ -268,6 +249,8 @@ impl ExternalManager {
             event = "external_modules_shutdown",
             "Shutting down external modules"
         );
+        let timer_tasks = std::mem::take(&mut self.timer_tasks);
+        stop_timer_tasks(timer_tasks).await;
         let processes: Vec<(String, Arc<Mutex<ModuleProcess>>)> = self
             .processes
             .iter()
@@ -378,24 +361,43 @@ impl ExternalManagerHandle {
     /// Starts children without retaining the manager mutex. Process I/O belongs
     /// to the individual process mutex; the manager only owns the index.
     pub async fn startup_enabled(&self, enabled_ids: &std::collections::BTreeSet<String>) {
-        let descriptors = {
+        let (descriptors, gateway) = {
             let manager = self.inner.lock().await;
-            manager
+            (manager
                 .descriptors
                 .iter()
                 .filter(|descriptor| enabled_ids.contains(&descriptor.id))
                 .cloned()
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(), manager.gateway.clone())
         };
         for descriptor in descriptors {
             let id = descriptor.id.clone();
-            match ModuleProcess::start(descriptor).await {
+            let old_timers = {
+                let mut manager = self.inner.lock().await;
+                manager.timer_tasks.remove(&id)
+            };
+            if let Some(tasks) = old_timers {
+                stop_timer_tasks(BTreeMap::from([(id.clone(), tasks)])).await;
+            }
+            match ModuleProcess::start_with_gateway(descriptor.clone(), gateway.clone()).await {
                 Ok(process) => {
-                    let mut manager = self.inner.lock().await;
-                    manager
-                        .processes
-                        .insert(id.clone(), Arc::new(Mutex::new(process)));
+                    let replaced = {
+                        let mut manager = self.inner.lock().await;
+                        manager
+                            .processes
+                            .insert(id.clone(), Arc::new(Mutex::new(process)))
+                    };
+                    if let Some(replaced) = replaced {
+                        let mut replaced = replaced.lock().await;
+                        replaced.terminate().await;
+                    }
                     tracing::info!(event = "external_module_started", module_id = %id, "External module started");
+                    if descriptor
+                        .capabilities
+                        .contains(&super::manifest::ExternalCapability::Timer)
+                    {
+                        self.start_timers(id, descriptor.timer_subscriptions).await;
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(event = "external_module_startup_failed", module_id = %id, error = %error, "Не удалось запустить внешний модуль")
@@ -407,10 +409,14 @@ impl ExternalManagerHandle {
     /// Removes the index before awaiting child shutdown, so status refresh and
     /// routing never wait behind a slow process shutdown.
     pub async fn shutdown_all(&self) {
-        let processes = {
+        let (timer_tasks, processes) = {
             let mut manager = self.inner.lock().await;
-            std::mem::take(&mut manager.processes)
+            (
+                std::mem::take(&mut manager.timer_tasks),
+                std::mem::take(&mut manager.processes),
+            )
         };
+        stop_timer_tasks(timer_tasks).await;
         for (id, process) in processes {
             let mut process = process.lock().await;
             if process.status() != ProcessStatus::Running {
@@ -421,6 +427,52 @@ impl ExternalManagerHandle {
             }
             tracing::warn!(event = "external_module_shutdown_forced", module_id = %id, "Forcefully terminating external module");
             process.terminate().await;
+        }
+    }
+
+    async fn start_timers(&self, module_id: String, timers: Vec<super::manifest::TimerSubscription>) {
+        if timers.is_empty() { return; }
+        let mut tasks = Vec::with_capacity(timers.len());
+        for timer in timers {
+            let manager = Arc::downgrade(&self.inner);
+            let id = module_id.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(timer.interval_seconds));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    let Some(manager) = manager.upgrade() else {
+                        break;
+                    };
+                    let process = {
+                        let manager = manager.lock().await;
+                        manager.processes.get(&id).cloned()
+                    };
+                    let Some(process) = process else { break; };
+                    let Ok(mut process) = process.try_lock() else { continue; };
+                    if process.status() != ProcessStatus::Running { break; }
+                    if let Err(error) = process
+                        .dispatch_timer(format!("timer-{}", super::protocol::request_id()))
+                        .await
+                    {
+                        tracing::warn!(event = "external_timer_failed", module_id = %id, error = %error, "External timer disabled after module failure");
+                        break;
+                    }
+                }
+            }));
+        }
+        let replaced = {
+            let mut manager = self.inner.lock().await;
+            if manager.processes.contains_key(&module_id) {
+                manager.timer_tasks.insert(module_id, tasks)
+            } else {
+                Some(tasks)
+            }
+        };
+        if let Some(tasks) = replaced {
+            stop_timer_tasks(BTreeMap::from([(module_id, tasks)])).await;
         }
     }
 
@@ -464,6 +516,15 @@ impl ExternalManagerHandle {
     }
 }
 
+async fn stop_timer_tasks(tasks: BTreeMap<String, Vec<tokio::task::JoinHandle<()>>>) {
+    for task in tasks.values().flatten() {
+        task.abort();
+    }
+    for task in tasks.into_values().flatten() {
+        let _ = task.await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ExternalManager;
@@ -482,6 +543,7 @@ mod tests {
             capabilities: vec![],
             default_command: None,
             subscriptions: vec![],
+            timer_subscriptions: vec![],
             actions: vec![],
             commands: vec![ExternalCommandDescriptor {
                 name: "run".to_owned(),

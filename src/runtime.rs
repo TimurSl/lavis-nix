@@ -2672,6 +2672,7 @@ for line in sys.stdin:
                     )
                     .into_iter()
                     .collect(),
+                timer_subscriptions: vec![],
                 actions: vec![],
                 commands: vec![],
             }

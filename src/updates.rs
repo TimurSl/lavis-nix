@@ -1266,6 +1266,7 @@ mod tests {
                 capabilities: vec![],
                 default_command: default_command.map(str::to_owned),
                 subscriptions: vec![],
+                timer_subscriptions: vec![],
                 actions: vec![],
                 commands: vec![ExternalCommandDescriptor {
                     name: "run".to_owned(),

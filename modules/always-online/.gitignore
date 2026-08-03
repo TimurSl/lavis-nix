@@ -1,0 +1,4 @@
+build/
+dist/
+state.json
+state.json.tmp*

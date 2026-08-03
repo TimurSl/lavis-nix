@@ -1,5 +1,6 @@
 use super::{
-    manifest::ExternalModuleDescriptor,
+    gateway::{GatewayContext, TelegramGateway, TELEGRAM_CALL_TIMEOUT},
+    manifest::{ExternalCapability, ExternalModuleDescriptor},
     protocol::{
         self, CoreMessage, MAX_LINE_BYTES, MAX_RESULT_BYTES, MessageEvent, MessageEventKind,
         ModuleMessage,
@@ -7,6 +8,7 @@ use super::{
 };
 use crate::error::ExternalError;
 use std::{
+    collections::HashSet,
     ffi::OsString,
     path::{Path, PathBuf},
     process::Stdio,
@@ -41,6 +43,8 @@ pub struct ModuleProcess {
     descriptor: ExternalModuleDescriptor,
     status: ProcessStatus,
     in_flight_request: Option<String>,
+    gateway: Option<std::sync::Arc<dyn TelegramGateway>>,
+    active_call_ids: HashSet<String>,
 }
 
 struct StderrCapture {
@@ -66,6 +70,12 @@ impl ModuleProcess {
     }
 
     pub async fn start(descriptor: ExternalModuleDescriptor) -> Result<Self, ExternalError> {
+        Self::start_with_gateway(descriptor, None).await
+    }
+    pub async fn start_with_gateway(
+        descriptor: ExternalModuleDescriptor,
+        gateway: Option<std::sync::Arc<dyn TelegramGateway>>,
+    ) -> Result<Self, ExternalError> {
         let entrypoint = descriptor.entrypoint.clone();
         if !entrypoint.starts_with(&descriptor.module_dir) {
             return Err(ExternalError::PathEscape);
@@ -141,6 +151,8 @@ impl ModuleProcess {
             descriptor,
             status: ProcessStatus::Running,
             in_flight_request: None,
+            gateway,
+            active_call_ids: HashSet::new(),
         };
 
         if let Err(e) = process.handshake().await {
@@ -234,6 +246,7 @@ impl ModuleProcess {
         };
 
         self.in_flight_request = None;
+        self.active_call_ids.clear();
 
         match result {
             ModuleMessage::Result { request_id, text } => {
@@ -286,6 +299,7 @@ impl ModuleProcess {
             }
         };
         self.in_flight_request = None;
+        self.active_call_ids.clear();
         match reply {
             ModuleMessage::EventResult {
                 request_id: actual,
@@ -293,6 +307,49 @@ impl ModuleProcess {
             } if actual == request_id => Ok((request_id, actions)),
             ModuleMessage::EventResult { .. } => {
                 Err(self.fail_and_terminate(ExternalError::WrongRequestId).await)
+            }
+            _ => Err(self.fail_and_terminate(ExternalError::ProtocolDecode).await),
+        }
+    }
+
+    pub async fn dispatch_timer(&mut self, event_id: String) -> Result<String, ExternalError> {
+        if self.descriptor.protocol_version != 5
+            || !self
+                .descriptor
+                .capabilities
+                .contains(&ExternalCapability::Timer)
+        {
+            return Err(ExternalError::InvalidArgument);
+        }
+        let request_id = protocol::request_id();
+        self.in_flight_request = Some(request_id.clone());
+        if let Err(error) = self
+            .send(&CoreMessage::TimerTick {
+                request_id: request_id.clone(),
+                event_id,
+            })
+            .await
+        {
+            return Err(self.fail_and_terminate(error).await);
+        }
+        let reply = match timeout(EXECUTE_TIMEOUT, self.collect_reply(&request_id)).await {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(error)) => return Err(self.fail_and_terminate(error).await),
+            Err(_) => {
+                return Err(self
+                    .fail_and_terminate(ExternalError::ExecutionTimeout)
+                    .await);
+            }
+        };
+        self.in_flight_request = None;
+        self.active_call_ids.clear();
+        match reply {
+            ModuleMessage::EventResult {
+                request_id: actual,
+                actions,
+            } if actual == request_id && actions.is_empty() => Ok(request_id),
+            ModuleMessage::EventResult { .. } => {
+                Err(self.fail_and_terminate(ExternalError::ProtocolDecode).await)
             }
             _ => Err(self.fail_and_terminate(ExternalError::ProtocolDecode).await),
         }
@@ -307,6 +364,46 @@ impl ModuleProcess {
             };
             match msg {
                 ModuleMessage::Log { .. } => continue,
+                ModuleMessage::TelegramInvoke {
+                    request_id,
+                    call_id,
+                    method,
+                    params,
+                } => {
+                    if self.descriptor.protocol_version != 5
+                        || request_id != expected_id
+                        || self.in_flight_request.as_deref() != Some(expected_id)
+                        || !self.active_call_ids.insert(call_id.clone())
+                    {
+                        return Err(ExternalError::ProtocolDecode);
+                    }
+                    let result = if !self
+                        .descriptor
+                        .capabilities
+                        .contains(&ExternalCapability::TelegramInvoke)
+                    {
+                        Err(telegram_error("capability", "telegram.invoke capability is required"))
+                    } else if let Some(gateway) = &self.gateway {
+                        let context = GatewayContext {
+                            module_id: self.descriptor.id.clone(),
+                            request_id: expected_id.to_owned(),
+                        };
+                        match timeout(TELEGRAM_CALL_TIMEOUT, gateway.invoke(context, &method, params)).await {
+                            Ok(result) => result,
+                            Err(_) => Err(telegram_error("timeout", "Telegram request timed out")),
+                        }
+                    } else {
+                        Err(telegram_error("transport", "Telegram gateway unavailable"))
+                    };
+                    self.active_call_ids.remove(&call_id);
+                    self.send(&CoreMessage::TelegramResult {
+                        request_id,
+                        call_id,
+                        result,
+                    })
+                    .await?;
+                    continue;
+                }
                 ModuleMessage::Result { ref request_id, .. }
                 | ModuleMessage::Error { ref request_id, .. }
                 | ModuleMessage::Health { ref request_id }
@@ -364,6 +461,7 @@ impl ModuleProcess {
             Ok(()) => {
                 self.join_stderr_drain().await;
                 self.in_flight_request = None;
+                self.active_call_ids.clear();
                 self.status = ProcessStatus::Terminated;
                 Ok(())
             }
@@ -374,11 +472,14 @@ impl ModuleProcess {
     }
 
     pub fn mark_failed(&mut self) {
+        self.in_flight_request = None;
+        self.active_call_ids.clear();
         self.status = ProcessStatus::Failed;
     }
 
     async fn fail_and_terminate(&mut self, error: ExternalError) -> ExternalError {
         self.in_flight_request = None;
+        self.active_call_ids.clear();
         self.status = ProcessStatus::Crashed;
         self.terminate_process_group().await;
         self.reap_child().await;
@@ -388,6 +489,8 @@ impl ModuleProcess {
 
     pub async fn terminate(&mut self) {
         self.status = ProcessStatus::Terminated;
+        self.in_flight_request = None;
+        self.active_call_ids.clear();
         self.terminate_process_group().await;
         self.reap_child().await;
         self.join_stderr_drain().await;
@@ -543,6 +646,16 @@ fn truncate_result(text: &str) -> String {
             end = idx;
         }
         format!("{}…", &text[..end])
+    }
+}
+
+fn telegram_error(kind: &'static str, message: &str) -> protocol::TelegramCallError {
+    protocol::TelegramCallError {
+        kind,
+        code: None,
+        name: None,
+        message: message.to_owned(),
+        retry_after_seconds: None,
     }
 }
 
@@ -707,6 +820,7 @@ if child:
             capabilities: Vec::new(),
             default_command: None,
             subscriptions: Vec::new(),
+            timer_subscriptions: Vec::new(),
             actions: Vec::new(),
             commands: vec![],
         };
@@ -733,6 +847,7 @@ if child:
             capabilities: Vec::new(),
             default_command: None,
             subscriptions: Vec::new(),
+            timer_subscriptions: Vec::new(),
             actions: Vec::new(),
             commands: vec![],
         };
@@ -759,6 +874,7 @@ if child:
             capabilities: Vec::new(),
             default_command: None,
             subscriptions: Vec::new(),
+            timer_subscriptions: Vec::new(),
             actions: Vec::new(),
             commands: vec![],
         };
