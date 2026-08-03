@@ -32,7 +32,7 @@ Module API v1 — статический контракт метаданных �
 
 ### Команда
 
-`CommandKind` — типовой вид встроенной команды: `Ping`, `Stats`, `Help`, `Fastfetch`, `Alias`, `Prefix`, `Modules`, `Setup` или `Lm`.
+`CommandKind` — типовой вид встроенной команды: `Ping`, `Stats`, `Help`, `Fastfetch`, `Alias`, `Prefix`, `Modules`, `Setup`, `Lm` или `Reboot`.
 
 `CommandRisk` описывает максимальный характер действия:
 
@@ -43,7 +43,7 @@ Module API v1 — статический контракт метаданных �
 - `Privileged` — чувствительное действие с Telegram/account state;
 - `ExternalCodeInstall` — проверка и сохранение внешнего исполняемого кода без автоматического запуска.
 
-`setup` имеет риск `Privileged`; `lm` — `ExternalCodeInstall`; `fastfetch` — `RestrictedProcess`. Риск описывает пользовательский эффект команды, а не даёт разрешение обходить runtime-проверки.
+`setup` и `reboot` имеют риск `Privileged`; `lm` — `ExternalCodeInstall`; `fastfetch` — `RestrictedProcess`. Риск описывает пользовательский эффект команды, а не даёт разрешение обходить runtime-проверки.
 
 `CommandDefinition` связывает `kind` с каноническим `name`, синтаксисом `usage`, русскими `summary_ru` и `description_ru`, списком безпрефиксных `examples`, `risk`, `icon`, флагом `aliasable` и владельцем `module: ModuleId`. Каждый пример начинается с имени канонической команды, а UI добавляет активный префикс.
 
@@ -68,7 +68,9 @@ Help v2 использует статические поля v1 для built-in 
 
 Порядок исполнения резервирует встроенные canonical names. Внешние команды вызываются namespaced-именем `module-id.command-name`; schema 3 default command может использовать короткое имя module ID; затем проверяются псевдонимы.
 
-Команда `lm` имеет специализированную карточку Help, потому что generic metadata недостаточно для описания Saved Messages, `.lmod`, inspection plan, ApprovalId, TTL и disabled-after-install semantics.
+Команда `lm` имеет специализированную карточку Help, потому что generic metadata недостаточно для описания Saved Messages, `.lmod`, inspection plan, ApprovalId, TTL, disabled-after-install semantics и persistent enable state. `lm list` и `lm info <id>` читают состояние; `lm enable <id>` и `lm disable <id>` меняют его только для следующего запуска. Горячая загрузка отсутствует.
+
+`reboot` безопасно перезапускает только процесс Lavis, а не операционную систему. Он редактирует то же сообщение с командой сначала в «♻️ Lavis перезапускается…», а после успешного запуска — в «✅ Lavis перезагрузился» с целым временем перезапуска в секундах с усечением дробной части; отдельное сообщение не создаётся. Как и изменяющие состояние варианты `lm`, он принимается только в новом собственном сообщении «Сохранённых сообщений»; редактированные сообщения не подходят.
 
 ## Как зарегистрировать встроенную команду
 

@@ -350,7 +350,7 @@ mod tests {
                     panic!("production command has prohibited risk");
                 }
                 CommandRisk::Privileged => {
-                    assert_eq!(command.name, "setup");
+                    assert!(matches!(command.name, "setup" | "reboot"));
                     assert_eq!(command.module, ModuleId::Core);
                     assert!(!command.aliasable);
                 }
