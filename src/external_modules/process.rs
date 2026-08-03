@@ -17,11 +17,19 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
-    time::timeout,
+    time::{Instant, timeout, timeout_at},
 };
 
 pub const INIT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Total budget for a v5 parent request, including its optional nested call.
+pub const PARENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+/// Legacy v2-v4 execute/event deadline. It remains unchanged.
 pub const EXECUTE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Once the core has answered `telegram.result`, the module gets this bounded
+/// time to send the correlated terminal reply.
+pub const TERMINAL_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+/// Reserved for flushing `telegram.result` before terminal-reply waiting begins.
+pub const TELEGRAM_RESULT_WRITE_RESERVE: Duration = Duration::from_millis(250);
 pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 pub const MAX_STDERR_CAPTURE: usize = 16 * 1024;
@@ -45,6 +53,7 @@ pub struct ModuleProcess {
     in_flight_request: Option<String>,
     gateway: Option<std::sync::Arc<dyn TelegramGateway>>,
     active_call_ids: HashSet<String>,
+    telegram_invoke_parent: Option<String>,
 }
 
 struct StderrCapture {
@@ -153,6 +162,7 @@ impl ModuleProcess {
             in_flight_request: None,
             gateway,
             active_call_ids: HashSet::new(),
+            telegram_invoke_parent: None,
         };
 
         if let Err(e) = process.handshake().await {
@@ -233,20 +243,15 @@ impl ModuleProcess {
             return Err(self.fail_and_terminate(e).await);
         }
 
-        let result = match timeout(EXECUTE_TIMEOUT, self.collect_reply(&req_id)).await {
-            Ok(inner) => match inner {
-                Ok(msg) => msg,
-                Err(e) => return Err(self.fail_and_terminate(e).await),
-            },
-            Err(_) => {
-                return Err(self
-                    .fail_and_terminate(ExternalError::ExecutionTimeout)
-                    .await);
-            }
+        let result = match self
+            .collect_reply_until(&req_id, request_deadline(self.descriptor.protocol_version))
+            .await
+        {
+            Ok(msg) => msg,
+            Err(error) => return Err(self.fail_and_terminate(error).await),
         };
 
-        self.in_flight_request = None;
-        self.active_call_ids.clear();
+        self.clear_request_state();
 
         match result {
             ModuleMessage::Result { request_id, text } => {
@@ -289,17 +294,14 @@ impl ModuleProcess {
         if let Err(error) = self.send(&message).await {
             return Err(self.fail_and_terminate(error).await);
         }
-        let reply = match timeout(EXECUTE_TIMEOUT, self.collect_reply(&request_id)).await {
-            Ok(Ok(reply)) => reply,
-            Ok(Err(error)) => return Err(self.fail_and_terminate(error).await),
-            Err(_) => {
-                return Err(self
-                    .fail_and_terminate(ExternalError::ExecutionTimeout)
-                    .await);
-            }
+        let reply = match self
+            .collect_reply_until(&request_id, request_deadline(self.descriptor.protocol_version))
+            .await
+        {
+            Ok(reply) => reply,
+            Err(error) => return Err(self.fail_and_terminate(error).await),
         };
-        self.in_flight_request = None;
-        self.active_call_ids.clear();
+        self.clear_request_state();
         match reply {
             ModuleMessage::EventResult {
                 request_id: actual,
@@ -332,17 +334,14 @@ impl ModuleProcess {
         {
             return Err(self.fail_and_terminate(error).await);
         }
-        let reply = match timeout(EXECUTE_TIMEOUT, self.collect_reply(&request_id)).await {
-            Ok(Ok(reply)) => reply,
-            Ok(Err(error)) => return Err(self.fail_and_terminate(error).await),
-            Err(_) => {
-                return Err(self
-                    .fail_and_terminate(ExternalError::ExecutionTimeout)
-                    .await);
-            }
+        let reply = match self
+            .collect_reply_until(&request_id, request_deadline(self.descriptor.protocol_version))
+            .await
+        {
+            Ok(reply) => reply,
+            Err(error) => return Err(self.fail_and_terminate(error).await),
         };
-        self.in_flight_request = None;
-        self.active_call_ids.clear();
+        self.clear_request_state();
         match reply {
             ModuleMessage::EventResult {
                 request_id: actual,
@@ -355,9 +354,16 @@ impl ModuleProcess {
         }
     }
 
-    async fn collect_reply(&mut self, expected_id: &str) -> Result<ModuleMessage, ExternalError> {
+    async fn collect_reply_until(
+        &mut self,
+        expected_id: &str,
+        parent_deadline: Instant,
+    ) -> Result<ModuleMessage, ExternalError> {
+        let mut read_deadline = parent_deadline;
         loop {
-            let line = self.read_line().await?;
+            let line = timeout_at(read_deadline, self.read_line())
+                .await
+                .map_err(|_| ExternalError::ExecutionTimeout)??;
             let Some(msg) = line else {
                 self.status = ProcessStatus::Crashed;
                 return Err(ExternalError::Unavailable);
@@ -370,13 +376,18 @@ impl ModuleProcess {
                     method,
                     params,
                 } => {
-                    if self.descriptor.protocol_version != 5
-                        || request_id != expected_id
-                        || self.in_flight_request.as_deref() != Some(expected_id)
+                    if !allows_telegram_invoke(
+                        self.descriptor.protocol_version,
+                        self.in_flight_request.as_deref(),
+                        self.telegram_invoke_parent.as_deref(),
+                        expected_id,
+                        &request_id,
+                    )
                         || !self.active_call_ids.insert(call_id.clone())
                     {
                         return Err(ExternalError::ProtocolDecode);
                     }
+                    self.telegram_invoke_parent = Some(expected_id.to_owned());
                     let result = if !self
                         .descriptor
                         .capabilities
@@ -388,9 +399,24 @@ impl ModuleProcess {
                             module_id: self.descriptor.id.clone(),
                             request_id: expected_id.to_owned(),
                         };
-                        match timeout(TELEGRAM_CALL_TIMEOUT, gateway.invoke(context, &method, params)).await {
-                            Ok(result) => result,
-                            Err(_) => Err(telegram_error("timeout", "Telegram request timed out")),
+                        if !has_nested_call_budget(parent_deadline, Instant::now()) {
+                            Err(telegram_error(
+                                "timeout",
+                                "parent request deadline has insufficient nested-call budget",
+                            ))
+                        } else {
+                            match timeout(
+                                TELEGRAM_CALL_TIMEOUT,
+                                gateway.invoke(context, &method, params),
+                            )
+                            .await
+                            {
+                                Ok(result) => result,
+                                Err(_) => Err(telegram_error(
+                                    "timeout",
+                                    "Telegram request timed out",
+                                )),
+                            }
                         }
                     } else {
                         Err(telegram_error("transport", "Telegram gateway unavailable"))
@@ -402,6 +428,10 @@ impl ModuleProcess {
                         result,
                     })
                     .await?;
+                    read_deadline = std::cmp::min(
+                        parent_deadline,
+                        Instant::now() + TERMINAL_REPLY_TIMEOUT,
+                    );
                     continue;
                 }
                 ModuleMessage::Result { ref request_id, .. }
@@ -418,6 +448,11 @@ impl ModuleProcess {
         }
     }
 
+    async fn collect_reply(&mut self, expected_id: &str) -> Result<ModuleMessage, ExternalError> {
+        self.collect_reply_until(expected_id, Instant::now() + HEALTH_TIMEOUT)
+            .await
+    }
+
     pub async fn health_check(&mut self) -> Result<(), ExternalError> {
         let req_id = protocol::request_id();
         let msg = CoreMessage::Health {
@@ -430,6 +465,9 @@ impl ModuleProcess {
         let response = match timeout(HEALTH_TIMEOUT, self.collect_reply(&req_id)).await {
             Ok(inner) => match inner {
                 Ok(msg) => msg,
+                Err(ExternalError::ExecutionTimeout) => {
+                    return Err(self.fail_and_terminate(ExternalError::HealthTimeout).await);
+                }
                 Err(e) => return Err(self.fail_and_terminate(e).await),
             },
             Err(_) => {
@@ -460,8 +498,7 @@ impl ModuleProcess {
         match timeout(SHUTDOWN_TIMEOUT, self.reap_child()).await {
             Ok(()) => {
                 self.join_stderr_drain().await;
-                self.in_flight_request = None;
-                self.active_call_ids.clear();
+                self.clear_request_state();
                 self.status = ProcessStatus::Terminated;
                 Ok(())
             }
@@ -472,14 +509,18 @@ impl ModuleProcess {
     }
 
     pub fn mark_failed(&mut self) {
-        self.in_flight_request = None;
-        self.active_call_ids.clear();
+        self.clear_request_state();
         self.status = ProcessStatus::Failed;
     }
 
-    async fn fail_and_terminate(&mut self, error: ExternalError) -> ExternalError {
+    fn clear_request_state(&mut self) {
         self.in_flight_request = None;
         self.active_call_ids.clear();
+        self.telegram_invoke_parent = None;
+    }
+
+    async fn fail_and_terminate(&mut self, error: ExternalError) -> ExternalError {
+        self.clear_request_state();
         self.status = ProcessStatus::Crashed;
         self.terminate_process_group().await;
         self.reap_child().await;
@@ -489,8 +530,7 @@ impl ModuleProcess {
 
     pub async fn terminate(&mut self) {
         self.status = ProcessStatus::Terminated;
-        self.in_flight_request = None;
-        self.active_call_ids.clear();
+        self.clear_request_state();
         self.terminate_process_group().await;
         self.reap_child().await;
         self.join_stderr_drain().await;
@@ -659,6 +699,74 @@ fn telegram_error(kind: &'static str, message: &str) -> protocol::TelegramCallEr
     }
 }
 
+fn has_nested_call_budget(parent_deadline: Instant, now: Instant) -> bool {
+    parent_deadline.saturating_duration_since(now)
+        >= TELEGRAM_CALL_TIMEOUT + TELEGRAM_RESULT_WRITE_RESERVE + TERMINAL_REPLY_TIMEOUT
+}
+
+fn request_deadline(protocol_version: u32) -> Instant {
+    Instant::now() + request_timeout(protocol_version)
+}
+
+fn request_timeout(protocol_version: u32) -> Duration {
+    if protocol_version == 5 {
+        PARENT_REQUEST_TIMEOUT
+    } else {
+        EXECUTE_TIMEOUT
+    }
+}
+
+fn allows_telegram_invoke(
+    protocol_version: u32,
+    active_parent: Option<&str>,
+    invoked_parent: Option<&str>,
+    expected_parent: &str,
+    supplied_parent: &str,
+) -> bool {
+    protocol_version == 5
+        && active_parent == Some(expected_parent)
+        && supplied_parent == expected_parent
+        && invoked_parent != Some(expected_parent)
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[test]
+    fn parent_timeout_reserves_nested_gateway_and_terminal_reply_budget() {
+        let now = Instant::now();
+        let nested_budget =
+            TELEGRAM_CALL_TIMEOUT + TELEGRAM_RESULT_WRITE_RESERVE + TERMINAL_REPLY_TIMEOUT;
+        assert!(PARENT_REQUEST_TIMEOUT > nested_budget);
+        assert!(has_nested_call_budget(
+            now + nested_budget,
+            now
+        ));
+        assert!(!has_nested_call_budget(
+            now + nested_budget - Duration::from_millis(1),
+            now
+        ));
+    }
+
+    #[test]
+    fn legacy_protocols_keep_the_five_second_request_deadline() {
+        for protocol_version in 2..=4 {
+            assert_eq!(request_timeout(protocol_version), EXECUTE_TIMEOUT);
+        }
+        assert_eq!(request_timeout(5), PARENT_REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn invoke_is_bound_to_its_parent_and_limited_to_one_total_call() {
+        assert!(allows_telegram_invoke(5, Some("10"), None, "10", "10"));
+        assert!(!allows_telegram_invoke(5, Some("10"), Some("10"), "10", "10"));
+        assert!(!allows_telegram_invoke(5, Some("10"), None, "10", "11"));
+        assert!(!allows_telegram_invoke(4, Some("10"), None, "10", "10"));
+        assert!(!allows_telegram_invoke(5, None, None, "10", "10"));
+    }
+}
+
 fn module_state_dir<F>(module_id: &str, environment: &F) -> Option<PathBuf>
 where
     F: Fn(&str) -> Option<OsString>,
@@ -696,12 +804,14 @@ pub async fn reap_child(mut child: Child) {
 #[cfg(all(test, feature = "fixture-tests"))]
 mod tests {
     use super::*;
+    use crate::external_modules::gateway::TelegramGateway;
     use std::env;
     use std::ffi::OsString;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -1061,6 +1171,161 @@ for line in sys.stdin:
     sys.stdout.write(json.dumps(response) + "\n")
     sys.stdout.flush()
 "#;
+
+    const V5_INVOKE_MODULE_PY: &str = r#"#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    request_id = message["request_id"]
+    if message["type"] == "initialize":
+        response = {"protocol_version": 5, "type": "initialized", "request_id": request_id, "module_id": message["module_id"]}
+        print(json.dumps(response), flush=True)
+    elif message["type"] == "execute":
+        invoke = {"protocol_version": 5, "type": "telegram.invoke", "request_id": request_id, "call_id": "call-1", "method": "account.updateStatus", "params": {"offline": True}}
+        print(json.dumps(invoke), flush=True)
+        result = json.loads(sys.stdin.readline())
+        if result["type"] != "telegram.result" or result["request_id"] != request_id or result["call_id"] != "call-1":
+            sys.exit(2)
+        response = {"protocol_version": 5, "type": "result", "request_id": request_id, "text": json.dumps(result, sort_keys=True)}
+        print(json.dumps(response), flush=True)
+"#;
+
+    const V5_DOUBLE_INVOKE_MODULE_PY: &str = r#"#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    request_id = message["request_id"]
+    if message["type"] == "initialize":
+        print(json.dumps({"protocol_version": 5, "type": "initialized", "request_id": request_id, "module_id": message["module_id"]}), flush=True)
+    elif message["type"] == "execute":
+        for call_id in ["call-1", "call-2"]:
+            print(json.dumps({"protocol_version": 5, "type": "telegram.invoke", "request_id": request_id, "call_id": call_id, "method": "account.updateStatus", "params": {"offline": True}}), flush=True)
+"#;
+
+    struct FakeGateway {
+        result: Result<serde_json::Value, protocol::TelegramCallError>,
+        contexts: Mutex<Vec<GatewayContext>>,
+    }
+
+    impl TelegramGateway for FakeGateway {
+        fn invoke<'a>(
+            &'a self,
+            context: GatewayContext,
+            _method: &'a str,
+            _params: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value, protocol::TelegramCallError>> + Send + 'a>,
+        > {
+            self.contexts.lock().unwrap().push(context);
+            Box::pin(std::future::ready(self.result.clone()))
+        }
+    }
+
+    struct HangingGateway;
+
+    impl TelegramGateway for HangingGateway {
+        fn invoke<'a>(
+            &'a self,
+            _context: GatewayContext,
+            _method: &'a str,
+            _params: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value, protocol::TelegramCallError>> + Send + 'a>,
+        > {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn v5_nested_invoke_preserves_parent_and_success_envelope() {
+        let (mut descriptor, directory) = create_fixture_module(V5_INVOKE_MODULE_PY, "v5-invoke");
+        descriptor.protocol_version = 5;
+        descriptor.capabilities = vec![ExternalCapability::TelegramInvoke];
+        let gateway = Arc::new(FakeGateway {
+            result: Ok(serde_json::Value::Bool(true)),
+            contexts: Mutex::new(Vec::new()),
+        });
+        let mut process = ModuleProcess::start_with_gateway(descriptor, Some(gateway.clone()))
+            .await
+            .unwrap();
+        let text = process.execute("run", "").await.unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["result"], true);
+        assert_eq!(gateway.contexts.lock().unwrap().len(), 1);
+        assert_eq!(process.in_flight_request(), None);
+        process.terminate().await;
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn v5_nested_invoke_returns_rpc_error_envelope() {
+        let (mut descriptor, directory) = create_fixture_module(V5_INVOKE_MODULE_PY, "v5-rpc");
+        descriptor.protocol_version = 5;
+        descriptor.capabilities = vec![ExternalCapability::TelegramInvoke];
+        let gateway = Arc::new(FakeGateway {
+            result: Err(protocol::TelegramCallError {
+                kind: "rpc",
+                code: Some(420),
+                name: Some("FLOOD_WAIT".to_owned()),
+                message: "FLOOD_WAIT".to_owned(),
+                retry_after_seconds: Some(9),
+            }),
+            contexts: Mutex::new(Vec::new()),
+        });
+        let mut process = ModuleProcess::start_with_gateway(descriptor, Some(gateway))
+            .await
+            .unwrap();
+        let text = process.execute("run", "").await.unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error"]["kind"], "rpc");
+        assert_eq!(envelope["error"]["code"], 420);
+        assert_eq!(envelope["error"]["name"], "FLOOD_WAIT");
+        assert_eq!(envelope["error"]["retry_after_seconds"], 9);
+        process.terminate().await;
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn v5_second_invoke_for_the_same_parent_fails_and_clears_state() {
+        let (mut descriptor, directory) =
+            create_fixture_module(V5_DOUBLE_INVOKE_MODULE_PY, "v5-double");
+        descriptor.protocol_version = 5;
+        descriptor.capabilities = vec![ExternalCapability::TelegramInvoke];
+        let gateway = Arc::new(FakeGateway {
+            result: Ok(serde_json::Value::Bool(true)),
+            contexts: Mutex::new(Vec::new()),
+        });
+        let mut process = ModuleProcess::start_with_gateway(descriptor, Some(gateway))
+            .await
+            .unwrap();
+        assert!(matches!(
+            process.execute("run", "").await,
+            Err(ExternalError::ProtocolDecode)
+        ));
+        assert_eq!(process.in_flight_request(), None);
+        assert_eq!(process.status(), ProcessStatus::Crashed);
+        process.terminate().await;
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn v5_hanging_gateway_receives_timeout_result_before_terminal_reply() {
+        let (mut descriptor, directory) = create_fixture_module(V5_INVOKE_MODULE_PY, "v5-timeout");
+        descriptor.protocol_version = 5;
+        descriptor.capabilities = vec![ExternalCapability::TelegramInvoke];
+        let mut process = ModuleProcess::start_with_gateway(descriptor, Some(Arc::new(HangingGateway)))
+            .await
+            .unwrap();
+        let text = process.execute("run", "").await.unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error"]["kind"], "timeout");
+        assert_eq!(process.in_flight_request(), None);
+        process.terminate().await;
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[tokio::test]
     async fn v3_event_result_accepts_zero_ordinary_and_custom_emoji_actions() {

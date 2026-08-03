@@ -249,6 +249,14 @@ pub struct InspectionTimes {
     pub expires_unix_seconds: u64,
 }
 
+/// Structured V5 timer metadata shown before installation. Keeping the type
+/// and interval separate makes the reviewed/fingerprinted value unambiguous.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TimerSubscriptionPlan {
+    pub subscription_type: String,
+    pub interval_seconds: u64,
+}
+
 /// Caller-safe review data. It has no staging location or confirmation secret.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ModuleInstallPlan {
@@ -265,6 +273,7 @@ pub struct ModuleInstallPlan {
     pub times: InspectionTimes,
     pub capabilities: Vec<String>,
     pub subscriptions: Vec<String>,
+    pub timer_subscriptions: Vec<TimerSubscriptionPlan>,
     pub actions: Vec<String>,
     pub fingerprint: String,
 }
@@ -316,6 +325,14 @@ impl ModuleInstallPlan {
                 super::manifest::ExternalAction::MessageReact => "message.react".into(),
             })
             .collect();
+        let timer_subscriptions = d
+            .timer_subscriptions
+            .iter()
+            .map(|timer| TimerSubscriptionPlan {
+                subscription_type: "timer.tick".to_owned(),
+                interval_seconds: timer.interval_seconds,
+            })
+            .collect();
         let mut result = Self {
             source_kind: identity.kind(),
             source_identity: identity,
@@ -333,6 +350,7 @@ impl ModuleInstallPlan {
             },
             capabilities,
             subscriptions,
+            timer_subscriptions,
             actions,
             fingerprint: String::new(),
         };
@@ -368,6 +386,11 @@ impl ModuleInstallPlan {
         encoded.extend_from_slice(&self.archive.expanded_bytes.to_be_bytes());
         canonical_list(&mut encoded, &self.capabilities);
         canonical_list(&mut encoded, &self.subscriptions);
+        encoded.extend_from_slice(&(self.timer_subscriptions.len() as u32).to_be_bytes());
+        for timer in &self.timer_subscriptions {
+            canonical_string(&mut encoded, &timer.subscription_type);
+            encoded.extend_from_slice(&timer.interval_seconds.to_be_bytes());
+        }
         canonical_list(&mut encoded, &self.actions);
         encoded.extend_from_slice(&(self.warnings.len() as u32).to_be_bytes());
         for warning in &self.warnings {
@@ -1078,6 +1101,16 @@ mod tests {
         zip(&[manifest(), run])
     }
 
+    fn v5_archive() -> Vec<u8> {
+        let manifest = file(
+            "module.json",
+            br#"{"schema_version":5,"id":"timer","name":"Timer","version":"1","author":"A","entrypoint":"run","capabilities":["timer","telegram.invoke"],"subscriptions":[{"type":"timer.tick","interval_seconds":30}],"commands":[{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}]}"#,
+        );
+        let mut run = file("run", b"#!/bin/sh");
+        run.mode = 0o100755;
+        zip(&[manifest, run])
+    }
+
     struct TestRandom(u8);
 
     impl RandomSource for TestRandom {
@@ -1221,6 +1254,39 @@ mod tests {
         first.cleanup().unwrap();
         second.cleanup().unwrap();
         assert!(!wrapper.exists());
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn v5_plan_exposes_and_fingerprints_timer_and_gateway_capability() {
+        let root = root("v5-plan");
+        let config = InspectionConfig {
+            staging_root: root.clone(),
+            limits: limits(),
+        };
+        let mut random = TestRandom(1);
+        let pending = inspect_pending(
+            &config,
+            AcquiredLmod::archive(v5_archive()),
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
+            &mut random,
+        )
+        .unwrap();
+        assert!(pending.plan.capabilities.contains(&"telegram.invoke".to_owned()));
+        assert_eq!(
+            pending.plan.timer_subscriptions,
+            vec![TimerSubscriptionPlan {
+                subscription_type: "timer.tick".to_owned(),
+                interval_seconds: 30,
+            }]
+        );
+        let timerless = ModuleInstallPlan {
+            timer_subscriptions: Vec::new(),
+            ..pending.plan.clone()
+        };
+        assert_ne!(pending.plan.fingerprint, timerless.canonical_fingerprint());
+        pending.cleanup().unwrap();
         let _ = fs::remove_dir(root);
     }
 

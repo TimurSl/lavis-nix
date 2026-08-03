@@ -1401,7 +1401,7 @@ fn render_install_plan(
         }
     };
     format!(
-        "📋 План установки\n\nИсточник: {source}\nМодуль: {} v{}\nПротокол: {}\nТочка входа: {}\nКоманда по умолчанию: {}\nSHA-256: {}\nОтпечаток: {}\nАрхив: {} Байт, файлов: {}, сжато: {} Байт, распаковано: {} Байт\nВозможности: {}\nПодписки: {}\nДействия: {}\nПредупреждения: {}\n\nApprovalId: {approval_id}\nПодтвердите: {prefix}lm confirm {approval_id}\nОтменить: {prefix}lm cancel {approval_id}\nСрок действия: 10 минут.",
+        "📋 План установки\n\nИсточник: {source}\nМодуль: {} v{}\nПротокол: {}\nТочка входа: {}\nКоманда по умолчанию: {}\nSHA-256: {}\nОтпечаток: {}\nАрхив: {} Байт, файлов: {}, сжато: {} Байт, распаковано: {} Байт\nВозможности: {}\nПодписки: {}\nТаймеры: {}\nДействия: {}\nПредупреждения: {}\n\nApprovalId: {approval_id}\nПодтвердите: {prefix}lm confirm {approval_id}\nОтменить: {prefix}lm cancel {approval_id}\nСрок действия: 10 минут.",
         plan.module_id,
         plan.module_version,
         plan.protocol_version,
@@ -1415,6 +1415,13 @@ fn render_install_plan(
         plan.archive.expanded_bytes,
         bounded_list(&plan.capabilities),
         bounded_list(&plan.subscriptions),
+        bounded_list(
+            &plan
+                .timer_subscriptions
+                .iter()
+                .map(|timer| format!("{} ({} с)", timer.subscription_type, timer.interval_seconds))
+                .collect::<Vec<_>>(),
+        ),
         bounded_list(&plan.actions),
         bounded_list(
             &plan

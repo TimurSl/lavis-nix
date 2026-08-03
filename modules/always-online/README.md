@@ -5,10 +5,10 @@ Always Online is an independent Lavis Module API v5 executable.  On each core
 
 ## Commands
 
-- `,online on` — enable updates;
-- `,online off` — disable updates;
-- `,online status` (or `,online`) — show state;
-- `,online interval <seconds>` — store a desired interval from 30 to 86400.
+- `,always-online.online on` — enable updates;
+- `,always-online.online off` — disable updates;
+- `,always-online.online status` (or `,always-online.online`) — show state;
+- `,always-online.online interval <seconds>` — store a desired interval from 30 to 86400.
 
 The manifest requests the static 30-second core timer. `interval` is persisted
 module configuration that gates calls on those ticks: after an invocation, the
@@ -19,7 +19,8 @@ of additional delay).
 
 The module only sends invocations while enabled. It requires the structured
 `timer.tick` payload to contain a unique `event_id`. It creates a persisted
-`online_<number>` call ID (letters, digits, and underscores only), sends one
+`online_<number>` call ID (letters, digits, and underscores only; valid V5
+call IDs are 1–64 ASCII `[A-Za-z0-9_-]+`), sends one
 `telegram.invoke` with its parent request ID, then waits for the matching
 structured `telegram.result` before emitting the terminal `event_result`.
 Failed temporary, timeout, and FloodWait results apply a backoff (using

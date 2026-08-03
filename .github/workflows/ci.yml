@@ -23,6 +23,19 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
 
+      - name: Cache Nix build results
+        uses: DeterminateSystems/magic-nix-cache-action@v9
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
       - name: Test GAF module and artifact
         run: |
           cp modules/gaf/dist/gaf.lmod /tmp/gaf.lmod
@@ -36,6 +49,31 @@ jobs:
               modes = {item.filename: (item.external_attr >> 16) & 0o777 for item in archive.infolist()}
               assert modes == {'module.json': 0o600, 'gaf': 0o700}, modes
           PY
+
+      - name: Test Always Online module and artifact
+        run: |
+          nix develop -c bash -c '
+            set -euo pipefail
+            test -z "$(gofmt -l modules/always-online/*.go)"
+            cd modules/always-online
+            go test ./...
+            go vet ./...
+            ./build-lmod.sh
+            cp dist/always-online.lmod /tmp/always-online-first.lmod
+            ./build-lmod.sh
+            cmp /tmp/always-online-first.lmod dist/always-online.lmod
+          '
+          python3 - <<'PY'
+          import zipfile
+          with zipfile.ZipFile('modules/always-online/dist/always-online.lmod') as archive:
+              assert archive.namelist() == ['module.json', 'always-online']
+              assert all(item.compress_type == zipfile.ZIP_STORED for item in archive.infolist())
+              modes = {item.filename: (item.external_attr >> 16) & 0o777 for item in archive.infolist()}
+              assert modes == {'module.json': 0o600, 'always-online': 0o700}, modes
+          PY
+
+      - name: Validate built Always Online manifest
+        run: nix develop -c cargo run --quiet -- modules validate modules/always-online/build/module.json
 
       - name: Check formatting
         run: nix develop -c cargo fmt --check
@@ -54,3 +92,32 @@ jobs:
 
       - name: Build package
         run: nix build --print-build-logs
+
+      - name: Collect failure diagnostics
+        if: ${{ failure() }}
+        run: |
+          mkdir -p ci-diagnostics
+          {
+            echo '== git status =='
+            git status --short
+            echo
+            echo '== disk usage =='
+            df -h .
+            echo
+            echo '== Nix version =='
+            nix --version
+            echo
+            echo '== module build metadata =='
+            sha256sum modules/gaf/module.json modules/always-online/module.json
+            find modules/gaf modules/always-online -maxdepth 2 -type f \( -name '*.lmod' -o -name 'module.json' \) -printf '%p %s bytes\n'
+          } > ci-diagnostics/summary.txt
+
+      - name: Upload failure diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-failure-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-diagnostics/
+          if-no-files-found: ignore
+          retention-days: 3
+          compression-level: 9

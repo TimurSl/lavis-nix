@@ -33,13 +33,14 @@ type Message struct {
 // FloodWait retry metadata when the core supplies it.
 type TelegramError struct {
 	Kind              string `json:"kind"`
-	Code              string `json:"code,omitempty"`
+	Code              *int64 `json:"code,omitempty"`
 	Name              string `json:"name,omitempty"`
 	Message           string `json:"message,omitempty"`
 	RetryAfterSeconds int64  `json:"retry_after_seconds,omitempty"`
 }
 
 type TelegramResult struct {
+	RequestID string
 	CallID string
 	OK     bool
 	Result json.RawMessage
@@ -50,8 +51,8 @@ func parseTelegramResult(message Message) (TelegramResult, error) {
 	if message.Type != "telegram.result" {
 		return TelegramResult{}, fmt.Errorf("not a telegram.result message")
 	}
-	if message.CallID == "" {
-		return TelegramResult{}, fmt.Errorf("telegram.result missing call_id")
+	if message.RequestID == "" || message.CallID == "" {
+		return TelegramResult{}, fmt.Errorf("telegram.result missing request_id or call_id")
 	}
 	if message.OK == nil {
 		return TelegramResult{}, fmt.Errorf("telegram.result missing ok")
@@ -63,6 +64,7 @@ func parseTelegramResult(message Message) (TelegramResult, error) {
 		return TelegramResult{}, fmt.Errorf("failed telegram.result missing error")
 	}
 	return TelegramResult{
+		RequestID: message.RequestID,
 		CallID: message.CallID,
 		OK:     *message.OK,
 		Result: message.Result,

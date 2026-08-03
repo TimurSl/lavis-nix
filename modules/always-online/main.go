@@ -166,7 +166,7 @@ func (m *Module) handleTelegramResult(message Message) []Message {
 	if err != nil {
 		return m.finishMalformedResult()
 	}
-	if m.pending == nil || result.CallID != m.pending.callID {
+	if m.pending == nil || result.RequestID != m.pending.requestID || result.CallID != m.pending.callID {
 		return m.finishMalformedResult()
 	}
 	requestID := m.pending.requestID
@@ -203,9 +203,8 @@ func retryDelay(problem *TelegramError) int64 {
 		return problem.RetryAfterSeconds
 	}
 	kind := strings.ToUpper(problem.Kind)
-	code := strings.ToUpper(problem.Code)
 	name := strings.ToUpper(problem.Name)
-	if strings.Contains(kind, "FLOOD") || strings.Contains(kind, "TEMPORARY") || strings.Contains(kind, "TIMEOUT") || strings.Contains(code, "FLOOD") || strings.Contains(name, "FLOOD") {
+	if strings.Contains(kind, "FLOOD") || strings.Contains(kind, "TEMPORARY") || strings.Contains(kind, "TIMEOUT") || strings.Contains(name, "FLOOD") {
 		return defaultBackoff
 	}
 	return defaultBackoff

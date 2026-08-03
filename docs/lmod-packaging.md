@@ -40,6 +40,10 @@ Validate before packaging:
 lavis modules validate ./my-module/module.json
 ```
 
+The archive may contain a schema 2, 3, 4, or 5 manifest. Package the selected
+schema unchanged; V5 timer and Telegram-gateway fields are documented in
+[Module API v5](module-api-v5.md).
+
 ## Create a compatible archive
 
 Lavis currently accepts only unencrypted ZIP entries using method 0 (**stored**, no compression).

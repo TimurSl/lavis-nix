@@ -48,7 +48,7 @@ func TestTimerWireWaitsForResultBeforeTerminalEventResult(t *testing.T) {
 	if string(envelope["request_id"]) != `"42"` || string(envelope["call_id"]) != `"online_1"` || string(envelope["params"]) != `{"offline":false}` {
 		t.Fatalf("wire: %s", wire)
 	}
-	terminal := m.handleTelegramResult(Message{Type: "telegram.result", CallID: invoke.CallID, OK: boolPtr(true)})
+	terminal := m.handleTelegramResult(Message{Type: "telegram.result", RequestID: "42", CallID: invoke.CallID, OK: boolPtr(true)})
 	if len(terminal) != 1 || terminal[0].Type != "event_result" || terminal[0].RequestID != "42" || m.pending != nil {
 		t.Fatalf("terminal: %#v pending=%#v", terminal, m.pending)
 	}
@@ -89,7 +89,7 @@ func TestOnlineCommandsAndIntervalGating(t *testing.T) {
 	if len(m.handleEvent(timerRequest("1", "first"))) != 1 || m.pending == nil {
 		t.Fatal("first tick must invoke")
 	}
-	m.handleTelegramResult(Message{Type: "telegram.result", CallID: "online_1", OK: boolPtr(true)})
+	m.handleTelegramResult(Message{Type: "telegram.result", RequestID: "1", CallID: "online_1", OK: boolPtr(true)})
 	m.now = func() time.Time { return time.Unix(1030, 0) }
 	if responses := m.handleEvent(timerRequest("2", "second")); len(responses) != 1 || responses[0].Type != "event_result" {
 		t.Fatalf("interval must gate second tick: %#v", responses)
@@ -140,7 +140,7 @@ func TestStatePersistsUnderModuleStateDirectory(t *testing.T) {
 func TestFloodWaitAndMalformedResultBackOffAndFinish(t *testing.T) {
 	m := testModule(t)
 	invoke := m.handleEvent(timerRequest("1", "tick"))[0]
-	terminal := m.handleTelegramResult(Message{Type: "telegram.result", CallID: invoke.CallID, OK: boolPtr(false), Error: &TelegramError{Kind: "flood_wait", RetryAfterSeconds: 120, Message: "wait"}})
+	terminal := m.handleTelegramResult(Message{Type: "telegram.result", RequestID: "1", CallID: invoke.CallID, OK: boolPtr(false), Error: &TelegramError{Kind: "flood_wait", RetryAfterSeconds: 120, Message: "wait"}})
 	if len(terminal) != 1 || m.state.BackoffUntil != 1120 || m.pending != nil {
 		t.Fatalf("terminal=%#v state=%#v pending=%#v", terminal, m.state, m.pending)
 	}
@@ -148,17 +148,50 @@ func TestFloodWaitAndMalformedResultBackOffAndFinish(t *testing.T) {
 	m.state.LastInvokeAt = 0
 	m.now = func() time.Time { return time.Unix(2000, 0) }
 	m.handleEvent(timerRequest("2", "tick-2"))
-	terminal = m.handleTelegramResult(Message{Type: "telegram.result", CallID: "online_2"})
+	terminal = m.handleTelegramResult(Message{Type: "telegram.result", RequestID: "2", CallID: "online_2"})
 	if len(terminal) != 1 || m.state.BackoffUntil != 2060 || m.pending != nil {
 		t.Fatalf("malformed terminal=%#v state=%#v pending=%#v", terminal, m.state, m.pending)
 	}
 }
 
+func TestCoreTelegramResultGoldenEnvelopes(t *testing.T) {
+	var success Message
+	if err := json.Unmarshal([]byte(`{"protocol_version":5,"type":"telegram.result","request_id":"42","call_id":"online_1","ok":true,"result":true}`), &success); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := parseTelegramResult(success)
+	if err != nil || !parsed.OK || parsed.RequestID != "42" || parsed.CallID != "online_1" || string(parsed.Result) != "true" {
+		t.Fatalf("success=%#v err=%v", parsed, err)
+	}
+
+	var rpcError Message
+	if err := json.Unmarshal([]byte(`{"protocol_version":5,"type":"telegram.result","request_id":"43","call_id":"online_1","ok":false,"error":{"kind":"rpc","code":420,"name":"FLOOD_WAIT","message":"FLOOD_WAIT","retry_after_seconds":7}}`), &rpcError); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err = parseTelegramResult(rpcError)
+	if err != nil || parsed.OK || parsed.Error == nil || parsed.Error.Code == nil || *parsed.Error.Code != 420 || parsed.Error.Name != "FLOOD_WAIT" {
+		t.Fatalf("rpc error=%#v err=%v", parsed, err)
+	}
+}
+
+func TestCoreRPCErrorMatchesBothIDsAndBacksOff(t *testing.T) {
+	m := testModule(t)
+	invoke := m.handleEvent(timerRequest("42", "tick"))[0]
+	var rpcError Message
+	if err := json.Unmarshal([]byte(`{"protocol_version":5,"type":"telegram.result","request_id":"42","call_id":"online_1","ok":false,"error":{"kind":"rpc","code":420,"name":"FLOOD_WAIT","message":"FLOOD_WAIT","retry_after_seconds":7}}`), &rpcError); err != nil {
+		t.Fatal(err)
+	}
+	terminal := m.handleTelegramResult(rpcError)
+	if len(terminal) != 1 || terminal[0].RequestID != invoke.RequestID || m.pending != nil || m.state.BackoffUntil != 1007 {
+		t.Fatalf("terminal=%#v pending=%#v state=%#v", terminal, m.pending, m.state)
+	}
+}
+
 func TestTelegramResultRequiresStructuredError(t *testing.T) {
-	if _, err := parseTelegramResult(Message{Type: "telegram.result", CallID: "call_1", OK: boolPtr(false)}); err == nil {
+	if _, err := parseTelegramResult(Message{Type: "telegram.result", RequestID: "1", CallID: "call_1", OK: boolPtr(false)}); err == nil {
 		t.Fatal("failed result without structured error must be rejected")
 	}
-	if _, err := parseTelegramResult(Message{Type: "telegram.result", CallID: "call_1", OK: boolPtr(true), Error: &TelegramError{Kind: "timeout", Message: "bad"}}); err == nil {
+	if _, err := parseTelegramResult(Message{Type: "telegram.result", RequestID: "1", CallID: "call_1", OK: boolPtr(true), Error: &TelegramError{Kind: "timeout", Message: "bad"}}); err == nil {
 		t.Fatal("successful result with error must be rejected")
 	}
 }
