@@ -65,10 +65,10 @@ func parseTelegramResult(message Message) (TelegramResult, error) {
 	}
 	return TelegramResult{
 		RequestID: message.RequestID,
-		CallID: message.CallID,
-		OK:     *message.OK,
-		Result: message.Result,
-		Error:  message.Error,
+		CallID:    message.CallID,
+		OK:        *message.OK,
+		Result:    message.Result,
+		Error:     message.Error,
 	}, nil
 }
 

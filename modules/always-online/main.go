@@ -20,10 +20,10 @@ const (
 )
 
 type State struct {
-	Enabled      bool  `json:"enabled"`
-	Interval     int64 `json:"interval_seconds"`
-	BackoffUntil int64 `json:"backoff_until,omitempty"`
-	LastInvokeAt int64 `json:"last_invoke_at,omitempty"`
+	Enabled      bool   `json:"enabled"`
+	Interval     int64  `json:"interval_seconds"`
+	BackoffUntil int64  `json:"backoff_until,omitempty"`
+	LastInvokeAt int64  `json:"last_invoke_at,omitempty"`
 	NextCallID   uint64 `json:"next_call_id"`
 }
 
@@ -77,9 +77,9 @@ func loadModule() (*Module, error) {
 		return nil, errors.New("LAVIS_MODULE_STATE_DIR is required")
 	}
 	m := &Module{
-		path:    filepath.Join(directory, "state.json"),
-		state:   defaultState(),
-		now:     time.Now,
+		path:  filepath.Join(directory, "state.json"),
+		state: defaultState(),
+		now:   time.Now,
 	}
 	data, err := os.ReadFile(m.path)
 	if errors.Is(err, os.ErrNotExist) {
