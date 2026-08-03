@@ -62,6 +62,7 @@ jobs:
             if [ -n "$unformatted" ]; then
               printf "%s\n" "Always Online files requiring gofmt:" >&2
               printf "%s\n" "$unformatted" >&2
+              gofmt -d modules/always-online/*.go >&2
               exit 1
             fi
             cd modules/always-online
