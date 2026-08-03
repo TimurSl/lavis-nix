@@ -65,6 +65,7 @@ impl Drop for TelegramClientGuard {
     }
 }
 
+use crate::error::AuthError;
 use crate::error::ClientError;
 
 pub async fn run() -> anyhow::Result<()> {
@@ -382,9 +383,22 @@ fn restart_current_process() -> anyhow::Result<()> {
 }
 
 fn authorization_failure(error: anyhow::Error, newly_saved: bool) -> anyhow::Error {
-    if newly_saved {
+    let noninteractive = error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<AuthError>(),
+            Some(AuthError::NonInteractive)
+        )
+    });
+    let error = if newly_saved {
         error.context(
             "new credentials were saved; if they are incorrect, run `lavis credentials reset`",
+        )
+    } else {
+        error
+    };
+    if noninteractive {
+        error.context(
+            "authorize Telegram first with `lavis auth` in an interactive terminal; on NixOS, run `sudo lavis-auth` before starting lavis.service",
         )
     } else {
         error
@@ -857,6 +871,21 @@ mod tests {
 
         assert!(new.to_string().contains("lavis credentials reset"));
         assert!(!existing.to_string().contains("lavis credentials reset"));
+    }
+
+    #[test]
+    fn authorization_failure_explains_noninteractive_service_recovery() {
+        let error = authorization_failure(
+            anyhow::Error::new(crate::error::AuthError::NonInteractive)
+                .context("Telegram authorization failed"),
+            false,
+        );
+
+        assert!(error.to_string().contains("sudo lavis-auth"));
+        assert!(
+            error.chain().any(|cause| cause.to_string()
+                == "Telegram authorization requires an interactive terminal")
+        );
     }
 
     #[test]
