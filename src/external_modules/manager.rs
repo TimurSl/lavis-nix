@@ -363,12 +363,15 @@ impl ExternalManagerHandle {
     pub async fn startup_enabled(&self, enabled_ids: &std::collections::BTreeSet<String>) {
         let (descriptors, gateway) = {
             let manager = self.inner.lock().await;
-            (manager
-                .descriptors
-                .iter()
-                .filter(|descriptor| enabled_ids.contains(&descriptor.id))
-                .cloned()
-                .collect::<Vec<_>>(), manager.gateway.clone())
+            (
+                manager
+                    .descriptors
+                    .iter()
+                    .filter(|descriptor| enabled_ids.contains(&descriptor.id))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                manager.gateway.clone(),
+            )
         };
         for descriptor in descriptors {
             let id = descriptor.id.clone();
@@ -430,8 +433,14 @@ impl ExternalManagerHandle {
         }
     }
 
-    async fn start_timers(&self, module_id: String, timers: Vec<super::manifest::TimerSubscription>) {
-        if timers.is_empty() { return; }
+    async fn start_timers(
+        &self,
+        module_id: String,
+        timers: Vec<super::manifest::TimerSubscription>,
+    ) {
+        if timers.is_empty() {
+            return;
+        }
         let mut tasks = Vec::with_capacity(timers.len());
         for timer in timers {
             let manager = Arc::downgrade(&self.inner);
@@ -629,7 +638,6 @@ mod tests {
             manifest::{ExternalCapability, TimerSubscription},
             process::ModuleProcess,
         };
-        use tokio::sync::Mutex;
         use std::{
             fs,
             os::unix::fs::PermissionsExt,
@@ -637,6 +645,7 @@ mod tests {
             sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
             time::{Duration, SystemTime, UNIX_EPOCH},
         };
+        use tokio::sync::Mutex;
 
         static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
@@ -659,11 +668,16 @@ for line in sys.stdin:
         sys.exit(0)
 "#;
 
-        async fn timer_fixture(fail: bool) -> (String, Arc<Mutex<ModuleProcess>>, PathBuf, PathBuf) {
+        async fn timer_fixture(
+            fail: bool,
+        ) -> (String, Arc<Mutex<ModuleProcess>>, PathBuf, PathBuf) {
             let nonce = format!(
                 "{}-{}-{}",
                 std::process::id(),
-                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
                 NEXT_FIXTURE.fetch_add(1, AtomicOrdering::Relaxed)
             );
             let directory = std::env::temp_dir().join(format!("lavis-manager-timer-{nonce}"));
@@ -680,12 +694,19 @@ for line in sys.stdin:
                 .find(|path| path.is_file())
                 .expect("fixture tests require python3");
             let script = TIMER_MODULE
-                .replacen("#!/usr/bin/env python3", &format!("#!{}", python.display()), 1)
+                .replacen(
+                    "#!/usr/bin/env python3",
+                    &format!("#!{}", python.display()),
+                    1,
+                )
                 .replace("__MARKER__", &format!("{:?}", marker))
                 .replace("__FAIL__", if fail { "True" } else { "False" });
             fs::write(&entrypoint, script).unwrap();
             fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700)).unwrap();
-            let id = format!("timer{}", NEXT_FIXTURE.fetch_add(1, AtomicOrdering::Relaxed));
+            let id = format!(
+                "timer{}",
+                NEXT_FIXTURE.fetch_add(1, AtomicOrdering::Relaxed)
+            );
             let descriptor = ExternalModuleDescriptor {
                 protocol_version: 5,
                 id: id.clone(),
@@ -697,7 +718,9 @@ for line in sys.stdin:
                 capabilities: vec![ExternalCapability::Timer],
                 default_command: None,
                 subscriptions: vec![],
-                timer_subscriptions: vec![TimerSubscription { interval_seconds: 1 }],
+                timer_subscriptions: vec![TimerSubscription {
+                    interval_seconds: 1,
+                }],
                 actions: vec![],
                 commands: vec![],
             };
@@ -719,7 +742,12 @@ for line in sys.stdin:
             let handle = ExternalManagerHandle::new(ExternalManager::new());
             install_timer_process(&handle, id.clone(), process).await;
             handle
-                .start_timers(id, vec![TimerSubscription { interval_seconds: 1 }])
+                .start_timers(
+                    id,
+                    vec![TimerSubscription {
+                        interval_seconds: 1,
+                    }],
+                )
                 .await;
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert!(!marker.exists());
@@ -736,7 +764,12 @@ for line in sys.stdin:
             install_timer_process(&handle, id.clone(), Arc::clone(&process)).await;
             let busy = process.lock().await;
             handle
-                .start_timers(id.clone(), vec![TimerSubscription { interval_seconds: 1 }])
+                .start_timers(
+                    id.clone(),
+                    vec![TimerSubscription {
+                        interval_seconds: 1,
+                    }],
+                )
                 .await;
             tokio::time::sleep(Duration::from_millis(1100)).await;
             assert!(!marker.exists());
@@ -750,7 +783,12 @@ for line in sys.stdin:
             let handle = ExternalManagerHandle::new(ExternalManager::new());
             install_timer_process(&handle, id.clone(), process).await;
             handle
-                .start_timers(id.clone(), vec![TimerSubscription { interval_seconds: 1 }])
+                .start_timers(
+                    id.clone(),
+                    vec![TimerSubscription {
+                        interval_seconds: 1,
+                    }],
+                )
                 .await;
             tokio::time::sleep(Duration::from_millis(1200)).await;
             assert!(handle.lock().await.timer_tasks[&id][0].is_finished());
@@ -764,10 +802,20 @@ for line in sys.stdin:
             let handle = ExternalManagerHandle::new(ExternalManager::new());
             install_timer_process(&handle, id.clone(), process).await;
             handle
-                .start_timers(id.clone(), vec![TimerSubscription { interval_seconds: 1 }])
+                .start_timers(
+                    id.clone(),
+                    vec![TimerSubscription {
+                        interval_seconds: 1,
+                    }],
+                )
                 .await;
             handle
-                .start_timers(id.clone(), vec![TimerSubscription { interval_seconds: 1 }])
+                .start_timers(
+                    id.clone(),
+                    vec![TimerSubscription {
+                        interval_seconds: 1,
+                    }],
+                )
                 .await;
             assert_eq!(handle.lock().await.timer_tasks[&id].len(), 1);
             handle.shutdown_all().await;

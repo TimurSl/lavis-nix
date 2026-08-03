@@ -1,5 +1,5 @@
 use super::{
-    gateway::{GatewayContext, TelegramGateway, TELEGRAM_CALL_TIMEOUT},
+    gateway::{GatewayContext, TELEGRAM_CALL_TIMEOUT, TelegramGateway},
     manifest::{ExternalCapability, ExternalModuleDescriptor},
     protocol::{
         self, CoreMessage, MAX_LINE_BYTES, MAX_RESULT_BYTES, MessageEvent, MessageEventKind,
@@ -295,7 +295,10 @@ impl ModuleProcess {
             return Err(self.fail_and_terminate(error).await);
         }
         let reply = match self
-            .collect_reply_until(&request_id, request_deadline(self.descriptor.protocol_version))
+            .collect_reply_until(
+                &request_id,
+                request_deadline(self.descriptor.protocol_version),
+            )
             .await
         {
             Ok(reply) => reply,
@@ -335,7 +338,10 @@ impl ModuleProcess {
             return Err(self.fail_and_terminate(error).await);
         }
         let reply = match self
-            .collect_reply_until(&request_id, request_deadline(self.descriptor.protocol_version))
+            .collect_reply_until(
+                &request_id,
+                request_deadline(self.descriptor.protocol_version),
+            )
             .await
         {
             Ok(reply) => reply,
@@ -382,8 +388,7 @@ impl ModuleProcess {
                         self.telegram_invoke_parent.as_deref(),
                         expected_id,
                         &request_id,
-                    )
-                        || !self.active_call_ids.insert(call_id.clone())
+                    ) || !self.active_call_ids.insert(call_id.clone())
                     {
                         return Err(ExternalError::ProtocolDecode);
                     }
@@ -393,7 +398,10 @@ impl ModuleProcess {
                         .capabilities
                         .contains(&ExternalCapability::TelegramInvoke)
                     {
-                        Err(telegram_error("capability", "telegram.invoke capability is required"))
+                        Err(telegram_error(
+                            "capability",
+                            "telegram.invoke capability is required",
+                        ))
                     } else if let Some(gateway) = &self.gateway {
                         let context = GatewayContext {
                             module_id: self.descriptor.id.clone(),
@@ -412,10 +420,9 @@ impl ModuleProcess {
                             .await
                             {
                                 Ok(result) => result,
-                                Err(_) => Err(telegram_error(
-                                    "timeout",
-                                    "Telegram request timed out",
-                                )),
+                                Err(_) => {
+                                    Err(telegram_error("timeout", "Telegram request timed out"))
+                                }
                             }
                         }
                     } else {
@@ -428,10 +435,8 @@ impl ModuleProcess {
                         result,
                     })
                     .await?;
-                    read_deadline = std::cmp::min(
-                        parent_deadline,
-                        Instant::now() + TERMINAL_REPLY_TIMEOUT,
-                    );
+                    read_deadline =
+                        std::cmp::min(parent_deadline, Instant::now() + TERMINAL_REPLY_TIMEOUT);
                     continue;
                 }
                 ModuleMessage::Result { ref request_id, .. }
@@ -739,10 +744,7 @@ mod deadline_tests {
         let nested_budget =
             TELEGRAM_CALL_TIMEOUT + TELEGRAM_RESULT_WRITE_RESERVE + TERMINAL_REPLY_TIMEOUT;
         assert!(PARENT_REQUEST_TIMEOUT > nested_budget);
-        assert!(has_nested_call_budget(
-            now + nested_budget,
-            now
-        ));
+        assert!(has_nested_call_budget(now + nested_budget, now));
         assert!(!has_nested_call_budget(
             now + nested_budget - Duration::from_millis(1),
             now
@@ -760,7 +762,13 @@ mod deadline_tests {
     #[test]
     fn invoke_is_bound_to_its_parent_and_limited_to_one_total_call() {
         assert!(allows_telegram_invoke(5, Some("10"), None, "10", "10"));
-        assert!(!allows_telegram_invoke(5, Some("10"), Some("10"), "10", "10"));
+        assert!(!allows_telegram_invoke(
+            5,
+            Some("10"),
+            Some("10"),
+            "10",
+            "10"
+        ));
         assert!(!allows_telegram_invoke(5, Some("10"), None, "10", "11"));
         assert!(!allows_telegram_invoke(4, Some("10"), None, "10", "10"));
         assert!(!allows_telegram_invoke(5, None, None, "10", "10"));
@@ -1214,7 +1222,12 @@ for line in sys.stdin:
             _method: &'a str,
             _params: serde_json::Value,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<serde_json::Value, protocol::TelegramCallError>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<
+                        Output = Result<serde_json::Value, protocol::TelegramCallError>,
+                    > + Send
+                    + 'a,
+            >,
         > {
             self.contexts.lock().unwrap().push(context);
             Box::pin(std::future::ready(self.result.clone()))
@@ -1230,7 +1243,12 @@ for line in sys.stdin:
             _method: &'a str,
             _params: serde_json::Value,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<serde_json::Value, protocol::TelegramCallError>> + Send + 'a>,
+            Box<
+                dyn std::future::Future<
+                        Output = Result<serde_json::Value, protocol::TelegramCallError>,
+                    > + Send
+                    + 'a,
+            >,
         > {
             Box::pin(std::future::pending())
         }
@@ -1315,9 +1333,10 @@ for line in sys.stdin:
         let (mut descriptor, directory) = create_fixture_module(V5_INVOKE_MODULE_PY, "v5-timeout");
         descriptor.protocol_version = 5;
         descriptor.capabilities = vec![ExternalCapability::TelegramInvoke];
-        let mut process = ModuleProcess::start_with_gateway(descriptor, Some(Arc::new(HangingGateway)))
-            .await
-            .unwrap();
+        let mut process =
+            ModuleProcess::start_with_gateway(descriptor, Some(Arc::new(HangingGateway)))
+                .await
+                .unwrap();
         let text = process.execute("run", "").await.unwrap();
         let envelope: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(envelope["ok"], false);

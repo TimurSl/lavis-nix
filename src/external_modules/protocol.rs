@@ -434,7 +434,10 @@ pub fn parse_module_line_for(
                 return Err(ExternalError::ProtocolDecode);
             }
             let method = get_string(&value, "method")?;
-            let params = value.get("params").cloned().ok_or(ExternalError::ProtocolDecode)?;
+            let params = value
+                .get("params")
+                .cloned()
+                .ok_or(ExternalError::ProtocolDecode)?;
             Ok(Some(ModuleMessage::TelegramInvoke {
                 request_id,
                 call_id,

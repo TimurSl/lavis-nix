@@ -780,10 +780,16 @@ mod tests {
         json["subscriptions"] = serde_json::json!([{"type":"timer.tick", "interval_seconds": MIN_TIMER_INTERVAL_SECONDS}]);
         let path = write_manifest(&dir, &serde_json::to_vec(&json).unwrap());
         let descriptor = validate_manifest_at(&path, Some("echo")).unwrap();
-        assert_eq!(descriptor.timer_subscriptions[0].interval_seconds, MIN_TIMER_INTERVAL_SECONDS);
+        assert_eq!(
+            descriptor.timer_subscriptions[0].interval_seconds,
+            MIN_TIMER_INTERVAL_SECONDS
+        );
         json["schema_version"] = serde_json::json!(4);
         fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
-        assert!(matches!(validate_manifest_at(&path, Some("echo")), Err(ExternalError::UnsupportedSchemaVersion)));
+        assert!(matches!(
+            validate_manifest_at(&path, Some("echo")),
+            Err(ExternalError::UnsupportedSchemaVersion)
+        ));
         fs::remove_dir_all(&base).unwrap();
     }
 

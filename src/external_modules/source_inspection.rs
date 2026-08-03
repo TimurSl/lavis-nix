@@ -1273,7 +1273,12 @@ mod tests {
             &mut random,
         )
         .unwrap();
-        assert!(pending.plan.capabilities.contains(&"telegram.invoke".to_owned()));
+        assert!(
+            pending
+                .plan
+                .capabilities
+                .contains(&"telegram.invoke".to_owned())
+        );
         assert_eq!(
             pending.plan.timer_subscriptions,
             vec![TimerSubscriptionPlan {
