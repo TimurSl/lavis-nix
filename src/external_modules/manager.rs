@@ -466,7 +466,7 @@ impl ExternalManagerHandle {
         let replaced = {
             let mut manager = self.inner.lock().await;
             if manager.processes.contains_key(&module_id) {
-                manager.timer_tasks.insert(module_id, tasks)
+                manager.timer_tasks.insert(module_id.clone(), tasks)
             } else {
                 Some(tasks)
             }
