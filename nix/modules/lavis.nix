@@ -15,6 +15,7 @@ let
     mkIf
     mkOption
     optional
+    optionalString
     types
     ;
 
@@ -22,18 +23,29 @@ let
   system = pkgs.stdenv.hostPlatform.system;
   extensionLib = import ../lib/extensions.nix { inherit pkgs; };
 
+  serviceUser = cfg.user;
+  createsDefaultUser = serviceUser == "lavis";
+
   declaredUser =
-    if cfg.user != null && builtins.hasAttr cfg.user config.users.users then
+    if builtins.hasAttr serviceUser config.users.users then
       config.users.users.${cfg.user}
     else
       null;
   declaredUserGroup = if declaredUser != null then declaredUser.group else null;
-  effectiveGroup = if cfg.group != null then cfg.group else declaredUserGroup;
+  serviceGroup =
+    if cfg.group != null then
+      cfg.group
+    else if createsDefaultUser then
+      "lavis"
+    else
+      declaredUserGroup;
   declaredUserHome =
     if declaredUser != null then declaredUser.home else null;
   effectiveHome =
     if cfg.home != null then
       cfg.home
+    else if createsDefaultUser then
+      "/var/lib/lavis"
     else if declaredUserHome != null then
       declaredUserHome
     else
@@ -215,6 +227,104 @@ PY
       ${lib.escapeShellArg declarativeIdsJson} \
       ${lib.escapeShellArg enabledIdsJson}
   '';
+
+  authSetupScript = pkgs.writeShellScript "lavis-auth-setup" ''
+    set -euo pipefail
+
+    ${optionalString createsDefaultUser ''
+    ${pkgs.coreutils}/bin/mkdir -p \
+      ${lib.escapeShellArg effectiveHome}
+
+    ${pkgs.coreutils}/bin/chmod 700 \
+      ${lib.escapeShellArg effectiveHome}
+    ''}
+
+    ${pkgs.coreutils}/bin/mkdir -p \
+      ${lib.escapeShellArg lavisConfigDir} \
+      ${lib.escapeShellArg lavisStateDir} \
+      ${lib.escapeShellArg lavisDataDir}
+
+    ${pkgs.coreutils}/bin/chmod 700 \
+      ${lib.escapeShellArg lavisConfigDir} \
+      ${lib.escapeShellArg lavisStateDir} \
+      ${lib.escapeShellArg lavisDataDir}
+
+    exec ${cfg.package}/bin/lavis auth
+  '';
+
+  authScript = pkgs.writeShellScriptBin "lavis-auth" ''
+    set -euo pipefail
+
+    if [ "$(${pkgs.coreutils}/bin/id -u)" != 0 ]; then
+      echo "lavis-auth must be run as root so it can read the service credential file and switch to ${serviceUser}." >&2
+      exit 1
+    fi
+
+    credential_env=()
+    ${optionalString (cfg.credentialsEnvironmentFile != null) ''
+      credential_output="$(${pkgs.python3}/bin/python3 - ${lib.escapeShellArg cfg.credentialsEnvironmentFile} <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+allowed = {"LAVIS_API_ID", "LAVIS_API_HASH"}
+values = {}
+line_re = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^#\s]+)\s*(?:#.*)?$")
+
+with open(path, "r", encoding="utf-8") as handle:
+    for number, line in enumerate(handle, 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = line_re.match(line)
+        if match is None or match.group(1) not in allowed:
+            raise SystemExit(f"{path}:{number}: expected literal LAVIS_API_ID=... or LAVIS_API_HASH=...")
+        key, value = match.groups()
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+            raise SystemExit(f"{path}:{number}: invalid control character")
+        values[key] = value
+
+api_id = values.get("LAVIS_API_ID")
+api_hash = values.get("LAVIS_API_HASH")
+if (api_id is None) != (api_hash is None):
+    raise SystemExit(f"{path}: LAVIS_API_ID and LAVIS_API_HASH must be set together")
+if api_id is not None:
+    if not api_id.isdigit():
+        raise SystemExit(f"{path}: LAVIS_API_ID must be decimal digits")
+    if re.fullmatch(r"[A-Fa-f0-9]{32}", api_hash) is None:
+        raise SystemExit(f"{path}: LAVIS_API_HASH must be 32 hexadecimal characters")
+    print(f"LAVIS_API_ID={api_id}")
+    print(f"LAVIS_API_HASH={api_hash}")
+PY
+      )"
+      if [ -n "$credential_output" ]; then
+        mapfile -t credential_env <<< "$credential_output"
+      fi
+    ''}
+
+    ${optionalString createsDefaultUser ''
+      ${pkgs.coreutils}/bin/install -d -m 700 -o ${lib.escapeShellArg serviceUser} -g ${lib.escapeShellArg serviceGroup} \
+        ${lib.escapeShellArg effectiveHome}
+    ''}
+
+    lavis_env=(
+      ${lib.escapeShellArg "HOME=${effectiveHome}"}
+      ${lib.escapeShellArg "XDG_CONFIG_HOME=${configHome}"}
+      ${lib.escapeShellArg "XDG_STATE_HOME=${stateHome}"}
+      ${lib.escapeShellArg "XDG_DATA_HOME=${dataHome}"}
+      ${lib.escapeShellArg "RUST_LOG=${cfg.logLevel}"}
+      "''${credential_env[@]}"
+    )
+
+    exec ${pkgs.util-linux}/bin/runuser \
+      --user ${lib.escapeShellArg serviceUser} \
+      --group ${lib.escapeShellArg serviceGroup} \
+      -- \
+      ${pkgs.coreutils}/bin/env \
+        -i \
+        "''${lavis_env[@]}" \
+        ${authSetupScript}
+  '';
 in
 {
   options.services.lavis = {
@@ -228,24 +338,24 @@ in
     };
 
     user = mkOption {
-      type = types.nullOr types.str;
-      default = null;
-      description = "Existing Unix user that owns and runs Lavis.";
-      example = "melvi";
+      type = types.str;
+      default = "lavis";
+      description = "Unix user that owns and runs Lavis. The default creates a dedicated system user.";
+      example = "lavis";
     };
 
     group = mkOption {
       type = types.nullOr types.str;
       default = null;
-      description = "Existing Unix group for Lavis files. Defaults to the declared primary group of services.lavis.user.";
-      example = "users";
+      description = "Unix group for Lavis files. Defaults to the declared primary group of services.lavis.user or to the dedicated lavis group.";
+      example = "lavis";
     };
 
     home = mkOption {
       type = types.nullOr types.str;
       default = null;
-      description = "Home directory used to derive Lavis XDG paths. Defaults to the configured user's home.";
-      example = "/home/melvi";
+      description = "Home directory used to derive Lavis XDG paths. Defaults to the configured user's home or /var/lib/lavis.";
+      example = "/var/lib/lavis";
     };
 
     autoStart = mkOption {
@@ -308,15 +418,11 @@ in
     assertions =
       [
         {
-          assertion = cfg.user != null;
-          message = "services.lavis.user must be set to an existing Unix user.";
-        }
-        {
-          assertion = cfg.home != null || declaredUserHome != null;
+          assertion = cfg.home != null || createsDefaultUser || declaredUserHome != null;
           message = "services.lavis.home must be set when services.lavis.user has no declared home.";
         }
         {
-          assertion = effectiveGroup != null;
+          assertion = cfg.group != null || createsDefaultUser || declaredUserGroup != null;
           message = "services.lavis.group must be set when services.lavis.user has no declared primary group.";
         }
       ]
@@ -328,6 +434,26 @@ in
         assertion = ext.url == null || ext.hash != null;
         message = "services.lavis.extensions entry ${ext.id} with url must also set hash.";
       }) cfg.extensions;
+
+    users.groups = mkIf createsDefaultUser {
+      ${serviceGroup} = { };
+    };
+
+    users.users = mkIf createsDefaultUser {
+      ${serviceUser} = {
+        isSystemUser = true;
+        group = serviceGroup;
+        home = effectiveHome;
+        createHome = true;
+        homeMode = "0700";
+      };
+    };
+
+    systemd.tmpfiles.rules = optional createsDefaultUser (
+      "d ${effectiveHome} 0700 ${serviceUser} ${serviceGroup} - -"
+    );
+
+    environment.systemPackages = [ authScript ];
 
     systemd.services.lavis = {
       description = "Lavis Telegram userbot";
@@ -348,8 +474,8 @@ in
       serviceConfig = {
         Type = "simple";
         ExecStart = "${cfg.package}/bin/lavis run";
-        User = cfg.user;
-        Group = effectiveGroup;
+        User = serviceUser;
+        Group = serviceGroup;
         WorkingDirectory = effectiveHome;
         Restart = "on-failure";
         RestartSec = "5s";

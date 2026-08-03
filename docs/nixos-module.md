@@ -5,7 +5,7 @@ systemd service.
 
 The module is intentionally conservative:
 
-- it runs as an existing Unix user;
+- it creates a dedicated `lavis` system user by default;
 - it stores mutable data under that user's XDG directories;
 - it never writes Telegram credentials or sessions into the Nix store;
 - it installs external modules as real writable directories, not symlinks;
@@ -28,7 +28,9 @@ Add the Lavis flake input and import the module:
         {
           services.lavis = {
             enable = true;
-            user = "melvi";
+            # Keep the service stopped until the first interactive auth
+            # has created the Telegram session.
+            autoStart = false;
             credentialsEnvironmentFile = "/run/secrets/lavis.env";
           };
         }
@@ -38,8 +40,10 @@ Add the Lavis flake input and import the module:
 }
 ```
 
-The `user` must already exist. If the user is not declared in the same NixOS
-configuration, set `home` explicitly:
+This creates a system user/group named `lavis` and stores mutable state under
+`/var/lib/lavis`. To run as an existing account instead, set `user`. If that
+user is not declared in the same NixOS configuration, set `group` and `home`
+explicitly:
 
 ```nix
 services.lavis = {
@@ -50,8 +54,8 @@ services.lavis = {
 };
 ```
 
-By default the service starts at boot. Set `autoStart = false` to install the
-unit without adding it to `multi-user.target`.
+By default the service starts at boot. Keep `autoStart = false` for first-time
+authorization, then remove it or set it to `true` after `lavis-auth` succeeds.
 
 ## Credentials and first authorization
 
@@ -68,26 +72,37 @@ sops-nix, or another `/run/secrets/...` provider. Do not use `environment.etc`,
 inline Nix strings, or committed files for the API hash.
 
 Before starting the long-running service for the first time, authorize Telegram
-interactively as the same user:
+interactively with the helper installed by the module:
 
 ```bash
-sudo -u melvi \
-  XDG_CONFIG_HOME=/home/melvi/.config \
-  XDG_STATE_HOME=/home/melvi/.local/state \
-  XDG_DATA_HOME=/home/melvi/.local/share \
-  lavis auth
+sudo lavis-auth
 ```
 
-The service uses the same paths:
+`lavis-auth` parses only literal `LAVIS_API_ID` and `LAVIS_API_HASH` assignments
+from `credentialsEnvironmentFile` as root, switches to the service user, creates
+the Lavis XDG directories with private permissions, and runs `lavis auth` with
+the same environment as `lavis.service`.
+
+The default service uses these paths:
 
 ```text
-$HOME/.config/lavis/
-$HOME/.local/state/lavis/
-$HOME/.local/share/lavis/
+/var/lib/lavis/.config/lavis/
+/var/lib/lavis/.local/state/lavis/
+/var/lib/lavis/.local/share/lavis/
 ```
 
 The Telegram session remains mutable secret state under
 `$XDG_STATE_HOME/lavis/session`.
+
+On a fresh VPS, the usual sequence is:
+
+```bash
+nixos-rebuild test --flake .#host
+sudo lavis-auth
+sudo systemctl start lavis.service
+# Remove autoStart = false, or set autoStart = true.
+nixos-rebuild switch --flake .#host
+```
 
 ## Settings
 

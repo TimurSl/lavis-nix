@@ -90,6 +90,32 @@
             chmod 600 "$out/module.json"
             chmod 700 "$out/bin/fixture"
           '';
+          authFixture = pkgs.writeShellScriptBin "lavis" ''
+            test "$#" -eq 1
+            test "$1" = auth
+            printf '%s\n' "$HOME" > "$HOME/auth-home"
+            printf '%s:%s\n' "$LAVIS_API_ID" "$LAVIS_API_HASH" > "$HOME/auth-credentials"
+          '';
+          fakeRunuser = pkgs.writeShellScript "lavis-test-runuser" ''
+            set -euo pipefail
+            while [ "$#" -gt 0 ]; do
+              case "$1" in
+                --user|--group)
+                  shift 2
+                  ;;
+                --)
+                  shift
+                  exec "$@"
+                  ;;
+                *)
+                  echo "unexpected runuser argument: $1" >&2
+                  exit 1
+                  ;;
+              esac
+            done
+            echo "runuser command missing" >&2
+            exit 1
+          '';
           evaluated = nixpkgs.lib.nixosSystem {
             inherit system;
             modules = [
@@ -99,12 +125,13 @@
                 {
                   users.users.lavis-test = {
                     isNormalUser = true;
-                    home = "/build/lavis-test";
+                    home = "/build/lavis-test home";
                   };
                   services.lavis = {
                     enable = true;
+                    package = authFixture;
                     user = "lavis-test";
-                    credentialsEnvironmentFile = "/run/secrets/lavis.env";
+                    credentialsEnvironmentFile = "/build/lavis-test home/secrets/lavis.env";
                     settings.prefix = ".";
                     fastfetchProfile = {
                       version = 1;
@@ -122,33 +149,94 @@
               )
             ];
           };
+          defaultEvaluated = nixpkgs.lib.nixosSystem {
+            inherit system;
+            modules = [
+              self.nixosModules.default
+              (
+                { ... }:
+                {
+                  services.lavis = {
+                    enable = true;
+                    credentialsEnvironmentFile = "/run/secrets/lavis.env";
+                  };
+                }
+              )
+            ];
+          };
+          customAuthPackage = builtins.head (
+            builtins.filter
+              (package: (package.name or "") == "lavis-auth")
+              evaluated.config.environment.systemPackages
+          );
         in
         pkgs.runCommand "lavis-nixos-module-eval" {
           unit = evaluated.config.systemd.units."lavis.service".unit;
           preStartScript = evaluated.config.systemd.services.lavis.preStart;
+          authScript = "${customAuthPackage}/bin/lavis-auth";
+          defaultUnit = defaultEvaluated.config.systemd.units."lavis.service".unit;
+          existingTmpfiles = pkgs.writeText "lavis-existing-user-tmpfiles" (
+            nixpkgs.lib.concatStringsSep "\n" evaluated.config.systemd.tmpfiles.rules
+          );
+          defaultTmpfiles = pkgs.writeText "lavis-default-tmpfiles" (
+            nixpkgs.lib.concatStringsSep "\n" defaultEvaluated.config.systemd.tmpfiles.rules
+          );
         } ''
           grep -q 'User=lavis-test' "$unit/lavis.service"
           grep -q 'Group=users' "$unit/lavis.service"
           ! grep -q 'Group=lavis-test' "$unit/lavis.service"
-          grep -q 'EnvironmentFile=/run/secrets/lavis.env' "$unit/lavis.service"
-          grep -q 'XDG_STATE_HOME=/build/lavis-test/.local/state' "$unit/lavis.service"
-          grep -q 'mktemp -d -p /build/lavis-test/.local/share/lavis/module-staging' "$preStartScript"
+          grep -q 'EnvironmentFile=/build/lavis-test home/secrets/lavis.env' "$unit/lavis.service"
+          grep -q 'XDG_STATE_HOME=/build/lavis-test home/.local/state' "$unit/lavis.service"
+          grep -q "mktemp -d -p '/build/lavis-test home/.local/share/lavis/module-staging'" "$preStartScript"
+          grep -q 'runuser' "$authScript"
+          grep -q 'XDG_STATE_HOME=/build/lavis-test home/.local/state' "$authScript"
+          ! grep -q "XDG_STATE_HOME='/build/lavis-test home/.local/state'" "$authScript"
+          grep -q '/build/lavis-test home/secrets/lavis.env' "$authScript"
+          grep -q 'expected literal LAVIS_API_ID' "$authScript"
+          grep -q '32 hexadecimal characters' "$authScript"
+          ! grep -q 'install -d -m 700 -o lavis-test' "$authScript"
+          ! grep -q 'set -a' "$authScript"
+          ! grep -q '\. /run/secrets/lavis.env' "$authScript"
+          mkdir -p '/build/lavis-test home/secrets'
+          printf '%s\n' 'LAVIS_API_ID=not-digits' 'LAVIS_API_HASH=0123456789abcdef0123456789abcdef' > '/build/lavis-test home/secrets/lavis.env'
+          if ${pkgs.fakeroot}/bin/fakeroot "$authScript" 2>auth-invalid.log; then
+            echo "lavis-auth accepted invalid credentialsEnvironmentFile" >&2
+            exit 1
+          fi
+          grep -q 'LAVIS_API_ID must be decimal digits' auth-invalid.log
+          ! grep -q 'runuser' auth-invalid.log
+          ! grep -q 'lavis-test' auth-invalid.log
+          printf '%s\n' 'LAVIS_API_ID=123456789' 'LAVIS_API_HASH=0123456789abcdef0123456789abcdef' > '/build/lavis-test home/secrets/lavis.env'
+          cp "$authScript" auth-success
+          substituteInPlace auth-success --replace-fail '${pkgs.util-linux}/bin/runuser' '${fakeRunuser}'
+          ${pkgs.fakeroot}/bin/fakeroot ./auth-success
+          test -f '/build/lavis-test home/auth-home'
+          grep -qxF '/build/lavis-test home' '/build/lavis-test home/auth-home'
+          grep -qxF '123456789:0123456789abcdef0123456789abcdef' '/build/lavis-test home/auth-credentials'
+          test -d '/build/lavis-test home/.config/lavis'
+          test -d '/build/lavis-test home/.local/state/lavis'
+          test -d '/build/lavis-test home/.local/share/lavis'
+          ! grep -q 'd /build/lavis-test home 0700' "$existingTmpfiles"
+          grep -q 'User=lavis' "$defaultUnit/lavis.service"
+          grep -q 'Group=lavis' "$defaultUnit/lavis.service"
+          grep -q 'WorkingDirectory=/var/lib/lavis' "$defaultUnit/lavis.service"
+          grep -q 'd /var/lib/lavis 0700 lavis lavis - -' "$defaultTmpfiles"
           ! grep -q 'chown -R' "$preStartScript"
           ! grep -q 'PermissionsStartOnly=true' "$unit/lavis.service"
 
           "$preStartScript"
           printf '%s\n' '{"enabled":true,"next_id":2,"triggers":[{"id":1,"word":"nix","reactions":[{"type":"emoji","emoji":"👍"}],"enabled":true}],"active":{}}' \
-            > /build/lavis-test/.local/share/lavis/modules/fixture/state.json
+            > '/build/lavis-test home/.local/share/lavis/modules/fixture/state.json'
           "$preStartScript"
-          test -f /build/lavis-test/.local/state/lavis/modules/fixture/state.json
-          grep -q '"word":"nix"' /build/lavis-test/.local/state/lavis/modules/fixture/state.json
-          test ! -f /build/lavis-test/.local/share/lavis/modules/fixture/state.json
+          test -f '/build/lavis-test home/.local/state/lavis/modules/fixture/state.json'
+          grep -q '"word":"nix"' '/build/lavis-test home/.local/state/lavis/modules/fixture/state.json'
+          test ! -f '/build/lavis-test home/.local/share/lavis/modules/fixture/state.json'
           printf '%s\n' '{"enabled":true,"next_id":3,"triggers":[{"id":2,"word":"runtime","reactions":[{"type":"emoji","emoji":"✅"}],"enabled":true}],"active":{}}' \
-            > /build/lavis-test/.local/state/lavis/modules/fixture/state.json
+            > '/build/lavis-test home/.local/state/lavis/modules/fixture/state.json'
           "$preStartScript"
-          test -f /build/lavis-test/.local/state/lavis/modules/fixture/state.json
-          grep -q '"word":"runtime"' /build/lavis-test/.local/state/lavis/modules/fixture/state.json
-          test ! -f /build/lavis-test/.local/share/lavis/modules/fixture/state.json
+          test -f '/build/lavis-test home/.local/state/lavis/modules/fixture/state.json'
+          grep -q '"word":"runtime"' '/build/lavis-test home/.local/state/lavis/modules/fixture/state.json'
+          test ! -f '/build/lavis-test home/.local/share/lavis/modules/fixture/state.json'
 
           touch "$out"
         '';

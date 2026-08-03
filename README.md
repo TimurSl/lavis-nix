@@ -204,11 +204,27 @@ lavis modules status
 
   services.lavis = {
     enable = true;
-    user = "your-user";
+    # Keep stopped until the first interactive auth succeeds.
+    autoStart = false;
     credentialsEnvironmentFile = "/run/secrets/lavis.env";
   };
 }
 ```
+
+По умолчанию модуль создаёт системного пользователя `lavis` и хранит данные в
+`/var/lib/lavis`. После применения конфигурации выполните интерактивную
+авторизацию тем же окружением, которое использует systemd-сервис:
+
+```bash
+sudo lavis-auth
+sudo systemctl start lavis.service
+```
+
+После успешной авторизации можно убрать `autoStart = false` или заменить на
+`autoStart = true`.
+
+Full service, credentials and declarative extension setup:
+[NixOS module](docs/nixos-module.md).
 
 Декларативно также можно подключать внешние модули:
 
