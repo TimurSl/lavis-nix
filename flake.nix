@@ -90,6 +90,32 @@
             chmod 600 "$out/module.json"
             chmod 700 "$out/bin/fixture"
           '';
+          authFixture = pkgs.writeShellScriptBin "lavis" ''
+            test "$#" -eq 1
+            test "$1" = auth
+            printf '%s\n' "$HOME" > "$HOME/auth-home"
+            printf '%s:%s\n' "$LAVIS_API_ID" "$LAVIS_API_HASH" > "$HOME/auth-credentials"
+          '';
+          fakeRunuser = pkgs.writeShellScript "lavis-test-runuser" ''
+            set -euo pipefail
+            while [ "$#" -gt 0 ]; do
+              case "$1" in
+                --user|--group)
+                  shift 2
+                  ;;
+                --)
+                  shift
+                  exec "$@"
+                  ;;
+                *)
+                  echo "unexpected runuser argument: $1" >&2
+                  exit 1
+                  ;;
+              esac
+            done
+            echo "runuser command missing" >&2
+            exit 1
+          '';
           evaluated = nixpkgs.lib.nixosSystem {
             inherit system;
             modules = [
@@ -103,6 +129,7 @@
                   };
                   services.lavis = {
                     enable = true;
+                    package = authFixture;
                     user = "lavis-test";
                     credentialsEnvironmentFile = "/build/lavis-test home/secrets/lavis.env";
                     settings.prefix = ".";
@@ -179,6 +206,16 @@
           grep -q 'LAVIS_API_ID must be decimal digits' auth-invalid.log
           ! grep -q 'runuser' auth-invalid.log
           ! grep -q 'lavis-test' auth-invalid.log
+          printf '%s\n' 'LAVIS_API_ID=123456789' 'LAVIS_API_HASH=0123456789abcdef0123456789abcdef' > '/build/lavis-test home/secrets/lavis.env'
+          cp "$authScript" auth-success
+          substituteInPlace auth-success --replace-fail '${pkgs.util-linux}/bin/runuser' '${fakeRunuser}'
+          ${pkgs.fakeroot}/bin/fakeroot ./auth-success
+          test -f '/build/lavis-test home/auth-home'
+          grep -qxF '/build/lavis-test home' '/build/lavis-test home/auth-home'
+          grep -qxF '123456789:0123456789abcdef0123456789abcdef' '/build/lavis-test home/auth-credentials'
+          test -d '/build/lavis-test home/.config/lavis'
+          test -d '/build/lavis-test home/.local/state/lavis'
+          test -d '/build/lavis-test home/.local/share/lavis'
           ! grep -q 'd /build/lavis-test home 0700' "$existingTmpfiles"
           grep -q 'User=lavis' "$defaultUnit/lavis.service"
           grep -q 'Group=lavis' "$defaultUnit/lavis.service"

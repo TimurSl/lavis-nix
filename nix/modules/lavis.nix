@@ -228,6 +228,30 @@ PY
       ${lib.escapeShellArg enabledIdsJson}
   '';
 
+  authSetupScript = pkgs.writeShellScript "lavis-auth-setup" ''
+    set -euo pipefail
+
+    ${optionalString createsDefaultUser ''
+    ${pkgs.coreutils}/bin/mkdir -p \
+      ${lib.escapeShellArg effectiveHome}
+
+    ${pkgs.coreutils}/bin/chmod 700 \
+      ${lib.escapeShellArg effectiveHome}
+    ''}
+
+    ${pkgs.coreutils}/bin/mkdir -p \
+      ${lib.escapeShellArg lavisConfigDir} \
+      ${lib.escapeShellArg lavisStateDir} \
+      ${lib.escapeShellArg lavisDataDir}
+
+    ${pkgs.coreutils}/bin/chmod 700 \
+      ${lib.escapeShellArg lavisConfigDir} \
+      ${lib.escapeShellArg lavisStateDir} \
+      ${lib.escapeShellArg lavisDataDir}
+
+    exec ${cfg.package}/bin/lavis auth
+  '';
+
   authScript = pkgs.writeShellScriptBin "lavis-auth" ''
     set -euo pipefail
 
@@ -299,27 +323,7 @@ PY
       ${pkgs.coreutils}/bin/env \
         -i \
         "''${lavis_env[@]}" \
-        ${pkgs.bash}/bin/bash -euo pipefail -c '
-    ${optionalString createsDefaultUser ''
-    ${pkgs.coreutils}/bin/mkdir -p \
-      ${lib.escapeShellArg effectiveHome}
-
-    ${pkgs.coreutils}/bin/chmod 700 \
-      ${lib.escapeShellArg effectiveHome}
-    ''}
-
-    ${pkgs.coreutils}/bin/mkdir -p \
-      ${lib.escapeShellArg lavisConfigDir} \
-      ${lib.escapeShellArg lavisStateDir} \
-      ${lib.escapeShellArg lavisDataDir}
-
-    ${pkgs.coreutils}/bin/chmod 700 \
-      ${lib.escapeShellArg lavisConfigDir} \
-      ${lib.escapeShellArg lavisStateDir} \
-      ${lib.escapeShellArg lavisDataDir}
-
-    exec ${cfg.package}/bin/lavis auth
-        '
+        ${authSetupScript}
   '';
 in
 {
