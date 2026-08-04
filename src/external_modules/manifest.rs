@@ -52,6 +52,7 @@ pub enum ExternalCapability {
     MessageRead,
     MessagePeerId,
     MessageReact,
+    TelegramAccountStatus,
 }
 
 impl ExternalCapability {
@@ -64,6 +65,7 @@ impl ExternalCapability {
             Self::MessageRead => "message.read",
             Self::MessagePeerId => "message.peer_id",
             Self::MessageReact => "message.react",
+            Self::TelegramAccountStatus => "telegram.account.status",
         }
     }
 
@@ -76,6 +78,7 @@ impl ExternalCapability {
             Self::MessageRead => "чтение сообщений",
             Self::MessagePeerId => "идентификатор чата сообщения",
             Self::MessageReact => "реакции на сообщения",
+            Self::TelegramAccountStatus => "изменение статуса аккаунта Telegram",
         }
     }
 
@@ -88,6 +91,7 @@ impl ExternalCapability {
             "message.read" => Some(Self::MessageRead),
             "message.peer_id" => Some(Self::MessagePeerId),
             "message.react" => Some(Self::MessageReact),
+            "telegram.account.status" => Some(Self::TelegramAccountStatus),
             _ => None,
         }
     }
@@ -327,7 +331,7 @@ pub fn validate_manifest_at(
     let manifest: ManifestFile =
         serde_json::from_slice(&bytes).map_err(|_| ExternalError::MalformedManifest)?;
 
-    if !matches!(manifest.schema_version, 2..=4) {
+    if !matches!(manifest.schema_version, 2..=5) {
         return Err(ExternalError::UnsupportedSchemaVersion);
     }
 
@@ -470,6 +474,11 @@ pub fn validate_manifest_at(
         }
     }
     if !subscriptions.is_empty() && !seen_capabilities.contains(&ExternalCapability::MessageRead) {
+        return Err(ExternalError::InvalidCapability);
+    }
+    if seen_capabilities.contains(&ExternalCapability::TelegramAccountStatus)
+        && manifest.schema_version < 5
+    {
         return Err(ExternalError::InvalidCapability);
     }
     if seen_capabilities.contains(&ExternalCapability::MessagePeerId)
@@ -707,6 +716,61 @@ mod tests {
                 .subscriptions
                 .contains(&ExternalSubscription::MessageEdited)
         );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn v5_accepts_account_status_capability_and_rejects_timer_api() {
+        let base = temp_dir();
+        let dir = create_module_dir(&base, "echo");
+        let mut json = serde_json::from_slice::<serde_json::Value>(&valid_manifest_json()).unwrap();
+        json["schema_version"] = serde_json::json!(5);
+        json["capabilities"] = serde_json::json!(["telegram.account.status"]);
+        let path = write_manifest(&dir, &serde_json::to_vec(&json).unwrap());
+        let descriptor = validate_manifest_at(&path, Some("echo")).unwrap();
+        assert!(
+            descriptor
+                .capabilities
+                .contains(&ExternalCapability::TelegramAccountStatus)
+        );
+
+        json["timer_subscriptions"] = serde_json::json!([]);
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(matches!(
+            validate_manifest_at(&path, Some("echo")),
+            Err(ExternalError::MalformedManifest)
+        ));
+
+        json.as_object_mut().unwrap().remove("timer_subscriptions");
+        json["capabilities"] = serde_json::json!(["timer"]);
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(matches!(
+            validate_manifest_at(&path, Some("echo")),
+            Err(ExternalError::InvalidCapability)
+        ));
+
+        json["capabilities"] = serde_json::json!(["telegram.invoke"]);
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(matches!(
+            validate_manifest_at(&path, Some("echo")),
+            Err(ExternalError::InvalidCapability)
+        ));
+
+        json["capabilities"] = serde_json::json!(["telegram.account.status"]);
+        json["subscriptions"] = serde_json::json!([{"type": "timer.tick", "interval_seconds": 30}]);
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(matches!(
+            validate_manifest_at(&path, Some("echo")),
+            Err(ExternalError::MalformedManifest)
+        ));
+        for schema_version in 2..=4 {
+            json["schema_version"] = serde_json::json!(schema_version);
+            fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+            assert!(matches!(
+                validate_manifest_at(&path, Some("echo")),
+                Err(ExternalError::MalformedManifest)
+            ));
+        }
         fs::remove_dir_all(&base).unwrap();
     }
 

@@ -274,6 +274,9 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
         {
             let mut mgr = handle.lock().await;
             mgr.set_descriptors(descriptors);
+            mgr.set_gateway(external_modules::gateway::GrammersGateway::new(
+                guard.inner().client().clone(),
+            ));
         }
         handle.startup_enabled(external_state.enabled_ids()).await;
         let mut runtime = runtime::RuntimeState::new(
@@ -327,12 +330,12 @@ async fn run_command(auth_only: bool) -> anyhow::Result<()> {
     }
     .await;
 
-    let shutdown_result = guard.shutdown().await;
     if let Some(handle) = external_handle {
-        // Telegram disconnects before external modules so no module outlives the
-        // Telegram runner on any application exit path.
+        // Stop module processes before their core-owned Telegram gateway is
+        // disconnected.
         handle.shutdown_all().await;
     }
+    let shutdown_result = guard.shutdown().await;
 
     let reason = combine_application_and_shutdown(application_result, shutdown_result)?;
     if reason == runtime::ShutdownReason::Restart {

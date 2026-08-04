@@ -1078,6 +1078,16 @@ mod tests {
         zip(&[manifest(), run])
     }
 
+    fn v5_archive() -> Vec<u8> {
+        let manifest = file(
+            "module.json",
+            br#"{"schema_version":5,"id":"status","name":"Status","version":"1","author":"A","entrypoint":"run","capabilities":["telegram.account.status"],"commands":[{"name":"go","summary_ru":"x","description_ru":"x","usage":"<value>"}]}"#,
+        );
+        let mut run = file("run", b"#!/bin/sh");
+        run.mode = 0o100755;
+        zip(&[manifest, run])
+    }
+
     struct TestRandom(u8);
 
     impl RandomSource for TestRandom {
@@ -1221,6 +1231,40 @@ mod tests {
         first.cleanup().unwrap();
         second.cleanup().unwrap();
         assert!(!wrapper.exists());
+        let _ = fs::remove_dir(root);
+    }
+
+    #[test]
+    fn v5_plan_exposes_account_status_capability() {
+        let root = root("v5-plan");
+        let config = InspectionConfig {
+            staging_root: root.clone(),
+            limits: limits(),
+        };
+        let mut random = TestRandom(1);
+        let pending = inspect_pending(
+            &config,
+            AcquiredLmod::archive(v5_archive()),
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
+            &mut random,
+        )
+        .unwrap();
+        assert!(
+            pending
+                .plan
+                .capabilities
+                .contains(&"telegram.account.status".to_owned())
+        );
+        let without_capability = ModuleInstallPlan {
+            capabilities: Vec::new(),
+            ..pending.plan.clone()
+        };
+        assert_ne!(
+            pending.plan.fingerprint,
+            without_capability.canonical_fingerprint()
+        );
+        pending.cleanup().unwrap();
         let _ = fs::remove_dir(root);
     }
 

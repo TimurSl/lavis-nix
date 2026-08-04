@@ -34,6 +34,7 @@ pub struct ExternalModuleStatus {
 pub struct ExternalManager {
     descriptors: Vec<ExternalModuleDescriptor>,
     processes: BTreeMap<String, Arc<Mutex<ModuleProcess>>>,
+    gateway: Option<Arc<dyn super::gateway::TelegramGateway>>,
 }
 
 impl Default for ExternalManager {
@@ -47,11 +48,16 @@ impl ExternalManager {
         Self {
             descriptors: Vec::new(),
             processes: BTreeMap::new(),
+            gateway: None,
         }
     }
 
     pub fn set_descriptors(&mut self, descriptors: Vec<ExternalModuleDescriptor>) {
         self.descriptors = descriptors;
+    }
+
+    pub fn set_gateway(&mut self, gateway: Arc<dyn super::gateway::TelegramGateway>) {
+        self.gateway = Some(gateway);
     }
 
     pub fn descriptors(&self) -> &[ExternalModuleDescriptor] {
@@ -115,33 +121,6 @@ impl ExternalManager {
             });
         }
         statuses
-    }
-
-    pub async fn startup_enabled(&mut self, enabled_ids: &std::collections::BTreeSet<String>) {
-        for desc in &self.descriptors {
-            if !enabled_ids.contains(&desc.id) {
-                continue;
-            }
-            match ModuleProcess::start(desc.clone()).await {
-                Ok(process) => {
-                    tracing::info!(
-                        event = "external_module_started",
-                        module_id = %desc.id,
-                        "External module started"
-                    );
-                    let id = desc.id.clone();
-                    self.processes.insert(id, Arc::new(Mutex::new(process)));
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        event = "external_module_startup_failed",
-                        module_id = %desc.id,
-                        error = %error,
-                        "Не удалось запустить внешний модуль"
-                    );
-                }
-            }
-        }
     }
 
     /// Resolve a dotted command name `module-id.command-name` into
@@ -378,23 +357,32 @@ impl ExternalManagerHandle {
     /// Starts children without retaining the manager mutex. Process I/O belongs
     /// to the individual process mutex; the manager only owns the index.
     pub async fn startup_enabled(&self, enabled_ids: &std::collections::BTreeSet<String>) {
-        let descriptors = {
+        let (descriptors, gateway) = {
             let manager = self.inner.lock().await;
-            manager
-                .descriptors
-                .iter()
-                .filter(|descriptor| enabled_ids.contains(&descriptor.id))
-                .cloned()
-                .collect::<Vec<_>>()
+            (
+                manager
+                    .descriptors
+                    .iter()
+                    .filter(|descriptor| enabled_ids.contains(&descriptor.id))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                manager.gateway.clone(),
+            )
         };
         for descriptor in descriptors {
             let id = descriptor.id.clone();
-            match ModuleProcess::start(descriptor).await {
+            match ModuleProcess::start_with_gateway(descriptor.clone(), gateway.clone()).await {
                 Ok(process) => {
-                    let mut manager = self.inner.lock().await;
-                    manager
-                        .processes
-                        .insert(id.clone(), Arc::new(Mutex::new(process)));
+                    let replaced = {
+                        let mut manager = self.inner.lock().await;
+                        manager
+                            .processes
+                            .insert(id.clone(), Arc::new(Mutex::new(process)))
+                    };
+                    if let Some(replaced) = replaced {
+                        let mut replaced = replaced.lock().await;
+                        replaced.terminate().await;
+                    }
                     tracing::info!(event = "external_module_started", module_id = %id, "External module started");
                 }
                 Err(error) => {

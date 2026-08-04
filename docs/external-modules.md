@@ -4,6 +4,18 @@
 
 External modules extend Lavis with commands implemented in any language. Each enabled module runs as a separate child process and exchanges newline-delimited JSON with Lavis through stdin/stdout.
 
+## Поддерживаемые версии Module API
+
+| Schema/protocol | Статус и документ |
+| --- | --- |
+| v1 | Внутренние метаданные, не runtime внешнего процесса: [Module API v1](module-api-v1.md). |
+| v2–v3 | Базовый manifest и JSON Lines: [Module API v2/v3](module-api-v2.md). |
+| v4 | Редактирование сообщений и наборы реакций: [Module API v4](module-api-v4.md). |
+| v5 | Gateway статуса аккаунта: [Module API v5](module-api-v5.md). |
+
+V1–V4 сохраняют свои существующие wire-контракты; выбор v5 не изменяет их
+manifest или сообщения.
+
 ## End-to-end workflow
 
 ```text
@@ -25,7 +37,9 @@ write module
 mkdir -p my-echo/bin
 ```
 
-Create `my-echo/module.json`. See [Module API v2/v3](module-api-v2.md) for the full schema.
+Create `my-echo/module.json`. See [Module API v2/v3](module-api-v2.md),
+[Module API v4](module-api-v4.md), and [Module API v5](module-api-v5.md) for
+the schema selected by your module.
 
 Create a directly executable entrypoint that reads JSON lines from stdin and writes JSON lines to stdout:
 
@@ -82,7 +96,7 @@ Use a **new self-authored message in Saved Messages**. Attach exactly one `.lmod
 
 Edited messages do not start or confirm installation. URL, repository and reply-based acquisition are not supported.
 
-Lavis performs a bounded download and fail-closed archive inspection. The returned plan includes module ID/version, protocol version, entrypoint, capabilities, subscriptions/actions, archive statistics, SHA-256 digest, fingerprint, warnings and expiry.
+Lavis performs a bounded download and fail-closed archive inspection. The returned plan includes module ID/version, protocol version, entrypoint, capabilities, archive statistics, SHA-256 digest, fingerprint, warnings and expiry.
 
 The plan contains a random 80-bit ApprovalId in canonical form:
 
@@ -272,7 +286,10 @@ Help for a discovered module card is available by module ID even while it is dis
 - start quickly;
 - use stderr only for diagnostics.
 
-Schema 3 may also receive `message.created` events and return one scoped `message.react` action. See [Module API v2/v3](module-api-v2.md).
+Schema 3 may also receive `message.created` events and return one scoped
+`message.react` action. Schema 4 adds edited-message support; schema 5 adds the
+allowlisted core account-status gateway. See [Module API v5](module-api-v5.md);
+v2–v4 behavior remains unchanged.
 
 ### Environment
 
@@ -288,7 +305,10 @@ Telegram credentials and arbitrary host environment variables are not passed to 
 
 ### Capabilities
 
-Capabilities describe intended access but do not enforce it. Supported values include host/network/state access and schema 3 message read/reaction declarations. A malicious process still has the ordinary OS access of the Lavis user.
+Capabilities do not form an OS sandbox. A module retains the ordinary OS access
+of the Lavis user. In schema 5, `telegram.account.status` is enforced by the
+core gateway boundary; it controls that core-mediated feature, not direct OS
+access. See [Module API v5](module-api-v5.md).
 
 ## Files and lifecycle
 
@@ -319,7 +339,8 @@ Pending staging is cleaned best-effort on cancel, expiry, shutdown and next star
 - `.lmod` inspection is structural validation, not malware analysis or signature verification.
 - External modules run as arbitrary executable code with the Lavis user's OS permissions.
 - No seccomp, container, WASM runtime or other system sandbox is applied.
-- Capabilities are metadata, not permissions.
+- Schema-5 `telegram.account.status` is enforced only at the core gateway
+  boundary; it is not an OS permission.
 - The installer never overwrites an existing module target.
 - Telegram acquisition is limited to a same-message document in Saved Messages and bounded by declared and actual bytes.
 - Enable only code you trust.

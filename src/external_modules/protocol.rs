@@ -82,6 +82,20 @@ pub enum CoreMessage {
         event: MessageEventKind,
         payload: MessageEvent,
     },
+    TelegramResult {
+        request_id: String,
+        call_id: String,
+        result: Result<serde_json::Value, TelegramCallError>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramCallError {
+    pub kind: &'static str,
+    pub code: Option<i32>,
+    pub name: Option<String>,
+    pub message: String,
+    pub retry_after_seconds: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -110,6 +124,12 @@ pub enum ModuleMessage {
     EventResult {
         request_id: String,
         actions: Vec<EventAction>,
+    },
+    TelegramInvoke {
+        request_id: String,
+        call_id: String,
+        method: String,
+        params: serde_json::Value,
     },
 }
 
@@ -202,6 +222,56 @@ impl CoreMessage {
                     "payload": event_payload,
                 }))
             }
+            Self::TelegramResult {
+                request_id,
+                call_id,
+                result,
+            } => {
+                if protocol_version != 5 {
+                    return Err(ExternalError::ProtocolEncode);
+                }
+                let mut value = serde_json::json!({
+                    "protocol_version": 5,
+                    "type": "telegram.result",
+                    "request_id": request_id,
+                    "call_id": call_id,
+                });
+                match result {
+                    Ok(result) => {
+                        value["ok"] = serde_json::Value::Bool(true);
+                        value["result"] = result.clone();
+                    }
+                    Err(error) => {
+                        value["ok"] = serde_json::Value::Bool(false);
+                        let mut error_value = serde_json::Map::new();
+                        error_value.insert(
+                            "kind".to_owned(),
+                            serde_json::Value::String(error.kind.to_owned()),
+                        );
+                        error_value.insert(
+                            "message".to_owned(),
+                            serde_json::Value::String(error.message.clone()),
+                        );
+                        if let Some(code) = error.code {
+                            error_value.insert("code".to_owned(), serde_json::json!(code));
+                        }
+                        if let Some(name) = &error.name {
+                            error_value.insert(
+                                "name".to_owned(),
+                                serde_json::Value::String(name.clone()),
+                            );
+                        }
+                        if let Some(seconds) = error.retry_after_seconds {
+                            error_value.insert(
+                                "retry_after_seconds".to_owned(),
+                                serde_json::json!(seconds),
+                            );
+                        }
+                        value["error"] = serde_json::Value::Object(error_value);
+                    }
+                }
+                serde_json::to_string(&value)
+            }
         }
         .map_err(|_| ExternalError::ProtocolEncode)
     }
@@ -213,6 +283,7 @@ impl CoreMessage {
             | Self::Health { request_id }
             | Self::Shutdown { request_id }
             | Self::Event { request_id, .. } => request_id,
+            Self::TelegramResult { request_id, .. } => request_id,
         }
     }
 }
@@ -313,7 +384,7 @@ pub fn parse_module_line_for(
             let request_id = validate_request_id(&value)?;
             let actions: &[serde_json::Value] = match value.get("actions") {
                 Some(actions) => actions.as_array().ok_or(ExternalError::ProtocolDecode)?,
-                None if expected_protocol_version == 4 => &[],
+                None if expected_protocol_version >= 4 => &[],
                 None => return Err(ExternalError::ProtocolDecode),
             };
             if actions.len() > MAX_EVENT_ACTIONS {
@@ -326,6 +397,32 @@ pub fn parse_module_line_for(
             Ok(Some(ModuleMessage::EventResult {
                 request_id,
                 actions,
+            }))
+        }
+        "telegram.invoke" => {
+            if expected_protocol_version != 5 {
+                return Err(ExternalError::ProtocolDecode);
+            }
+            let request_id = validate_request_id(&value)?;
+            let call_id = get_string(&value, "call_id")?;
+            if call_id.is_empty()
+                || call_id.len() > 64
+                || !call_id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                return Err(ExternalError::ProtocolDecode);
+            }
+            let method = get_string(&value, "method")?;
+            let params = value
+                .get("params")
+                .cloned()
+                .ok_or(ExternalError::ProtocolDecode)?;
+            Ok(Some(ModuleMessage::TelegramInvoke {
+                request_id,
+                call_id,
+                method,
+                params,
             }))
         }
         _ => Err(ExternalError::ProtocolDecode),
@@ -344,7 +441,7 @@ fn parse_event_action(
         vec![parse_reaction(
             value.get("reaction").ok_or(ExternalError::ProtocolDecode)?,
         )?]
-    } else if protocol_version == 4 {
+    } else if protocol_version >= 4 {
         let reactions = value
             .get("reactions")
             .and_then(|value| value.as_array())
@@ -725,6 +822,54 @@ mod tests {
         let id1 = request_id();
         let id2 = request_id();
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn v5_telegram_invoke_preserves_correlation() {
+        let invoke = r#"{"protocol_version":5,"type":"telegram.invoke","request_id":"10","call_id":"call_1","method":"account.updateStatus","params":{"offline":true}}"#;
+        assert!(matches!(
+            parse_module_line_for(invoke, 5).unwrap(),
+            Some(ModuleMessage::TelegramInvoke { request_id, call_id, .. })
+                if request_id == "10" && call_id == "call_1"
+        ));
+        assert!(parse_module_line_for(invoke, 4).is_err());
+        let missing_parent = r#"{"protocol_version":5,"type":"telegram.invoke","call_id":"call_1","method":"account.updateStatus","params":{"offline":true}}"#;
+        assert!(parse_module_line_for(missing_parent, 5).is_err());
+    }
+
+    #[test]
+    fn v5_telegram_result_uses_the_frozen_success_and_error_envelopes() {
+        let success = CoreMessage::TelegramResult {
+            request_id: "10".to_owned(),
+            call_id: "call_1".to_owned(),
+            result: Ok(serde_json::Value::Bool(true)),
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&success.serialize_for(5).unwrap()).unwrap();
+        assert_eq!(value["type"], "telegram.result");
+        assert_eq!(value["request_id"], "10");
+        assert_eq!(value["call_id"], "call_1");
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["result"], true);
+
+        let failure = CoreMessage::TelegramResult {
+            request_id: "10".to_owned(),
+            call_id: "call_2".to_owned(),
+            result: Err(TelegramCallError {
+                kind: "rpc",
+                code: Some(420),
+                name: Some("FLOOD_WAIT".to_owned()),
+                message: "FLOOD_WAIT".to_owned(),
+                retry_after_seconds: Some(7),
+            }),
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&failure.serialize_for(5).unwrap()).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["kind"], "rpc");
+        assert_eq!(value["error"]["code"], 420);
+        assert_eq!(value["error"]["name"], "FLOOD_WAIT");
+        assert_eq!(value["error"]["retry_after_seconds"], 7);
     }
 
     #[test]

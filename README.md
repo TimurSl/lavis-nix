@@ -180,9 +180,12 @@ lavis modules status
 > [!WARNING]
 > Внешние модули не изолируются системной песочницей и работают с правами пользователя Lavis.
 >
-> Capabilities в manifest являются описательными метаданными, а не механизмом безопасности. Устанавливайте только доверенный код.
+> Для v5 capability `telegram.account.status` принудительно проверяется ядром
+> на границе gateway, но не ограничивает прямой доступ модуля к ОС.
+> Устанавливайте только доверенный код.
 
-Подробнее: [External modules](docs/external-modules.md).
+Подробнее: [External modules](docs/external-modules.md), включая
+[Module API v5](docs/module-api-v5.md) для gateway статуса аккаунта.
 
 ---
 
@@ -326,6 +329,8 @@ nix build --print-build-logs
 | [Companion bot setup](docs/companion-bot-setup.md) | Создание и восстановление companion-бота |
 | [Module API v1](docs/module-api-v1.md)             | Встроенные модули и метаданные команд    |
 | [Module API v2/v3](docs/module-api-v2.md)          | Manifest и JSON Lines protocol           |
+| [Module API v4](docs/module-api-v4.md)             | Редактирование сообщений и наборы реакций |
+| [Module API v5](docs/module-api-v5.md)             | Gateway статуса аккаунта                  |
 | [External modules](docs/external-modules.md)       | Разработка и запуск внешних модулей      |
 | [Packaging `.lmod`](docs/lmod-packaging.md)        | Формат и безопасная упаковка `.lmod`     |
 | [NixOS module](docs/nixos-module.md)               | Декларативная настройка сервиса          |
