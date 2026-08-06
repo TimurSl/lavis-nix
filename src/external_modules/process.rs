@@ -12,6 +12,7 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::{
@@ -47,18 +48,56 @@ pub struct ModuleProcess {
     process_group_id: Option<u32>,
     stdin: tokio::process::ChildStdin,
     stdout_reader: tokio::io::BufReader<tokio::process::ChildStdout>,
-    stderr_drain: Option<tokio::task::JoinHandle<StderrCapture>>,
+    stderr_drain: Option<tokio::task::JoinHandle<()>>,
+    stderr_capture: Arc<Mutex<StderrCapture>>,
     descriptor: ExternalModuleDescriptor,
     status: ProcessStatus,
     in_flight_request: Option<String>,
     gateway: Option<std::sync::Arc<dyn TelegramGateway>>,
     active_call_ids: HashSet<String>,
     telegram_invoke_parent: Option<String>,
+    /// Test-only counter of crash events emitted for this process. Lets tests
+    /// prove that normal shutdown never takes the crash path.
+    #[cfg(test)]
+    crash_events: std::sync::atomic::AtomicU32,
 }
 
+#[derive(Debug, Clone, Default)]
 struct StderrCapture {
-    _bytes: Vec<u8>,
-    _truncated: bool,
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl StderrCapture {
+    /// Append a chunk, stopping once the capture limit is reached. Once the
+    /// limit is hit the flag is set and further bytes are dropped, but the
+    /// caller keeps draining the pipe so the module is never blocked.
+    fn push(&mut self, chunk: &[u8]) {
+        if self.truncated {
+            return;
+        }
+        let remaining = MAX_STDERR_CAPTURE.saturating_sub(self.bytes.len());
+        if chunk.len() <= remaining {
+            self.bytes.extend_from_slice(chunk);
+        } else {
+            self.bytes.extend_from_slice(&chunk[..remaining]);
+            self.truncated = true;
+        }
+    }
+
+    /// Lossy UTF-8 view of the captured bytes. Never panics on malformed input.
+    fn lossy_text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes).into_owned()
+    }
+}
+
+/// Lock the shared capture, recovering from a poisoned mutex instead of
+/// panicking. The guard is never held across an `.await`.
+fn lock_capture(shared: &Mutex<StderrCapture>) -> std::sync::MutexGuard<'_, StderrCapture> {
+    match shared.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 impl ModuleProcess {
@@ -149,7 +188,8 @@ impl ModuleProcess {
         };
         let stdout_reader = BufReader::new(stdout);
 
-        let stderr_drain = tokio::spawn(drain_stderr(stderr));
+        let stderr_capture = Arc::new(Mutex::new(StderrCapture::default()));
+        let stderr_drain = tokio::spawn(drain_stderr(stderr, stderr_capture.clone()));
 
         let mut process = Self {
             child: Some(child),
@@ -157,20 +197,21 @@ impl ModuleProcess {
             stdin,
             stdout_reader,
             stderr_drain: Some(stderr_drain),
+            stderr_capture,
             descriptor,
             status: ProcessStatus::Running,
             in_flight_request: None,
             gateway,
             active_call_ids: HashSet::new(),
             telegram_invoke_parent: None,
+            #[cfg(test)]
+            crash_events: std::sync::atomic::AtomicU32::new(0),
         };
 
-        if let Err(e) = process.handshake().await {
-            process.terminate_process_group().await;
-            process.reap_child().await;
-            process.join_stderr_drain().await;
-            return Err(e);
-        }
+        // Every error path of `handshake()` already runs `fail_and_terminate`,
+        // which stops the process group, reaps the child and joins the stderr
+        // reader. Doing that again here would be redundant cleanup.
+        process.handshake().await?;
 
         Ok(process)
     }
@@ -332,7 +373,17 @@ impl ModuleProcess {
                 return Err(ExternalError::Unavailable);
             };
             match msg {
-                ModuleMessage::Log { .. } => continue,
+                ModuleMessage::Log {
+                    request_id,
+                    level,
+                    message,
+                } => {
+                    if request_id != expected_id {
+                        return Err(ExternalError::WrongRequestId);
+                    }
+                    log_module_message(&self.descriptor.id, &request_id, &level, &message);
+                    continue;
+                }
                 ModuleMessage::TelegramInvoke {
                     request_id,
                     call_id,
@@ -482,12 +533,29 @@ impl ModuleProcess {
     }
 
     async fn fail_and_terminate(&mut self, error: ExternalError) -> ExternalError {
+        let request_id = self.in_flight_request.take();
         self.clear_request_state();
         self.status = ProcessStatus::Crashed;
         self.terminate_process_group().await;
         self.reap_child().await;
         self.join_stderr_drain().await;
+        let capture = self.snapshot_stderr();
+        #[cfg(test)]
+        self.crash_events
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        emit_crash_event(&build_crash_diagnostics(
+            &self.descriptor,
+            request_id.as_deref(),
+            &error,
+            &capture,
+        ));
         error
+    }
+
+    /// Snapshot the stderr accumulated so far. Safe to call after the reader
+    /// task has been aborted: the shared buffer retains everything already read.
+    fn snapshot_stderr(&self) -> StderrCapture {
+        lock_capture(&self.stderr_capture).clone()
     }
 
     pub async fn terminate(&mut self) {
@@ -595,10 +663,11 @@ impl ModuleProcess {
     }
 }
 
-async fn drain_stderr(mut stderr: tokio::process::ChildStderr) -> StderrCapture {
+async fn drain_stderr<R>(mut stderr: R, capture: Arc<Mutex<StderrCapture>>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     use tokio::io::AsyncReadExt;
-    let mut buf = Vec::with_capacity(MAX_STDERR_CAPTURE);
-    let mut truncated = false;
     let mut tmp = [0u8; 1024];
     loop {
         let n = match stderr.read(&mut tmp).await {
@@ -606,20 +675,122 @@ async fn drain_stderr(mut stderr: tokio::process::ChildStderr) -> StderrCapture 
             Ok(n) => n,
             Err(_) => break,
         };
-        if truncated {
-            continue;
-        }
-        let remaining = MAX_STDERR_CAPTURE.saturating_sub(buf.len());
-        if n <= remaining {
-            buf.extend_from_slice(&tmp[..n]);
-        } else {
-            buf.extend_from_slice(&tmp[..remaining]);
-            truncated = true;
+        // The guard is dropped at the end of this statement, before the next
+        // read is awaited.
+        lock_capture(&capture).push(&tmp[..n]);
+        #[cfg(all(test, feature = "fixture-tests"))]
+        if let Some(observer) = STDERR_PUSH_OBSERVER.get()
+            && let Some(sender) = observer.lock().unwrap().as_ref()
+        {
+            let _ = sender.send(lock_capture(&capture).clone());
         }
     }
-    StderrCapture {
-        _bytes: buf,
-        _truncated: truncated,
+}
+
+/// Test-only rendezvous: while a receiver is registered, the stderr reader
+/// forwards a snapshot of the capture after every successful push. This lets a
+/// fixture test prove that a marker written by the module reached the capture
+/// before the module is allowed to send its malformed reply, without relying on
+/// pipe capacity or scheduler ordering.
+#[cfg(all(test, feature = "fixture-tests"))]
+static STDERR_PUSH_OBSERVER: std::sync::OnceLock<
+    std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<StderrCapture>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(all(test, feature = "fixture-tests"))]
+fn set_stderr_push_observer(sender: tokio::sync::mpsc::UnboundedSender<StderrCapture>) {
+    *STDERR_PUSH_OBSERVER
+        .get_or_init(std::sync::Mutex::default)
+        .lock()
+        .unwrap() = Some(sender);
+}
+
+#[cfg(all(test, feature = "fixture-tests"))]
+fn clear_stderr_push_observer() {
+    if let Some(observer) = STDERR_PUSH_OBSERVER.get() {
+        *observer.lock().unwrap() = None;
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CrashDiagnostics {
+    module_id: String,
+    protocol_version: u32,
+    request_id: String,
+    error: String,
+    stderr_truncated: bool,
+    stderr: String,
+}
+
+/// Collect the fields for the crash event without touching `tracing`, so the
+/// assembly is directly testable. Only data the module itself wrote to stderr
+/// is included; protocol frames, environment and credentials are never logged.
+fn build_crash_diagnostics(
+    descriptor: &ExternalModuleDescriptor,
+    request_id: Option<&str>,
+    error: &ExternalError,
+    capture: &StderrCapture,
+) -> CrashDiagnostics {
+    CrashDiagnostics {
+        module_id: descriptor.id.clone(),
+        protocol_version: descriptor.protocol_version,
+        request_id: request_id.unwrap_or("-").to_owned(),
+        error: error.to_string(),
+        stderr_truncated: capture.truncated,
+        stderr: capture.lossy_text().trim().to_owned(),
+    }
+}
+
+fn emit_crash_event(diagnostics: &CrashDiagnostics) {
+    tracing::error!(
+        event = "external_module_crashed",
+        module_id = %diagnostics.module_id,
+        protocol_version = diagnostics.protocol_version,
+        request_id = %diagnostics.request_id,
+        error = %diagnostics.error,
+        stderr_truncated = diagnostics.stderr_truncated,
+        stderr = %diagnostics.stderr,
+        "External module crashed"
+    );
+}
+
+fn log_module_message(module_id: &str, request_id: &str, level: &str, message: &str) {
+    match level {
+        "error" => tracing::error!(
+            event = "external_module_log",
+            module_id = %module_id,
+            request_id = %request_id,
+            message = %message,
+            "External module log"
+        ),
+        "warn" | "warning" => tracing::warn!(
+            event = "external_module_log",
+            module_id = %module_id,
+            request_id = %request_id,
+            message = %message,
+            "External module log"
+        ),
+        "debug" => tracing::debug!(
+            event = "external_module_log",
+            module_id = %module_id,
+            request_id = %request_id,
+            message = %message,
+            "External module log"
+        ),
+        "trace" => tracing::trace!(
+            event = "external_module_log",
+            module_id = %module_id,
+            request_id = %request_id,
+            message = %message,
+            "External module log"
+        ),
+        _ => tracing::info!(
+            event = "external_module_log",
+            module_id = %module_id,
+            request_id = %request_id,
+            message = %message,
+            "External module log"
+        ),
     }
 }
 
@@ -729,6 +900,135 @@ mod deadline_tests {
         assert!(!allows_telegram_invoke(5, Some("10"), None, "10", "11"));
         assert!(!allows_telegram_invoke(4, Some("10"), None, "10", "10"));
         assert!(!allows_telegram_invoke(5, None, None, "10", "10"));
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use tokio::io::AsyncWriteExt;
+
+    fn descriptor(id: &str) -> ExternalModuleDescriptor {
+        ExternalModuleDescriptor {
+            protocol_version: 2,
+            id: id.to_owned(),
+            display_name: id.to_owned(),
+            version: "0.1.0".to_owned(),
+            author: "Test".to_owned(),
+            entrypoint: PathBuf::from("/tmp/never-executed"),
+            module_dir: PathBuf::from("/tmp/never-executed"),
+            capabilities: Vec::new(),
+            default_command: None,
+            subscriptions: Vec::new(),
+            actions: Vec::new(),
+            commands: vec![],
+        }
+    }
+
+    #[test]
+    fn push_keeps_all_bytes_below_the_limit() {
+        let mut capture = StderrCapture::default();
+        capture.push(&[b'a'; 1024]);
+        capture.push(&[b'b'; 1024]);
+        assert_eq!(capture.bytes.len(), 2048);
+        assert!(!capture.truncated);
+    }
+
+    #[test]
+    fn push_truncates_at_the_limit_and_drops_further_bytes() {
+        let mut capture = StderrCapture::default();
+        capture.push(&[b'x'; MAX_STDERR_CAPTURE + 512]);
+        assert_eq!(capture.bytes.len(), MAX_STDERR_CAPTURE);
+        assert!(capture.truncated);
+        // Bytes after the limit are dropped entirely.
+        capture.push(&[b'y'; 64]);
+        assert_eq!(capture.bytes.len(), MAX_STDERR_CAPTURE);
+        assert!(capture.truncated);
+    }
+
+    #[test]
+    fn invalid_utf8_is_replaced_without_panicking() {
+        let mut capture = StderrCapture::default();
+        capture.push(&[0xff, 0xfe, b'a']);
+        let text = capture.lossy_text();
+        assert!(text.contains('\u{FFFD}'));
+        assert!(text.contains('a'));
+    }
+
+    #[test]
+    fn poisoned_capture_mutex_recovers_without_panicking() {
+        let capture = Arc::new(Mutex::new(StderrCapture::default()));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = capture.lock().unwrap();
+            panic!("poison the mutex");
+        }));
+        assert!(result.is_err());
+        let snapshot = lock_capture(&capture).clone();
+        assert!(snapshot.bytes.is_empty());
+        assert!(!snapshot.truncated);
+    }
+
+    #[tokio::test]
+    async fn drain_stderr_captures_everything_below_the_limit() {
+        let (mut writer, reader) = tokio::io::duplex(MAX_STDERR_CAPTURE);
+        let capture = Arc::new(Mutex::new(StderrCapture::default()));
+        let task = tokio::spawn(drain_stderr(reader, capture.clone()));
+        writer
+            .write_all(b"first line\nsecond line\n")
+            .await
+            .unwrap();
+        drop(writer);
+        task.await.unwrap();
+        let snapshot = lock_capture(&capture).clone();
+        assert_eq!(snapshot.bytes, b"first line\nsecond line\n");
+        assert!(!snapshot.truncated);
+    }
+
+    #[tokio::test]
+    async fn drain_stderr_truncates_above_the_limit() {
+        let (mut writer, reader) = tokio::io::duplex(MAX_STDERR_CAPTURE + 4096);
+        let capture = Arc::new(Mutex::new(StderrCapture::default()));
+        let task = tokio::spawn(drain_stderr(reader, capture.clone()));
+        let payload = vec![b'x'; MAX_STDERR_CAPTURE + 2048];
+        writer.write_all(&payload).await.unwrap();
+        drop(writer);
+        task.await.unwrap();
+        let snapshot = lock_capture(&capture).clone();
+        assert_eq!(snapshot.bytes.len(), MAX_STDERR_CAPTURE);
+        assert!(snapshot.truncated);
+    }
+
+    #[test]
+    fn crash_diagnostics_include_request_id_and_stderr() {
+        let mut capture = StderrCapture::default();
+        capture.push(b"  boom: kernel panic\n");
+        let diagnostics = build_crash_diagnostics(
+            &descriptor("diag"),
+            Some("req-42"),
+            &ExternalError::ProtocolDecode,
+            &capture,
+        );
+        assert_eq!(diagnostics.module_id, "diag");
+        assert_eq!(diagnostics.protocol_version, 2);
+        assert_eq!(diagnostics.request_id, "req-42");
+        assert_eq!(diagnostics.error, "protocol decode error");
+        assert!(!diagnostics.stderr_truncated);
+        assert_eq!(diagnostics.stderr, "boom: kernel panic");
+    }
+
+    #[test]
+    fn crash_diagnostics_default_request_and_empty_stderr() {
+        let capture = StderrCapture::default();
+        let diagnostics = build_crash_diagnostics(
+            &descriptor("diag"),
+            None,
+            &ExternalError::Unavailable,
+            &capture,
+        );
+        assert_eq!(diagnostics.request_id, "-");
+        assert_eq!(diagnostics.stderr, "");
+        assert!(!diagnostics.stderr_truncated);
     }
 }
 
@@ -1030,6 +1330,8 @@ if child:
         let mut proc = ModuleProcess::start(desc).await.unwrap();
         proc.graceful_shutdown().await.unwrap();
         assert_eq!(proc.process_group_id, None);
+        // Graceful shutdown must not take the crash path.
+        assert_eq!(proc.crash_events.load(Ordering::Relaxed), 0);
         // Repeated cleanup after the child has exited must not retain a stale
         // PGID that could be reused by an unrelated process.
         proc.terminate().await;
@@ -1090,6 +1392,7 @@ for line in sys.stdin:
         let result = proc.execute("repeat", "test").await;
         assert!(matches!(result, Err(ExternalError::ExecutionTimeout)));
         assert_eq!(proc.status(), ProcessStatus::Crashed);
+        assert_eq!(proc.crash_events.load(Ordering::Relaxed), 1);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1205,6 +1508,36 @@ for line in sys.stdin:
             >,
         > {
             Box::pin(std::future::pending())
+        }
+    }
+
+    /// Gateway whose reply is withheld until the test releases it. Used to hold
+    /// the module's malformed reply until the stderr marker is confirmed.
+    struct GatedGateway {
+        release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    impl TelegramGateway for GatedGateway {
+        fn invoke<'a>(
+            &'a self,
+            _context: GatewayContext,
+            _method: &'a str,
+            _params: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<serde_json::Value, protocol::TelegramCallError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                let receiver = self.release.lock().unwrap().take();
+                if let Some(receiver) = receiver {
+                    let _ = receiver.await;
+                }
+                Ok(serde_json::Value::Bool(true))
+            })
         }
     }
 
@@ -1365,9 +1698,151 @@ for line in sys.stdin:
             assert_eq!(process.status(), ProcessStatus::Crashed);
             assert_eq!(process.in_flight_request(), None);
             assert_eq!(process.process_group_id, None);
+            assert_eq!(process.crash_events.load(Ordering::Relaxed), 1);
             process.terminate().await;
             assert_eq!(process.process_group_id, None);
             fs::remove_dir_all(directory).unwrap();
         }
+    }
+
+    const V2_LOG_MODULE_PY: &str = r#"#!/usr/bin/env python3
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    val = json.loads(line)
+    req_id = val.get("request_id", "?")
+    msg_type = val.get("type", "")
+    if msg_type == "initialize":
+        resp = {"protocol_version": 2, "type": "initialized", "request_id": req_id, "module_id": val.get("module_id", "")}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif msg_type == "execute":
+        log = {"protocol_version": 2, "type": "log", "request_id": req_id, "level": "info", "message": "working"}
+        sys.stdout.write(json.dumps(log) + "\n")
+        sys.stdout.flush()
+        resp = {"protocol_version": 2, "type": "result", "request_id": req_id, "text": "done"}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+"#;
+
+    #[tokio::test]
+    async fn module_log_with_matching_request_id_does_not_fail_the_request() {
+        let (desc, dir) = create_fixture_module(V2_LOG_MODULE_PY, "v2-log");
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
+        let result = proc.execute("run", "").await.unwrap();
+        assert_eq!(result, "done");
+        proc.terminate().await;
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    const V2_WRONG_LOG_ID_PY: &str = r#"#!/usr/bin/env python3
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    val = json.loads(line)
+    req_id = val.get("request_id", "?")
+    msg_type = val.get("type", "")
+    if msg_type == "initialize":
+        resp = {"protocol_version": 2, "type": "initialized", "request_id": req_id, "module_id": val.get("module_id", "")}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif msg_type == "execute":
+        log = {"protocol_version": 2, "type": "log", "request_id": "999", "level": "warn", "message": "stale"}
+        sys.stdout.write(json.dumps(log) + "\n")
+        sys.stdout.flush()
+"#;
+
+    #[tokio::test]
+    async fn module_log_with_foreign_request_id_is_rejected() {
+        let (desc, dir) = create_fixture_module(V2_WRONG_LOG_ID_PY, "v2-log-wrong-id");
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
+        let result = proc.execute("run", "").await;
+        assert!(matches!(result, Err(ExternalError::WrongRequestId)));
+        assert_eq!(proc.status(), ProcessStatus::Crashed);
+        assert_eq!(proc.crash_events.load(Ordering::Relaxed), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    const V5_STDERR_SYNC_PY: &str = r#"#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    request_id = message["request_id"]
+    if message["type"] == "initialize":
+        print(json.dumps({"protocol_version": 5, "type": "initialized", "request_id": request_id, "module_id": message["module_id"]}), flush=True)
+    elif message["type"] == "execute":
+        sys.stderr.write("diag: failing module marker\n")
+        sys.stderr.flush()
+        print(json.dumps({"protocol_version": 5, "type": "telegram.invoke", "request_id": request_id, "call_id": "call-1", "method": "account.updateStatus", "params": {"offline": True}}), flush=True)
+        result = json.loads(sys.stdin.readline())
+        if result["type"] != "telegram.result" or result["request_id"] != request_id or result["call_id"] != "call-1":
+            sys.exit(2)
+        print("this is not json", flush=True)
+"#;
+
+    #[tokio::test]
+    async fn stderr_marker_is_captured_before_the_malformed_reply_is_processed() {
+        const MARKER: &str = "diag: failing module marker";
+        let (observer_tx, mut observer_rx) = tokio::sync::mpsc::unbounded_channel();
+        set_stderr_push_observer(observer_tx);
+
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let gateway = GatedGateway {
+            release: Mutex::new(Some(gate_rx)),
+        };
+        let (mut descriptor, directory) = create_fixture_module(V5_STDERR_SYNC_PY, "stderr-sync");
+        descriptor.protocol_version = 5;
+        descriptor.capabilities = vec![ExternalCapability::TelegramAccountStatus];
+        let mut process = ModuleProcess::start_with_gateway(descriptor, Some(Arc::new(gateway)))
+            .await
+            .unwrap();
+
+        let execute_task = tokio::spawn(async move {
+            let result = process.execute("run", "").await;
+            (result, process)
+        });
+
+        // Wait until the reader reports the marker inside StderrCapture; only
+        // then release the gateway so the module may send its malformed reply.
+        let marker_seen = async {
+            while let Some(snapshot) = observer_rx.recv().await {
+                if snapshot.lossy_text().contains(MARKER) {
+                    return;
+                }
+            }
+            panic!("stderr observer closed before the marker was captured");
+        };
+        tokio::time::timeout(Duration::from_secs(10), marker_seen)
+            .await
+            .unwrap();
+        let _ = gate_tx.send(());
+
+        let (result, process) = tokio::time::timeout(Duration::from_secs(10), execute_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(ExternalError::ProtocolDecode)));
+        assert_eq!(process.crash_events.load(Ordering::Relaxed), 1);
+        let snapshot = process.snapshot_stderr();
+        assert!(snapshot.lossy_text().contains(MARKER));
+        assert!(!snapshot.truncated);
+        clear_stderr_push_observer();
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn normal_termination_is_not_a_crash() {
+        let (desc, dir) = create_echo_module();
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
+        proc.terminate().await;
+        assert_eq!(proc.status(), ProcessStatus::Terminated);
+        assert_eq!(proc.process_group_id, None);
+        // Normal shutdown must never take the crash path.
+        assert_eq!(proc.crash_events.load(Ordering::Relaxed), 0);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
