@@ -278,7 +278,10 @@ impl ModuleProcess {
                     self.clear_request_state();
                     return Ok(());
                 }
-                ModuleMessage::Error { .. } => {
+                ModuleMessage::Error { request_id, .. } => {
+                    if request_id != req_id {
+                        return Err(self.fail_and_terminate(ExternalError::WrongRequestId).await);
+                    }
                     return Err(self.fail_and_terminate(ExternalError::ModuleError).await);
                 }
                 _ => return Err(self.fail_and_terminate(ExternalError::ProtocolDecode).await),
@@ -320,13 +323,12 @@ impl ModuleProcess {
             Err(error) => return Err(self.fail_and_terminate(error).await),
         };
 
-        self.clear_request_state();
-
         match result {
             ModuleMessage::Result { request_id, text } => {
                 if request_id != req_id {
                     return Err(self.fail_and_terminate(ExternalError::WrongRequestId).await);
                 }
+                self.clear_request_state();
                 Ok(truncate_result(&text))
             }
             ModuleMessage::Error {
@@ -337,7 +339,11 @@ impl ModuleProcess {
                 if request_id != req_id {
                     return Err(self.fail_and_terminate(ExternalError::WrongRequestId).await);
                 }
-                Err(self.fail_and_terminate(ExternalError::ModuleError).await)
+                // A protocol-valid application error is not a crash: clean up
+                // the process but do not emit `external_module_crashed`.
+                self.clear_request_state();
+                self.terminate_failed_process().await;
+                Err(ExternalError::ModuleError)
             }
             _ => Err(self.fail_and_terminate(ExternalError::ProtocolDecode).await),
         }
@@ -373,12 +379,14 @@ impl ModuleProcess {
             Ok(reply) => reply,
             Err(error) => return Err(self.fail_and_terminate(error).await),
         };
-        self.clear_request_state();
         match reply {
             ModuleMessage::EventResult {
                 request_id: actual,
                 actions,
-            } if actual == request_id => Ok((request_id, actions)),
+            } if actual == request_id => {
+                self.clear_request_state();
+                Ok((request_id, actions))
+            }
             ModuleMessage::EventResult { .. } => {
                 Err(self.fail_and_terminate(ExternalError::WrongRequestId).await)
             }
@@ -566,10 +574,7 @@ impl ModuleProcess {
     async fn fail_and_terminate(&mut self, error: ExternalError) -> ExternalError {
         let request_id = self.in_flight_request.take();
         self.clear_request_state();
-        self.status = ProcessStatus::Crashed;
-        self.terminate_process_group().await;
-        self.reap_child().await;
-        self.join_stderr_drain().await;
+        self.terminate_failed_process().await;
         let capture = self.snapshot_stderr();
         let diagnostics =
             build_crash_diagnostics(&self.descriptor, request_id.as_deref(), &error, &capture);
@@ -581,6 +586,17 @@ impl ModuleProcess {
         }
         emit_crash_event(&diagnostics);
         error
+    }
+
+    /// Stop the process after a failure, following the existing lifecycle
+    /// policy. Unlike `fail_and_terminate`, this does not emit
+    /// `external_module_crashed`: it is used for protocol-valid application
+    /// errors, which are not crashes.
+    async fn terminate_failed_process(&mut self) {
+        self.status = ProcessStatus::Crashed;
+        self.terminate_process_group().await;
+        self.reap_child().await;
+        self.join_stderr_drain().await;
     }
 
     /// Snapshot the stderr accumulated so far. Safe to call after the reader
@@ -1789,6 +1805,196 @@ for line in sys.stdin:
             create_fixture_module(V2_HANDSHAKE_WRONG_LOG_PY, "v2-handshake-log-wrong");
         let result = ModuleProcess::start(desc).await;
         assert!(matches!(result, Err(ExternalError::WrongRequestId)));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// initialize OK, then execute replies with a terminal message of the wrong
+    /// type (a `health` frame) carrying the matching request ID. The correlation
+    /// state must survive until terminal validation, so the crash diagnostics
+    /// carry the real execute request id.
+    const V2_EXECUTE_WRONG_TERMINAL_PY: &str = r#"#!/usr/bin/env python3
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    val = json.loads(line)
+    req_id = val.get("request_id", "?")
+    msg_type = val.get("type", "")
+    if msg_type == "initialize":
+        resp = {"protocol_version": 2, "type": "initialized", "request_id": req_id, "module_id": val.get("module_id", "")}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif msg_type == "execute":
+        sys.stderr.write("exec-id " + req_id + "\n")
+        sys.stderr.flush()
+        resp = {"protocol_version": 2, "type": "health", "request_id": req_id}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+"#;
+
+    #[tokio::test]
+    async fn execute_wrong_terminal_type_preserves_request_id_in_crash_diagnostics() {
+        let (desc, dir) = create_fixture_module(V2_EXECUTE_WRONG_TERMINAL_PY, "v2-exec-wrong-term");
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
+        let result = proc.execute("run", "").await;
+        assert!(matches!(result, Err(ExternalError::ProtocolDecode)));
+        assert_eq!(proc.crash_events.load(Ordering::Relaxed), 1);
+        let diagnostics = proc.last_crash_diagnostics.lock().unwrap().clone().unwrap();
+        let echoed = last_echoed_id(&proc.snapshot_stderr(), "exec-id ");
+        assert!(!echoed.is_empty());
+        assert_eq!(diagnostics.request_id, echoed);
+        assert_ne!(diagnostics.request_id, "-");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A protocol-valid application `error` frame with the matching request id
+    /// is not a crash: it must not emit `external_module_crashed`.
+    const V2_EXECUTE_ERROR_MODULE_PY: &str = r#"#!/usr/bin/env python3
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    val = json.loads(line)
+    req_id = val.get("request_id", "?")
+    msg_type = val.get("type", "")
+    if msg_type == "initialize":
+        resp = {"protocol_version": 2, "type": "initialized", "request_id": req_id, "module_id": val.get("module_id", "")}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif msg_type == "execute":
+        resp = {"protocol_version": 2, "type": "error", "request_id": req_id, "code": "invalid_input", "message": "Name is required"}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+"#;
+
+    #[tokio::test]
+    async fn execute_application_error_is_not_a_crash() {
+        let (desc, dir) = create_fixture_module(V2_EXECUTE_ERROR_MODULE_PY, "v2-exec-error");
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
+        let result = proc.execute("run", "").await;
+        assert!(matches!(result, Err(ExternalError::ModuleError)));
+        assert_eq!(proc.crash_events.load(Ordering::Relaxed), 0);
+        assert_eq!(proc.in_flight_request(), None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An application error frame with a foreign request id is a protocol
+    /// failure: it must emit a crash event carrying the real execute request id.
+    const V2_EXECUTE_FOREIGN_ERROR_PY: &str = r#"#!/usr/bin/env python3
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    val = json.loads(line)
+    req_id = val.get("request_id", "?")
+    msg_type = val.get("type", "")
+    if msg_type == "initialize":
+        resp = {"protocol_version": 2, "type": "initialized", "request_id": req_id, "module_id": val.get("module_id", "")}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif msg_type == "execute":
+        sys.stderr.write("exec-id " + req_id + "\n")
+        sys.stderr.flush()
+        resp = {"protocol_version": 2, "type": "error", "request_id": "999", "code": "x", "message": "stale"}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+"#;
+
+    #[tokio::test]
+    async fn execute_foreign_error_id_is_a_crash_with_real_request_id() {
+        let (desc, dir) =
+            create_fixture_module(V2_EXECUTE_FOREIGN_ERROR_PY, "v2-exec-foreign-error");
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
+        let result = proc.execute("run", "").await;
+        assert!(matches!(result, Err(ExternalError::WrongRequestId)));
+        assert_eq!(proc.crash_events.load(Ordering::Relaxed), 1);
+        let diagnostics = proc.last_crash_diagnostics.lock().unwrap().clone().unwrap();
+        let echoed = last_echoed_id(&proc.snapshot_stderr(), "exec-id ");
+        assert!(!echoed.is_empty());
+        assert_eq!(diagnostics.request_id, echoed);
+        assert_ne!(diagnostics.request_id, "-");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A v3 event whose terminal reply is the wrong type (a `health` frame)
+    /// with the matching request id must preserve the event request id in the
+    /// crash diagnostics.
+    const V3_EVENT_WRONG_TERMINAL_PY: &str = r#"#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    request_id = message["request_id"]
+    if message["type"] == "initialize":
+        response = {"protocol_version": 3, "type": "initialized", "request_id": request_id, "module_id": message["module_id"]}
+        print(json.dumps(response), flush=True)
+    elif message["type"] == "event":
+        sys.stderr.write("event-id " + request_id + "\n")
+        sys.stderr.flush()
+        response = {"protocol_version": 3, "type": "health", "request_id": request_id}
+        print(json.dumps(response), flush=True)
+"#;
+
+    #[tokio::test]
+    async fn event_wrong_terminal_type_preserves_request_id_in_crash_diagnostics() {
+        let (mut descriptor, directory) =
+            create_fixture_module(V3_EVENT_WRONG_TERMINAL_PY, "v3-event-wrong-term");
+        descriptor.protocol_version = 3;
+        let mut proc = ModuleProcess::start(descriptor).await.unwrap();
+        let result = proc
+            .dispatch_event(MessageEventKind::Created, created_event())
+            .await;
+        assert!(matches!(result, Err(ExternalError::ProtocolDecode)));
+        assert_eq!(proc.crash_events.load(Ordering::Relaxed), 1);
+        let diagnostics = proc.last_crash_diagnostics.lock().unwrap().clone().unwrap();
+        let echoed = last_echoed_id(&proc.snapshot_stderr(), "event-id ");
+        assert!(!echoed.is_empty());
+        assert_eq!(diagnostics.request_id, echoed);
+        assert_ne!(diagnostics.request_id, "-");
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A handshake error frame with a foreign request id must be rejected as a
+    /// correlation failure, not attributed to the wrong request.
+    const V2_HANDSHAKE_FOREIGN_ERROR_PY: &str = r#"#!/usr/bin/env python3
+import sys, json
+initialized = False
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    val = json.loads(line)
+    req_id = val.get("request_id", "?")
+    msg_type = val.get("type", "")
+    if msg_type == "initialize":
+        if not initialized:
+            initialized = True
+            resp = {"protocol_version": 2, "type": "initialized", "request_id": req_id, "module_id": val.get("module_id", "")}
+            sys.stdout.write(json.dumps(resp) + "\n")
+            sys.stdout.flush()
+        else:
+            sys.stderr.write("handshake-id " + req_id + "\n")
+            sys.stderr.flush()
+            resp = {"protocol_version": 2, "type": "error", "request_id": "999", "code": "x", "message": "stale"}
+            sys.stdout.write(json.dumps(resp) + "\n")
+            sys.stdout.flush()
+"#;
+
+    #[tokio::test]
+    async fn handshake_foreign_error_id_is_rejected_with_real_request_id() {
+        let (desc, dir) =
+            create_fixture_module(V2_HANDSHAKE_FOREIGN_ERROR_PY, "handshake-foreign-error");
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
+        let result = proc.handshake().await;
+        assert!(matches!(result, Err(ExternalError::WrongRequestId)));
+        assert_eq!(proc.crash_events.load(Ordering::Relaxed), 1);
+        let diagnostics = proc.last_crash_diagnostics.lock().unwrap().clone().unwrap();
+        let echoed = last_echoed_id(&proc.snapshot_stderr(), "handshake-id ");
+        assert!(!echoed.is_empty());
+        assert_eq!(diagnostics.request_id, echoed);
+        assert_ne!(diagnostics.request_id, "-");
         fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -241,7 +241,7 @@ A module may emit a bounded structured log message:
 {"protocol_version":2,"type":"log","request_id":"2","level":"info","message":"request handled"}
 ```
 
-Module stderr is drained continuously and the first 16 KiB are kept. When the module crashes, fails the protocol, times out or fails handshake, the captured stderr is included in the `external_module_crashed` event at error level; invalid UTF-8 is converted lossy. A normal shutdown does not create a crash event. Modules must not write secrets to stderr.
+Module stderr is drained continuously and the first 16 KiB are kept. When the module crashes, fails the protocol, times out or fails handshake, the captured stderr is included in the `external_module_crashed` event at error level; invalid UTF-8 is converted lossy. A normal shutdown does not create a crash event, and a protocol-valid application `error` reply during execute is not a crash either. Modules must not write secrets to stderr.
 
 ## Schema 3 events and actions
 
