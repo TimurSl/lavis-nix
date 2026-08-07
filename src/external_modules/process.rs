@@ -339,10 +339,11 @@ impl ModuleProcess {
                 if request_id != req_id {
                     return Err(self.fail_and_terminate(ExternalError::WrongRequestId).await);
                 }
-                // A protocol-valid application error is not a crash: clean up
-                // the process but do not emit `external_module_crashed`.
+                // A protocol-valid correlated application error is not a crash
+                // and does not terminate the module: clear the request-scoped
+                // state and leave the process Running so it can serve the next
+                // request. No `external_module_crashed` is emitted.
                 self.clear_request_state();
-                self.terminate_failed_process().await;
                 Err(ExternalError::ModuleError)
             }
             _ => Err(self.fail_and_terminate(ExternalError::ProtocolDecode).await),
@@ -1875,8 +1876,61 @@ for line in sys.stdin:
         let mut proc = ModuleProcess::start(desc).await.unwrap();
         let result = proc.execute("run", "").await;
         assert!(matches!(result, Err(ExternalError::ModuleError)));
+        assert_eq!(proc.status(), ProcessStatus::Running);
         assert_eq!(proc.crash_events.load(Ordering::Relaxed), 0);
+        assert!(proc.last_crash_diagnostics.lock().unwrap().is_none());
         assert_eq!(proc.in_flight_request(), None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The module replies with a correlated application error on the first
+    /// execute and a normal result on every later execute. Proves the lifecycle
+    /// contract: after an application error the same process must stay Running
+    /// and serve the next request without a restart.
+    const V2_EXECUTE_ERROR_THEN_RESULT_PY: &str = r#"#!/usr/bin/env python3
+import sys, json
+executions = 0
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    val = json.loads(line)
+    req_id = val.get("request_id", "?")
+    msg_type = val.get("type", "")
+    if msg_type == "initialize":
+        resp = {"protocol_version": 2, "type": "initialized", "request_id": req_id, "module_id": val.get("module_id", "")}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif msg_type == "execute":
+        executions += 1
+        if executions == 1:
+            resp = {"protocol_version": 2, "type": "error", "request_id": req_id, "code": "invalid_input", "message": "Name is required"}
+        else:
+            resp = {"protocol_version": 2, "type": "result", "request_id": req_id, "text": "ok"}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+"#;
+
+    #[tokio::test]
+    async fn process_survives_application_error_and_serves_the_next_execute() {
+        let (desc, dir) =
+            create_fixture_module(V2_EXECUTE_ERROR_THEN_RESULT_PY, "v2-exec-error-then-result");
+        let mut proc = ModuleProcess::start(desc).await.unwrap();
+
+        let first = proc.execute("run", "").await;
+        assert!(matches!(first, Err(ExternalError::ModuleError)));
+        assert_eq!(proc.status(), ProcessStatus::Running);
+        assert_eq!(proc.crash_events.load(Ordering::Relaxed), 0);
+        assert!(proc.last_crash_diagnostics.lock().unwrap().is_none());
+        assert_eq!(proc.in_flight_request(), None);
+
+        // Same ModuleProcess, no restart: the module must still be usable.
+        let second = proc.execute("run", "").await;
+        assert!(matches!(second, Ok(ref text) if text == "ok"));
+        assert_eq!(proc.status(), ProcessStatus::Running);
+        assert_eq!(proc.crash_events.load(Ordering::Relaxed), 0);
+
+        proc.terminate().await;
         fs::remove_dir_all(&dir).unwrap();
     }
 
