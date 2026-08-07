@@ -589,10 +589,9 @@ impl ModuleProcess {
         error
     }
 
-    /// Stop the process after a failure, following the existing lifecycle
-    /// policy. Unlike `fail_and_terminate`, this does not emit
-    /// `external_module_crashed`: it is used for protocol-valid application
-    /// errors, which are not crashes.
+    /// Stop and reap a fatally failed process without emitting diagnostics
+    /// itself. `fail_and_terminate` uses this before snapshotting stderr and
+    /// emitting the single `external_module_crashed` event.
     async fn terminate_failed_process(&mut self) {
         self.status = ProcessStatus::Crashed;
         self.terminate_process_group().await;
@@ -643,15 +642,8 @@ impl ModuleProcess {
     }
 
     async fn join_stderr_drain(&mut self) {
-        if let Some(mut handle) = self.stderr_drain.take() {
-            // Descendants can retain stderr after the managed child exits; do
-            // not let their inherited FD block module cleanup forever. First
-            // give the reader a bounded chance to consume bytes already
-            // buffered in the kernel pipe, then abort it if it is still stuck.
-            if timeout(STDERR_DRAIN_GRACE, &mut handle).await.is_err() {
-                handle.abort();
-                let _ = handle.await;
-            }
+        if let Some(handle) = self.stderr_drain.take() {
+            finish_stderr_drain(handle).await;
         }
     }
 
@@ -730,6 +722,16 @@ where
         // The guard is dropped at the end of this statement, before the next
         // read is awaited.
         lock_capture(&capture).push(&tmp[..n]);
+    }
+}
+
+/// Give the stderr reader a bounded chance to consume bytes already buffered
+/// in the kernel pipe before aborting it. Descendants can retain stderr after
+/// the managed child exits; cleanup must never block on their inherited FD.
+async fn finish_stderr_drain(mut handle: tokio::task::JoinHandle<()>) {
+    if timeout(STDERR_DRAIN_GRACE, &mut handle).await.is_err() {
+        handle.abort();
+        let _ = handle.await;
     }
 }
 
@@ -1018,6 +1020,26 @@ mod capture_tests {
         let snapshot = lock_capture(&capture).clone();
         assert_eq!(snapshot.bytes.len(), MAX_STDERR_CAPTURE);
         assert!(snapshot.truncated);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stderr_drain_gets_grace_to_consume_pending_bytes() {
+        let (mut writer, reader) = tokio::io::duplex(128);
+
+        writer.write_all(b"pending marker\n").await.unwrap();
+        drop(writer);
+
+        let capture = Arc::new(Mutex::new(StderrCapture::default()));
+        let handle = tokio::spawn(drain_stderr(reader, capture.clone()));
+
+        // Do not yield before this call. On the current-thread runtime the
+        // spawned reader has not had an opportunity to run yet; the grace
+        // helper itself must allow it to consume the buffered bytes before
+        // cleanup completes.
+        finish_stderr_drain(handle).await;
+
+        let snapshot = lock_capture(&capture).clone();
+        assert!(snapshot.lossy_text().contains("pending marker"));
     }
 
     #[test]
@@ -1880,6 +1902,10 @@ for line in sys.stdin:
         assert_eq!(proc.crash_events.load(Ordering::Relaxed), 0);
         assert!(proc.last_crash_diagnostics.lock().unwrap().is_none());
         assert_eq!(proc.in_flight_request(), None);
+        // The process is still Running; stop it explicitly instead of relying
+        // on `kill_on_drop` for cleanup of a live module.
+        proc.terminate().await;
+        assert_eq!(proc.status(), ProcessStatus::Terminated);
         fs::remove_dir_all(&dir).unwrap();
     }
 
